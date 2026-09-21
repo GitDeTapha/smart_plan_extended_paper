@@ -1,0 +1,23 @@
+# Deny-all allow-list: nothing is tracked unless explicitly un-ignored below.
+# This keeps the patient dataset (data/, data_parquet_chunks/), the virtual
+# environment and every generated artifact out of the repository by default.
+/*
+
+!/.gitignore
+!/README.md
+!/requirements.txt
+
+# Main pipeline
+!/data_driven_plan.py
+!/gen_main_nb.py
+!/data_driven_plan.ipynb
+
+# Data ingestion (produces the notebook's input)
+!/scripts/
+/scripts/*
+!/scripts/csv_to_parquet.py
+
+# Generated at run time, never committed:
+#   data/ data_parquet_chunks/  input and preprocessed data (patient records)
+#   figures/ models/ results/ tables/  pipeline outputs
+#   ml_env/ __pycache__/ .ipynb_checkpoints/  environment and caches
