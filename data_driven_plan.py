@@ -75,7 +75,14 @@ FIGURES_DIR = "figures"
 MODELS_DIR = "models"
 TABLES_DIR = "tables"
 RESULTS_DIR = "results"
-INFERENCE_DIR = "data/inference"
+
+# Data root, overridable so the same notebook runs unchanged on a workstation
+# and on a remote machine where the dataset sits elsewhere:
+#     export SMART_PLAN_DATA=/workspace/data
+DATA_DIR = os.environ.get("SMART_PLAN_DATA", "data")
+RAW_PARQUET_DIR = os.path.join(DATA_DIR, "raw_data_parquet")
+PREPROCESSED_PATH = os.path.join(DATA_DIR, "preprocessed", "preprocessed_data.parquet")
+INFERENCE_DIR = os.path.join(DATA_DIR, "inference")
 
 sns.set_theme(style="whitegrid", palette="deep")
 plt.rcParams.update({

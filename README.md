@@ -28,7 +28,7 @@ LICENSE                  MIT
 ```
 
 The dataset is **not** part of this repository: it contains patient-level
-consultation records. `data/`, `data_parquet_chunks/` and every generated
+consultation records. `data/` and every generated
 artifact (`figures/`, `models/`, `results/`, `tables/`) are untracked.
 
 ## Setup
@@ -48,9 +48,16 @@ Convert the raw CSV once, then run the notebook top to bottom:
 ```bash
 ./ml_env/bin/python scripts/csv_to_parquet.py \
   --csv data/consult_waits_2024_03_25.csv \
-  --out-dir data_parquet_chunks --chunksize 500000 --compression snappy
+  --out-dir data/raw_data_parquet --chunksize 500000 --compression snappy
 
 ./ml_env/bin/jupyter lab data_driven_plan.ipynb
+```
+
+All data paths derive from `SMART_PLAN_DATA` (default `./data`), so the
+notebook runs unchanged against a dataset stored elsewhere:
+
+```bash
+export SMART_PLAN_DATA=/mnt/volume/data
 ```
 
 Section 3.2bis and sections 4a/4b each provide a resume point: once the

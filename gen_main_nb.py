@@ -99,7 +99,7 @@ md("## 1. Business Understanding\n\n"
 # ═══════════════════════════════════════════════════════════════════════════
 md("## 2. Data Understanding\n\n"
    "### 2.1 Initial collection\n\n"
-   "The raw data (`data_parquet_chunks/`, derived from "
+   "The raw data (`$SMART_PLAN_DATA/raw_data_parquet/`, derived from "
    "`data/consult_waits_2024_03_25.csv` by `scripts/csv_to_parquet.py`) covers "
    "outpatient consultations with their scheduled and realised times "
    "(`dts`/`dtc`), the attendance status (`disp`) and administrative metadata "
@@ -107,7 +107,9 @@ md("## 2. Data Understanding\n\n"
 
 code("""\
 # ── 2.1 Load the raw data ─────────────────────────────────────────────────────
-RAW_PARQUET_DIR = "data_parquet_chunks"
+# Paths come from the module and follow SMART_PLAN_DATA (default: ./data), so
+# this notebook runs unchanged wherever the dataset lives.
+print(f"Data root: {DATA_DIR}")
 data = pd.read_parquet(RAW_PARQUET_DIR, engine="pyarrow")
 print(f"Raw shape: {data.shape}")
 data.info(memory_usage="deep")
@@ -238,14 +240,14 @@ code("""\
 data = data.drop(columns=["activitydatetime", "patientsid"])
 print(f"Final preprocessed shape: {data.shape}")
 print(f"Columns: {data.columns.tolist()}")
-save_preprocessed_data(data, "data/preprocessed/preprocessed_data.parquet")
-print("Saved -> data/preprocessed/preprocessed_data.parquet")
+save_preprocessed_data(data, PREPROCESSED_PATH)
+print(f"Saved -> {PREPROCESSED_PATH}")
 """)
 
 md("### 3.2bis Fast resume point (optional)\n\n"
    "Section 2 (Data Understanding) and sections 3.1-3.2 (cleaning + feature "
    "engineering) are expensive on the 40M+ raw rows. If "
-   "`data/preprocessed/preprocessed_data.parquet` already exists from a "
+   "the preprocessed Parquet file already exists from a "
    "previous run, the cell below skips them entirely when resuming: run only "
    "the configuration cell at the very top, uncomment and run this one, then "
    "continue normally from section 3.3. On a full run from the raw data, leave "
@@ -257,7 +259,7 @@ md("### 3.2bis Fast resume point (optional)\n\n"
 
 code("""\
 # ── 3.2bis Fast resume: reload the preprocessed data instead of sections 2-3.2 ──
-# data = load_preprocessed_data("data/preprocessed/preprocessed_data.parquet")
+# data = load_preprocessed_data(PREPROCESSED_PATH)
 # print(f"Preprocessed data reloaded: {data.shape}")
 """)
 
