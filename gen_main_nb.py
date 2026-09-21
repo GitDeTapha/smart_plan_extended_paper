@@ -831,12 +831,15 @@ print("Summary saved -> results/recap_data_driven_plan.csv")
 """)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Keep the metadata of an existing notebook (the reader's own kernel) instead
-# of resetting it on every regeneration.
-metadata = DEFAULT_METADATA
+# Keep the metadata of an existing notebook, but always pin a portable
+# kernelspec: a locally named kernel (a venv registered as "ml_env", say) does
+# not exist on any other machine, and executing the notebook there fails with
+# NoSuchKernel before a single cell runs.
+metadata = dict(DEFAULT_METADATA)
 if os.path.exists(OUT):
     with open(OUT, encoding="utf-8") as f:
-        metadata = json.load(f).get("metadata") or DEFAULT_METADATA
+        existing = json.load(f).get("metadata") or {}
+    metadata = {**existing, "kernelspec": DEFAULT_METADATA["kernelspec"]}
 
 nb = {"cells": cells, "metadata": metadata, "nbformat": 4, "nbformat_minor": 5}
 

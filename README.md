@@ -60,6 +60,13 @@ notebook runs unchanged against a dataset stored elsewhere:
 export SMART_PLAN_DATA=/mnt/volume/data
 ```
 
+To run it headless on a server, execute it with nbconvert:
+
+```bash
+SMART_PLAN_DATA=/path/to/data jupyter nbconvert --to notebook --execute \
+  --ExecutePreprocessor.timeout=-1 --output run.ipynb data_driven_plan.ipynb
+```
+
 Section 3.2bis and sections 4a/4b each provide a resume point: once the
 preprocessed Parquet file and the model bundles exist, the expensive cells can
 be skipped on a later run.
