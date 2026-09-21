@@ -13,6 +13,9 @@
 !/gen_main_nb.py
 !/data_driven_plan.ipynb
 
+# Published results of a validated run (executed notebook + summary tables)
+!/reports/
+
 # Data ingestion (produces the notebook's input)
 !/scripts/
 /scripts/*

@@ -71,6 +71,26 @@ Section 3.2bis and sections 4a/4b each provide a resume point: once the
 preprocessed Parquet file and the model bundles exist, the expensive cells can
 be skipped on a later run.
 
+## Results of a validated run
+
+`reports/` holds one executed run on the full dataset (40,133,413 rows;
+train 28.1M / test 8.0M / inference holdout 4.0M):
+
+| | |
+|---|---|
+| No-show, best model | XGBoost — ROC-AUC 0.7538, Brier 0.0290 after calibration |
+| A/B group, best model | XGBoost — ROC-AUC 0.7362 |
+| service_time clustering | K=2, bootstrapped silhouette 0.6917 ± 0.0035, cutoff 38.5 min |
+| ILP (30 patients, 6 slots) | Z_complete 40.7221, solved in 3.3 s |
+
+- `run_20260921_1400.ipynb` — the executed notebook (text outputs; figures are
+  written to `figures/` at run time, not embedded)
+- `recap_data_driven_plan.csv`, `training_history.csv` — summary tables
+
+The threshold criterion moves no-show recall sharply at identical ROC-AUC:
+0.20 under `f1_macro` (threshold 0.75) against 0.67 under `youden`
+(threshold 0.43) — a lever worth exploring before retraining anything.
+
 ## Tuning the models
 
 Every training lever is exposed in the notebook's section 4.0 as a
