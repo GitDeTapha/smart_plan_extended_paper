@@ -7,6 +7,7 @@ instead of being edited cell by cell. Run from the project root.
 Note: regenerating overwrites the notebook, and with it the outputs of any
 previously executed cell.
 """
+import hashlib
 import json
 import os
 
@@ -14,15 +15,30 @@ os.makedirs("figures", exist_ok=True)
 os.makedirs("models", exist_ok=True)
 os.makedirs("data/inference", exist_ok=True)
 
+OUT = "data_driven_plan.ipynb"
+
+DEFAULT_METADATA = {
+    "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+    "language_info": {"name": "python", "version": "3.13.0"},
+}
+
 cells = []
 
 
+def _cell_id(src):
+    """Deterministic cell id: regenerating an unchanged cell keeps its id, so
+    the notebook stays byte-stable in git instead of churning on every run."""
+    return hashlib.md5(src.encode("utf-8")).hexdigest()[:8]
+
+
 def md(src):
-    cells.append({"cell_type": "markdown", "metadata": {}, "source": src})
+    cells.append({"cell_type": "markdown", "id": _cell_id(src), "metadata": {},
+                  "source": src.splitlines(keepends=True)})
 
 
 def code(src):
-    cells.append({"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": src})
+    cells.append({"cell_type": "code", "execution_count": None, "id": _cell_id(src),
+                  "metadata": {}, "outputs": [], "source": src.splitlines(keepends=True)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -813,18 +829,17 @@ print("Summary saved -> results/recap_data_driven_plan.csv")
 """)
 
 # ═══════════════════════════════════════════════════════════════════════════
-nb = {
-    "nbformat": 4,
-    "nbformat_minor": 5,
-    "metadata": {
-        "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
-        "language_info": {"name": "python", "version": "3.13.0"},
-    },
-    "cells": cells,
-}
+# Keep the metadata of an existing notebook (the reader's own kernel) instead
+# of resetting it on every regeneration.
+metadata = DEFAULT_METADATA
+if os.path.exists(OUT):
+    with open(OUT, encoding="utf-8") as f:
+        metadata = json.load(f).get("metadata") or DEFAULT_METADATA
 
-out = "data_driven_plan.ipynb"
-with open(out, "w", encoding="utf-8") as f:
+nb = {"cells": cells, "metadata": metadata, "nbformat": 4, "nbformat_minor": 5}
+
+with open(OUT, "w", encoding="utf-8") as f:
     json.dump(nb, f, indent=1, ensure_ascii=False)
+    f.write("\n")
 
-print(f"Notebook written: {out}  ({len(cells)} cells)")
+print(f"Notebook written: {OUT}  ({len(cells)} cells)")

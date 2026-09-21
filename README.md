@@ -24,6 +24,7 @@ gen_main_nb.py           generator of the notebook — edit this, not the .ipynb
 data_driven_plan.ipynb   the pipeline: orchestration, narrative, outputs
 scripts/csv_to_parquet.py  converts the raw CSV into chunked Parquet input
 requirements.txt         pinned dependencies (Python 3.13)
+LICENSE                  MIT
 ```
 
 The dataset is **not** part of this repository: it contains patient-level
@@ -79,3 +80,7 @@ python3 gen_main_nb.py
 
 Regenerating overwrites the notebook, including the outputs of cells that were
 already executed.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
