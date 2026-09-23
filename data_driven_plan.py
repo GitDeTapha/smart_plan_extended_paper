@@ -41,6 +41,7 @@ from sklearn.metrics import (
     confusion_matrix, silhouette_score, brier_score_loss,
     f1_score, balanced_accuracy_score, roc_auc_score, roc_curve,
     precision_recall_curve, average_precision_score, classification_report,
+    accuracy_score, precision_score, recall_score,
 )
 
 try:
@@ -57,9 +58,11 @@ except ImportError:  # pragma: no cover
 
 try:
     from imblearn.over_sampling import SMOTE
+    from imblearn.pipeline import Pipeline as ImbPipeline
     SMOTE_AVAILABLE = True
 except ImportError:  # pragma: no cover
     SMOTE_AVAILABLE = False
+    ImbPipeline = None
 
 import pyomo.environ as pyo
 
@@ -84,17 +87,36 @@ RAW_PARQUET_DIR = os.path.join(DATA_DIR, "raw_data_parquet")
 PREPROCESSED_PATH = os.path.join(DATA_DIR, "preprocessed", "preprocessed_data.parquet")
 INFERENCE_DIR = os.path.join(DATA_DIR, "inference")
 
+# ----------------------------------------------------------------------------
+# Figure typography — single source of truth
+# ----------------------------------------------------------------------------
+# Every figure is meant for a journal submission, so sizes are set once here and
+# never hard-coded inside a plotting function: annotations that used to be fixed
+# at 9 pt became unreadable once a figure was scaled down to column width.
+# Sizes are expressed relative to FONT_BASE, so the whole set scales together.
+FONT_BASE = 15          # axis tick labels and general text
+FS_TITLE = 17           # axes titles
+FS_LABEL = 16           # axis labels
+FS_TICK = 14            # tick labels
+FS_LEGEND = 14          # legend entries
+FS_ANNOT = 13           # in-figure annotations (bar values, matrix cells)
+FS_ANNOT_SMALL = 11     # secondary annotations (counts under percentages)
+FS_TREE = 12            # decision tree node text
+
 sns.set_theme(style="whitegrid", palette="deep")
 plt.rcParams.update({
     "font.family": "sans-serif",
-    "font.sans-serif": ["Segoe UI", "DejaVu Sans", "Arial", "Liberation Sans", "Noto Sans"],
-    "font.size": 14,
-    "axes.titlesize": 15,
-    "axes.labelsize": 15,
-    "xtick.labelsize": 13,
-    "ytick.labelsize": 13,
-    "legend.fontsize": 13,
-    "figure.titlesize": 16,
+    # DejaVu Sans first: it ships with matplotlib, so figures render identically
+    # on a workstation and on a headless server (no silent font substitution).
+    "font.sans-serif": ["DejaVu Sans", "Arial", "Liberation Sans", "Helvetica"],
+    "font.size": FONT_BASE,
+    "axes.titlesize": FS_TITLE,
+    "axes.labelsize": FS_LABEL,
+    "xtick.labelsize": FS_TICK,
+    "ytick.labelsize": FS_TICK,
+    "legend.fontsize": FS_LEGEND,
+    "legend.title_fontsize": FS_LEGEND,
+    "figure.titlesize": FS_TITLE + 1,
     "lines.linewidth": 2.0,
     "lines.markersize": 7,
     "axes.linewidth": 1.2,
@@ -107,6 +129,11 @@ plt.rcParams.update({
     "ytick.color": "#000000",
     "figure.dpi": 150,
     "savefig.dpi": 300,
+    "savefig.bbox": "tight",
+    # TrueType rather than Type 3: several journals reject Type 3 fonts, and
+    # Type 3 text cannot be searched or copied in the published PDF.
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
 })
 
 PLOT_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
@@ -474,7 +501,7 @@ def visualize_outliers(data: pd.DataFrame, prefix: str = "") -> None:
     sns.barplot(x=list(counts.keys()), y=list(counts.values()), palette=PLOT_COLORS[:len(counts)], ax=ax)
     ax.set_xlabel("Columns")
     ax.set_ylabel("Number of outliers")
-    ax.tick_params(axis="x", rotation=45)
+    ax.tick_params(axis="x", rotation=30)
     ax.grid(True, axis="y", alpha=0.3)
     _savefig("outliers_distribution", prefix)
     plt.show()
@@ -494,7 +521,7 @@ def plot_target_balance(data: pd.DataFrame, target_col: str, labels: Optional[di
         counts.index = [labels.get(i, i) for i in counts.index]
     fig, ax = plt.subplots(figsize=(7, 6), constrained_layout=True)
     ax.pie(counts, labels=counts.index, autopct="%1.1f%%", startangle=90,
-           colors=PLOT_COLORS[:len(counts)], textprops={"fontsize": 13})
+           colors=PLOT_COLORS[:len(counts)], textprops={"fontsize": FS_ANNOT})
     ax.axis("equal")
     _savefig(f"balance_{target_col}", prefix)
     plt.show()
@@ -822,9 +849,13 @@ DEFAULT_PARAM_GRIDS: dict[str, dict] = {
         "n_estimators": [100, 300],
         "learning_rate": [0.5, 1.0],
     },
+    # The ANN is searched over a wider space than the other families: it is the
+    # reference model of the study, and the narrow (64,32)/(128,64) grid used
+    # previously left it far behind the tree ensembles.
     "ANN": {
-        "hidden_layer_sizes": [(64, 32), (128, 64)],
-        "alpha": [1e-4, 1e-3],
+        "hidden_layer_sizes": [(128, 64), (256, 128), (256, 128, 64)],
+        "alpha": [1e-5, 1e-4, 1e-3],
+        "learning_rate_init": [1e-3, 3e-4],
     },
 }
 
@@ -836,8 +867,9 @@ DEFAULT_BASE_PARAMS: dict[str, dict] = {
     "RandomForest": {},
     "XGBoost": {"eval_metric": "logloss", "verbosity": 0} if XGB_AVAILABLE else {},
     "AdaBoost": {},
-    "ANN": {"solver": "adam", "max_iter": 500, "early_stopping": True,
-            "validation_fraction": 0.1, "n_iter_no_change": 15},
+    "ANN": {"solver": "adam", "max_iter": 800, "early_stopping": True,
+            "validation_fraction": 0.1, "n_iter_no_change": 25,
+            "batch_size": 512, "learning_rate": "adaptive"},
 }
 
 #: Criteria available for choosing the decision threshold on P(positive class).
@@ -850,6 +882,18 @@ THRESHOLD_METRICS: tuple[str, ...] = (
 )
 
 SEARCH_STRATEGIES: tuple[str, ...] = ("grid", "random", "none")
+
+# Reported metric set, fixed by the paper's conventions: AUC, accuracy,
+# precision, recall, F1-score. Precision/recall/F1 are those of the class of
+# interest (the rare event), which is what a no-show study reports; accuracy and
+# AUC are computed over both classes.
+AUC_COL = "AUC"
+ACC_COL = "Accuracy"
+PREC_COL = "Precision"
+REC_COL = "Recall"
+F1_COL = "F1-score"
+THR_COL = "Threshold"
+REPORTED_METRICS = [AUC_COL, ACC_COL, PREC_COL, REC_COL, F1_COL]
 
 
 @dataclass
@@ -1060,8 +1104,28 @@ def _make_estimator(name: str, cfg: TrainingConfig, spw: float, params: Optional
         raise ValueError(f"Unknown model: {name}")
 
     kwargs.update(cfg.base_for(name))
-    kwargs.update(params or {})
-    return estimator_cls(**kwargs)
+
+    if name == "ANN" and cfg.balance_classes and SMOTE_AVAILABLE:
+        # MLPClassifier accepts neither class_weight nor sample_weight, so the
+        # only way to rebalance it is to resample inside the fit itself. Without
+        # this the ANN is the one family left untreated against a 3% positive
+        # rate, and it collapses onto the majority class (recall 0.000 at the
+        # default threshold). An imbalanced-learn pipeline resamples on fit only,
+        # never on predict, so the reported probabilities stay honest.
+        estimator = ImbPipeline([
+            ("smote", SMOTE(random_state=cfg.random_state, **cfg.smote_params)),
+            ("mlp", MLPClassifier(**kwargs)),
+        ])
+    else:
+        estimator = estimator_cls(**kwargs)
+
+    if params:
+        # Grid keys addressing a pipeline step need the "mlp__" prefix; accept
+        # them written either way so callers need not know about the wrapper.
+        if isinstance(estimator, ImbPipeline) if ImbPipeline else False:
+            params = {(k if "__" in k else f"mlp__{k}"): v for k, v in params.items()}
+        estimator.set_params(**params)
+    return estimator
 
 
 def _search_hyperparams(name: str, cfg: TrainingConfig, spw: float,
@@ -1086,6 +1150,8 @@ def _search_hyperparams(name: str, cfg: TrainingConfig, spw: float,
     # n_jobs=1 on the model: the search is what parallelises (over folds and
     # candidates); doing both oversubscribes the cores.
     base = _make_estimator(name, cfg, spw, n_jobs=1)
+    if ImbPipeline is not None and isinstance(base, ImbPipeline):
+        grid = {(k if "__" in k else f"mlp__{k}"): v for k, v in grid.items()}
     if cfg.search == "random":
         n_cand = min(cfg.n_iter, _n_candidates(grid))
         search = RandomizedSearchCV(base, grid, n_iter=n_cand, cv=cfg.cv, scoring=cfg.scoring,
@@ -1307,7 +1373,7 @@ def record_training_run(label: str, results_df: pd.DataFrame,
     return training_history_table()
 
 
-def training_history_table(sort_by: str = "ROC-AUC") -> pd.DataFrame:
+def training_history_table(sort_by: str = AUC_COL) -> pd.DataFrame:
     """Comparison table of every recorded run.
 
     Args:
@@ -1388,9 +1454,6 @@ def _best_threshold(model, X, y_true: np.ndarray, metric: str = "f1_macro",
     return round(float(best_t), 2), round(float(best_s), 4)
 
 
-F1_OPT_COL = "F1-macro (opt)"  # single column name, referenced throughout
-
-
 def compute_classification_metrics(
     models_dict: dict, X_test: pd.DataFrame, y_te: np.ndarray, positive_name: str, reference_name: str,
     config: Optional["TrainingConfig"] = None, threshold_metric: Optional[str] = None,
@@ -1437,23 +1500,23 @@ def compute_classification_metrics(
         y_opt = np.where(p_pos >= bt, 1, 0)
 
         auc = roc_auc_score(y_te, p_pos)
-        f1_d = f1_score(y_te, y_def, average="macro")
-        ba_d = balanced_accuracy_score(y_te, y_def)
-        f1_t = f1_score(y_te, y_opt, average="macro")
-        ba_t = balanced_accuracy_score(y_te, y_opt)
+        acc = accuracy_score(y_te, y_opt)
+        prec = precision_score(y_te, y_opt, pos_label=1, average="binary", zero_division=0)
+        rec = recall_score(y_te, y_opt, pos_label=1, average="binary", zero_division=0)
+        f1 = f1_score(y_te, y_opt, pos_label=1, average="binary", zero_division=0)
         cm_d = confusion_matrix(y_te, y_def, labels=[0, 1])
         cm_t = confusion_matrix(y_te, y_opt, labels=[0, 1])
-        recall_pos_d = cm_d[1, 1] / max(cm_d[1].sum(), 1)
-        recall_pos_t = cm_t[1, 1] / max(cm_t[1].sum(), 1)
 
         cache[name] = dict(p_pos=p_pos, y_opt=y_opt, cm_def=cm_d, cm_opt=cm_t,
-                           bt=bt, auc=auc, f1_t=f1_t, ba_t=ba_t, recall_pos_t=recall_pos_t)
+                           bt=bt, auc=auc, f1_t=f1, acc=acc, prec=prec, rec=rec)
         rows.append({
-            "Model": name, "ROC-AUC": round(auc, 4),
-            "F1-macro (def.)": round(f1_d, 4), "BA (def.)": round(ba_d, 4),
-            f"Recall {positive_name} (def.)": round(recall_pos_d, 4), "Best threshold": bt,
-            F1_OPT_COL: round(f1_t, 4), "BA (opt)": round(ba_t, 4),
-            f"Recall {positive_name} (opt)": round(recall_pos_t, 4),
+            "Model": name,
+            AUC_COL: round(auc, 4),
+            ACC_COL: round(acc, 4),
+            PREC_COL: round(prec, 4),
+            REC_COL: round(rec, 4),
+            F1_COL: round(f1, 4),
+            THR_COL: bt,
         })
 
     results_df = pd.DataFrame(rows)
@@ -1464,7 +1527,7 @@ def compute_classification_metrics(
 
 
 def plot_metrics_comparison(results_df: pd.DataFrame, model_names: list[str], palette: np.ndarray, prefix: str = "") -> None:
-    """Grouped bars comparing ROC-AUC, F1-macro (opt), balanced accuracy and recall (opt).
+    """Grouped bars comparing the five reported metrics across models.
 
     Args:
         results_df: output of `compute_classification_metrics`.
@@ -1472,9 +1535,8 @@ def plot_metrics_comparison(results_df: pd.DataFrame, model_names: list[str], pa
         palette: per-model colours.
         prefix: file-name prefix.
     """
-    recall_col = [c for c in results_df.columns if c.startswith("Recall") and c.endswith("(opt)")][0]
-    metrics_keys = ["ROC-AUC", F1_OPT_COL, "BA (opt)", recall_col]
-    metrics_labels = ["ROC-AUC", "F1-macro\n(opt. threshold)", "Balanced\naccuracy", recall_col.replace(" (opt)", "\n(opt.)")]
+    metrics_keys = REPORTED_METRICS
+    metrics_labels = REPORTED_METRICS
     x = np.arange(len(metrics_keys))
     width = 0.72 / len(model_names)
 
@@ -1486,7 +1548,7 @@ def plot_metrics_comparison(results_df: pd.DataFrame, model_names: list[str], pa
         bars = ax.bar(offs, vals, width, label=name, color=color, alpha=0.88, edgecolor="white")
         for bar, v in zip(bars, vals):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.006,
-                    f"{v:.3f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
+                    f"{v:.3f}", ha="center", va="bottom", fontsize=FS_ANNOT, fontweight="bold")
     ax.set_xticks(x)
     ax.set_xticklabels(metrics_labels)
     ax.set_ylim(0, 1.15)
@@ -1525,8 +1587,8 @@ def plot_confusion_matrices(cache: dict, model_names: list[str], class_names: li
                 pct, n_ij = cm_norm[i, j], cm_raw[i, j]
                 txt_color = "white" if pct > 0.55 else "black"
                 ax.text(j + 0.5, i + 0.38, f"{pct:.1%}", ha="center", va="center",
-                        fontsize=13, fontweight="bold", color=txt_color)
-                ax.text(j + 0.5, i + 0.65, f"({n_ij:,})", ha="center", va="center", fontsize=9, color=txt_color)
+                        fontsize=FS_ANNOT + 2, fontweight="bold", color=txt_color)
+                ax.text(j + 0.5, i + 0.65, f"({n_ij:,})", ha="center", va="center", fontsize=FS_ANNOT_SMALL, color=txt_color)
         ax.set_title(f"{name}  |  threshold={cache[name]['bt']}  |  F1={cache[name]['f1_t']:.3f}", color=color)
         ax.set_xlabel("Predicted class")
         ax.set_ylabel("True class")
@@ -1639,7 +1701,7 @@ def plot_feature_importances(
         color = palette[model_names.index(name)]
         bars = ax.barh(top15.index, top15.values, color=color, alpha=0.85)
         for bar, v in zip(bars, top15.values):
-            ax.text(v + 0.001, bar.get_y() + bar.get_height() / 2, f"{v:.3f}", va="center", fontsize=9)
+            ax.text(v + 0.001, bar.get_y() + bar.get_height() / 2, f"{v:.3f}", va="center", fontsize=FS_ANNOT_SMALL)
         ax.set_title(name)
         ax.set_xlabel(kind)
         ax.grid(axis="x", alpha=0.25)
@@ -1655,7 +1717,7 @@ def plot_train_test_comparison(
     X_test: pd.DataFrame, y_test: np.ndarray,
     model_names: list[str], palette: np.ndarray, prefix: str = "",
 ) -> pd.DataFrame:
-    """Compare ROC-AUC and F1-macro (threshold 0.5) between the data seen during
+    """Compare AUC and F1-score (threshold 0.5) between the data seen during
     training (X_train/y_train — the `X_fit`/`y_fit` subsample actually used by
     `train_binary_classifiers`, NOT the whole `train_df`) and the unseen test
     set, to detect overfitting or data leakage.
@@ -1678,7 +1740,7 @@ def plot_train_test_comparison(
         prefix: file-name prefix.
 
     Returns:
-        DataFrame with train and test ROC-AUC/F1-macro, and the train-test gap.
+        DataFrame with train and test AUC/F1-score, and the train-test gap.
     """
     rows = []
     for name in model_names:
@@ -1686,14 +1748,14 @@ def plot_train_test_comparison(
         p_tr = model.predict_proba(X_train)[:, 1]
         p_te = model.predict_proba(X_test)[:, 1]
         auc_tr, auc_te = roc_auc_score(y_train, p_tr), roc_auc_score(y_test, p_te)
-        f1_tr = f1_score(y_train, model.predict(X_train), average="macro")
-        f1_te = f1_score(y_test, model.predict(X_test), average="macro")
+        f1_tr = f1_score(y_train, model.predict(X_train), pos_label=1, average="binary", zero_division=0)
+        f1_te = f1_score(y_test, model.predict(X_test), pos_label=1, average="binary", zero_division=0)
         rows.append({
             "Model": name,
-            "ROC-AUC (train)": round(auc_tr, 4), "ROC-AUC (test)": round(auc_te, 4),
-            "AUC gap (train-test)": round(auc_tr - auc_te, 4),
-            "F1-macro (train)": round(f1_tr, 4), "F1-macro (test)": round(f1_te, 4),
-            "F1 gap (train-test)": round(f1_tr - f1_te, 4),
+            f"{AUC_COL} (train)": round(auc_tr, 4), f"{AUC_COL} (test)": round(auc_te, 4),
+            f"{AUC_COL} gap (train-test)": round(auc_tr - auc_te, 4),
+            f"{F1_COL} (train)": round(f1_tr, 4), f"{F1_COL} (test)": round(f1_te, 4),
+            f"{F1_COL} gap (train-test)": round(f1_tr - f1_te, 4),
         })
     comparison_df = pd.DataFrame(rows)
     print(f"\n{'='*70}\n  TRAIN vs TEST — overfitting / leakage check\n{'='*70}")
@@ -1702,13 +1764,13 @@ def plot_train_test_comparison(
     fig, axes = plt.subplots(1, 2, figsize=(13, 5), constrained_layout=True)
     x = np.arange(len(model_names))
     width = 0.35
-    for ax, metric in zip(axes, ["ROC-AUC", "F1-macro"]):
+    for ax, metric in zip(axes, [AUC_COL, F1_COL]):
         tr_vals = comparison_df[f"{metric} (train)"].to_numpy()
         te_vals = comparison_df[f"{metric} (test)"].to_numpy()
         ax.bar(x - width / 2, tr_vals, width, label="Train", color=PLOT_COLORS[0], alpha=0.85, edgecolor="white")
         ax.bar(x + width / 2, te_vals, width, label="Test", color=PLOT_COLORS[1], alpha=0.85, edgecolor="white")
         ax.set_xticks(x)
-        ax.set_xticklabels(model_names, rotation=15)
+        ax.set_xticklabels(model_names, rotation=0)
         ax.set_ylim(0, 1.15)
         ax.set_ylabel(metric)
         ax.legend()
@@ -2017,7 +2079,8 @@ def learn_decision_tree_cutoffs(
     tree.fit(df[[service_time_col]], df[group_col])
 
     fig, ax = plt.subplots(figsize=(12, 6), constrained_layout=True)
-    plot_tree(tree, feature_names=[service_time_col], class_names=label_names, filled=True, rounded=True, ax=ax)
+    plot_tree(tree, feature_names=[service_time_col], class_names=label_names, filled=True,
+              rounded=True, fontsize=FS_TREE, ax=ax, proportion=True)
     _savefig("decision_tree_cutoffs")
     plt.show()
 

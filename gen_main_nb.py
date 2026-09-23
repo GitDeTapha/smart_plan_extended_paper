@@ -347,6 +347,14 @@ md("### 4.0 Training control panel\n\n"
    "| `balance_classes` / `scale_pos_weight` | class weighting | three imbalance mechanisms stack up: switching one off can improve precision |\n"
    "| `param_grids` / `base_params` | grids explored / fixed hyperparameters | `DEFAULT_PARAM_GRIDS` is the starting point, printed below |\n"
    "| `threshold_metric` | decision-threshold criterion | `f1_positive` or `youden` favour no-show recall — **without retraining** |\n\n"
+   "Reported metrics are fixed: **AUC, accuracy, precision, recall, F1-score**, "
+   "the last three computed on the class of interest.\n\n"
+   "**On the ANN.** `MLPClassifier` accepts neither `class_weight` nor "
+   "`sample_weight`, so it was the only family left untreated against a 3% "
+   "positive rate and collapsed onto the majority class. It is now fitted "
+   "inside an imbalanced-learn pipeline that applies SMOTE during training "
+   "only, and searched over a wider space (three architectures, three "
+   "regularisation levels, two learning rates).\n\n"
    "The split (section 3.3), clustering (4b) and calibration (5.2) settings "
    "stay in their own cells.")
 
@@ -633,7 +641,7 @@ code("""\
 
 code("""\
 # ── 4c. Comparison table of every recorded run ──────────────────────────────
-history = training_history_table(sort_by="ROC-AUC")
+history = training_history_table(sort_by="AUC")
 display(history)
 save_dataframe(history, "results/training_history.csv")
 print("History saved -> results/training_history.csv")
@@ -648,13 +656,14 @@ md("## 5. Evaluation\n\n"
    "well-discriminating but poorly calibrated probability would bias the "
    "optimisation parameters systematically. Calibration (Platt/isotonic) is "
    "therefore evaluated explicitly through the Brier score, on top of the "
-   "ROC-AUC and per-class recall already obtained in section 4.")
+   "AUC, precision, recall, F1-score and accuracy already obtained in "
+   "section 4.")
 
 code("""\
 # ── 5.0 Selection and calibration settings ───────────────────────────────────
-SELECTION_METRIC = "ROC-AUC"   # criterion for picking the best model: "ROC-AUC",
-                               # F1_OPT_COL ("F1-macro (opt)"), "BA (opt)", or
-                               # "Recall NoShow (opt)" when missing a no-show is costly
+SELECTION_METRIC = "AUC"       # criterion for picking the best model, among the
+                               # reported metrics: "AUC", "Accuracy", "Precision",
+                               # "Recall" (when missing a no-show is costly), "F1-score"
 FORCE_NOSHOW_MODEL = None      # impose a model (e.g. "XGBoost_v2") instead of the best one
 FORCE_GROUP_MODEL = None
 CALIB_METHODS = ("sigmoid", "isotonic")  # calibration methods compared (Brier)
@@ -811,16 +820,16 @@ recap = pd.DataFrame([
     {"Item": "Split", "Value": f"{len(df_sample):,} rows (full dataset) | "
      f"train={len(train_df):,} test={len(test_df):,} inference={len(df_inference):,}"},
     {"Item": "No-show — best model", "Value": best_noshow_name},
-    {"Item": "No-show — ROC-AUC (test)",
-     "Value": f"{results_noshow.set_index('Model').loc[best_noshow_name, 'ROC-AUC']:.4f}"},
+    {"Item": "No-show — AUC (test)",
+     "Value": f"{results_noshow.set_index('Model').loc[best_noshow_name, 'AUC']:.4f}"},
     {"Item": "No-show — Brier (calibrated)",
      "Value": f"{calib_comparison.set_index('Method').loc[calib_comparison.iloc[0]['Method'], 'Brier']:.4f}"},
     {"Item": "service_time clustering — selected K", "Value": str(best_k)},
     {"Item": "Clustering — bootstrapped silhouette", "Value": f"mean={mu_sil:.4f}, sd={sd_sil:.4f}"},
     {"Item": "Cutoff (decision tree)", "Value": f"{primary_cutoff:.1f} min"},
     {"Item": "Group — best classifier", "Value": best_group_name},
-    {"Item": "Group — ROC-AUC (test)",
-     "Value": f"{results_group.set_index('Model').loc[best_group_name, 'ROC-AUC']:.4f}"},
+    {"Item": "Group — AUC (test)",
+     "Value": f"{results_group.set_index('Model').loc[best_group_name, 'AUC']:.4f}"},
     {"Item": "ILP — real instance (n patients)", "Value": str(real_instance.n)},
     {"Item": "ILP — Z_complete", "Value": f"{real_solution.Z_complete:.4f}"},
     {"Item": "ILP — solve time", "Value": f"{real_solution.solve_time:.3f} s"},
