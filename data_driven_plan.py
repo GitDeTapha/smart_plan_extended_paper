@@ -895,6 +895,10 @@ F1_COL = "F1-score"
 THR_COL = "Threshold"
 REPORTED_METRICS = [AUC_COL, ACC_COL, PREC_COL, REC_COL, F1_COL]
 
+#: Decimals used for every reported metric, in tables and in figures. Two is
+#: what the paper reports, and it stops bar labels from overlapping.
+METRIC_DECIMALS = 2
+
 
 @dataclass
 class TrainingConfig:
@@ -1512,11 +1516,11 @@ def compute_classification_metrics(
                            bt=bt, auc=auc, f1_t=f1, acc=acc, prec=prec, rec=rec)
         rows.append({
             "Model": name,
-            AUC_COL: round(auc, 4),
-            ACC_COL: round(acc, 4),
-            PREC_COL: round(prec, 4),
-            REC_COL: round(rec, 4),
-            F1_COL: round(f1, 4),
+            AUC_COL: round(auc, METRIC_DECIMALS),
+            ACC_COL: round(acc, METRIC_DECIMALS),
+            PREC_COL: round(prec, METRIC_DECIMALS),
+            REC_COL: round(rec, METRIC_DECIMALS),
+            F1_COL: round(f1, METRIC_DECIMALS),
             THR_COL: bt,
         })
 
@@ -1549,7 +1553,7 @@ def plot_metrics_comparison(results_df: pd.DataFrame, model_names: list[str], pa
         bars = ax.bar(offs, vals, width, label=name, color=color, alpha=0.88, edgecolor="white")
         for bar, v in zip(bars, vals):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.006,
-                    f"{v:.3f}", ha="center", va="bottom", fontsize=FS_ANNOT, fontweight="bold")
+                    f"{v:.{METRIC_DECIMALS}f}", ha="center", va="bottom", fontsize=FS_ANNOT, fontweight="bold")
     ax.set_xticks(x)
     ax.set_xticklabels(metrics_labels)
     ax.set_ylim(0, 1.15)
@@ -1590,7 +1594,7 @@ def plot_confusion_matrices(cache: dict, model_names: list[str], class_names: li
                 ax.text(j + 0.5, i + 0.38, f"{pct:.1%}", ha="center", va="center",
                         fontsize=FS_ANNOT + 2, fontweight="bold", color=txt_color)
                 ax.text(j + 0.5, i + 0.65, f"({n_ij:,})", ha="center", va="center", fontsize=FS_ANNOT_SMALL, color=txt_color)
-        ax.set_title(f"{name}  |  threshold={cache[name]['bt']}  |  F1={cache[name]['f1_t']:.3f}", color=color)
+        ax.set_title(f"{name}  |  threshold={cache[name]['bt']}  |  F1={cache[name]['f1_t']:.{METRIC_DECIMALS}f}", color=color)
         ax.set_xlabel("Predicted class")
         ax.set_ylabel("True class")
     for ax in axes_flat[n:]:
@@ -1612,7 +1616,7 @@ def plot_roc_curves(cache: dict, y_te: np.ndarray, model_names: list[str], palet
     fig, ax = plt.subplots(figsize=(7, 6), constrained_layout=True)
     for name, color in zip(model_names, palette):
         fpr, tpr, _ = roc_curve(y_te, cache[name]["p_pos"])
-        ax.plot(fpr, tpr, lw=2.2, color=color, label=f"{name}  AUC = {cache[name]['auc']:.3f}")
+        ax.plot(fpr, tpr, lw=2.2, color=color, label=f"{name}  AUC = {cache[name]['auc']:.{METRIC_DECIMALS}f}")
     ax.plot([0, 1], [0, 1], "k--", lw=1, alpha=0.5, label="Random classifier")
     ax.set_xlabel("False positive rate (FPR)")
     ax.set_ylabel("True positive rate (TPR)")
@@ -1638,7 +1642,7 @@ def plot_precision_recall(cache: dict, y_te: np.ndarray, model_names: list[str],
     for name, color in zip(model_names, palette):
         pr, rc, _ = precision_recall_curve(y_te, cache[name]["p_pos"])
         ap = average_precision_score(y_te, cache[name]["p_pos"])
-        ax.plot(rc, pr, lw=2.2, color=color, label=f"{name}  AP = {ap:.3f}")
+        ax.plot(rc, pr, lw=2.2, color=color, label=f"{name}  AP = {ap:.{METRIC_DECIMALS}f}")
     baseline = float(y_te.mean())
     ax.axhline(baseline, linestyle="--", color="gray", lw=1.2, alpha=0.7, label=f"Baseline (prevalence = {baseline:.3f})")
     ax.set_xlabel(f"Recall — {positive_name}")
@@ -1753,10 +1757,10 @@ def plot_train_test_comparison(
         f1_te = f1_score(y_test, model.predict(X_test), average="macro", zero_division=0)
         rows.append({
             "Model": name,
-            f"{AUC_COL} (train)": round(auc_tr, 4), f"{AUC_COL} (test)": round(auc_te, 4),
-            f"{AUC_COL} gap (train-test)": round(auc_tr - auc_te, 4),
-            f"{F1_COL} (train)": round(f1_tr, 4), f"{F1_COL} (test)": round(f1_te, 4),
-            f"{F1_COL} gap (train-test)": round(f1_tr - f1_te, 4),
+            f"{AUC_COL} (train)": round(auc_tr, METRIC_DECIMALS), f"{AUC_COL} (test)": round(auc_te, METRIC_DECIMALS),
+            f"{AUC_COL} gap (train-test)": round(auc_tr - auc_te, METRIC_DECIMALS),
+            f"{F1_COL} (train)": round(f1_tr, METRIC_DECIMALS), f"{F1_COL} (test)": round(f1_te, METRIC_DECIMALS),
+            f"{F1_COL} gap (train-test)": round(f1_tr - f1_te, METRIC_DECIMALS),
         })
     comparison_df = pd.DataFrame(rows)
     print(f"\n{'='*70}\n  TRAIN vs TEST — overfitting / leakage check\n{'='*70}")
