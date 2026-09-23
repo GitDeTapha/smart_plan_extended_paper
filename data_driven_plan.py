@@ -884,9 +884,9 @@ THRESHOLD_METRICS: tuple[str, ...] = (
 SEARCH_STRATEGIES: tuple[str, ...] = ("grid", "random", "none")
 
 # Reported metric set, fixed by the paper's conventions: AUC, accuracy,
-# precision, recall, F1-score. Precision/recall/F1 are those of the class of
-# interest (the rare event), which is what a no-show study reports; accuracy and
-# AUC are computed over both classes.
+# precision, recall, F1-score. Precision, recall and F1 are MACRO-averaged
+# (unweighted mean over both classes), so the rare class weighs as much as the
+# majority one; accuracy and AUC are computed over both classes as usual.
 AUC_COL = "AUC"
 ACC_COL = "Accuracy"
 PREC_COL = "Precision"
@@ -1459,8 +1459,9 @@ def compute_classification_metrics(
     config: Optional["TrainingConfig"] = None, threshold_metric: Optional[str] = None,
     threshold_range: Optional[tuple] = None, fixed_threshold: Optional[float] = None,
 ) -> tuple[pd.DataFrame, dict, list[str], np.ndarray]:
-    """Compute the binary classification metrics of every model, at the default
-    threshold (0.5) AND at the threshold optimised for the chosen criterion.
+    """Compute the reported classification metrics of every model at the
+    threshold optimised for the chosen criterion: AUC, accuracy, and
+    macro-averaged precision, recall and F1-score.
 
     The threshold criterion is a tuning lever in its own right: on a strongly
     imbalanced target, switching from "f1_macro" to "f1_positive" or "youden"
@@ -1501,9 +1502,9 @@ def compute_classification_metrics(
 
         auc = roc_auc_score(y_te, p_pos)
         acc = accuracy_score(y_te, y_opt)
-        prec = precision_score(y_te, y_opt, pos_label=1, average="binary", zero_division=0)
-        rec = recall_score(y_te, y_opt, pos_label=1, average="binary", zero_division=0)
-        f1 = f1_score(y_te, y_opt, pos_label=1, average="binary", zero_division=0)
+        prec = precision_score(y_te, y_opt, average="macro", zero_division=0)
+        rec = recall_score(y_te, y_opt, average="macro", zero_division=0)
+        f1 = f1_score(y_te, y_opt, average="macro", zero_division=0)
         cm_d = confusion_matrix(y_te, y_def, labels=[0, 1])
         cm_t = confusion_matrix(y_te, y_opt, labels=[0, 1])
 
@@ -1748,8 +1749,8 @@ def plot_train_test_comparison(
         p_tr = model.predict_proba(X_train)[:, 1]
         p_te = model.predict_proba(X_test)[:, 1]
         auc_tr, auc_te = roc_auc_score(y_train, p_tr), roc_auc_score(y_test, p_te)
-        f1_tr = f1_score(y_train, model.predict(X_train), pos_label=1, average="binary", zero_division=0)
-        f1_te = f1_score(y_test, model.predict(X_test), pos_label=1, average="binary", zero_division=0)
+        f1_tr = f1_score(y_train, model.predict(X_train), average="macro", zero_division=0)
+        f1_te = f1_score(y_test, model.predict(X_test), average="macro", zero_division=0)
         rows.append({
             "Model": name,
             f"{AUC_COL} (train)": round(auc_tr, 4), f"{AUC_COL} (test)": round(auc_te, 4),
