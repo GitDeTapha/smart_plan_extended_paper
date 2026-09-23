@@ -358,6 +358,7 @@ def prepare_features(
     categorical_cols: Optional[Sequence[str]] = None,
     excluded_cols: Optional[set[str]] = None,
     random_state: int = RANDOM_STATE,
+    onehot_max_cardinality: int = 150,
 ) -> tuple[pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame], list[str], StandardScaler, dict]:
     """Encoding and standardisation shared by both ML pipelines.
 
@@ -391,6 +392,13 @@ def prepare_features(
         excluded_cols: target columns to exclude from the features.
         random_state: seed (unused here, kept for API consistency with the rest
             of the module).
+        onehot_max_cardinality: categorical columns with at most this many
+            levels are one-hot encoded; the others keep an integer code. A tree
+            splits an integer code space freely and recovers the groups, but a
+            neural network reads it as an ordered quantity — zip code 437 close
+            to 438 and far from 900 — which is meaningless. One-hot fixes that,
+            at the cost of one column per level, so it is worth it only while
+            the cardinality stays small: `zip` alone would add 919 columns.
 
     Returns:
         (X_train, X_test, X_inference, feature_cols, scaler, cat_encodings)
@@ -415,7 +423,6 @@ def prepare_features(
 
     features = [c for c in train_df.columns if c not in excluded_cols]
     numeric_cols = [c for c in features if c not in cat_cols]
-    print(f"Features: {len(features)} | Numeric: {len(numeric_cols)} | Categorical: {len(cat_cols)}")
 
     cat_encodings = {}
     for col in cat_cols:
@@ -425,15 +432,43 @@ def prepare_features(
         for d in dfs:
             d[col] = d[col].map(mapping).fillna(-1).astype(int)
 
-    feature_cols = numeric_cols + cat_cols
+    onehot_cols = [c for c in cat_cols if len(cat_encodings[c]) <= onehot_max_cardinality]
+    ordinal_cols = [c for c in cat_cols if c not in onehot_cols]
+    n_dummies = sum(len(cat_encodings[c]) for c in onehot_cols)
+    print(f"Features: {len(features)} | Numeric: {len(numeric_cols)} | "
+          f"Categorical one-hot: {len(onehot_cols)} ({n_dummies} columns) | "
+          f"Categorical ordinal: {len(ordinal_cols)}")
+    for c in onehot_cols:
+        print(f"   one-hot  {c:<10} {len(cat_encodings[c]):>4} levels")
+    for c in ordinal_cols:
+        print(f"   ordinal  {c:<10} {len(cat_encodings[c]):>4} levels (too many to expand)")
+
     scaler = StandardScaler()
     train_df[numeric_cols] = scaler.fit_transform(train_df[numeric_cols])
     for d in [test_df] + ([inference_df] if inference_df is not None else []):
         d[numeric_cols] = scaler.transform(d[numeric_cols])
 
-    X_train = train_df[feature_cols].copy()
-    X_test = test_df[feature_cols].copy()
-    X_inf = inference_df[feature_cols].copy() if inference_df is not None else None
+    def _design_matrix(df):
+        """Numeric + ordinal columns, plus one dummy per level of the low
+        cardinality categoricals. float32 halves the memory of a matrix that is
+        mostly zeros once expanded."""
+        if df is None:
+            return None
+        base = df[numeric_cols + ordinal_cols].astype(np.float32)
+        if not onehot_cols:
+            return base
+        parts = [base]
+        for col in onehot_cols:
+            codes = df[col].to_numpy()
+            for level, idx in cat_encodings[col].items():
+                parts.append(pd.Series((codes == idx).astype(np.float32),
+                                       index=df.index, name=f"{col}={level}"))
+        return pd.concat(parts, axis=1)
+
+    X_train = _design_matrix(train_df)
+    X_test = _design_matrix(test_df)
+    X_inf = _design_matrix(inference_df)
+    feature_cols = list(X_train.columns)
 
     print(f"X_train: {X_train.shape} | X_test: {X_test.shape}", end="")
     if X_inf is not None:
@@ -828,16 +863,23 @@ SUPPORTED_MODELS: tuple[str, ...] = ("RandomForest", "XGBoost", "AdaBoost", "ANN
 #: `TrainingConfig(param_grids={...})` — an override replaces the grid of that
 #: model only, the others keep their default.
 DEFAULT_PARAM_GRIDS: dict[str, dict] = {
+    # Depth is capped and a minimum leaf size imposed: left unconstrained, the
+    # forest reached a perfect training score (AUC 1.00 train against 0.73 test)
+    # by isolating individual rows. min_samples_leaf is what forbids that.
     "RandomForest": {
-        "n_estimators": [100, 200],
-        "max_depth": [10, 20, None],
-        "max_features": ["sqrt"],
+        "n_estimators": [200, 400],
+        "max_depth": [8, 12, 16],
+        "min_samples_leaf": [20, 50, 200],
+        "max_features": ["sqrt", 0.3],
     },
     "XGBoost": {
-        "n_estimators": [100, 200],
-        "max_depth": [4, 8],
-        "learning_rate": [0.05, 0.1],
-        "subsample": [0.8, 1.0],
+        "n_estimators": [200, 400],
+        "max_depth": [4, 6],
+        "learning_rate": [0.03, 0.05, 0.1],
+        "subsample": [0.8],
+        "colsample_bytree": [0.6, 0.8],
+        "min_child_weight": [5, 20, 50],
+        "reg_lambda": [1.0, 10.0],
     } if XGB_AVAILABLE else {
         # HistGradientBoostingClassifier fallback (xgboost missing): different
         # argument names.
@@ -923,8 +965,11 @@ class TrainingConfig:
         search_sample: size of the tuning subsample (drawn from X_fit);
             `None` = all of X_fit.
         fit_sample: size of the final fit subsample (drawn from X_train);
-            `None` = all of X_train. AdaBoost and the scikit-learn MLP being
-            sequential, raising it costs roughly linear time.
+            `None` = all of X_train.
+        fit_sample_by_model: per-model override of `fit_sample`, e.g.
+            `{"AdaBoost": 3_000_000}`. RandomForest and XGBoost are parallel and
+            take the whole training set; AdaBoost and the scikit-learn MLP are
+            sequential, so their cost grows linearly and they need a ceiling.
         use_smote: apply SMOTE to the tuning subset (never to the test set).
         smote_params: arguments passed to `SMOTE` (e.g.
             `{"sampling_strategy": 0.3, "k_neighbors": 3}`).
@@ -952,6 +997,7 @@ class TrainingConfig:
     scoring: str = "roc_auc"
     search_sample: Optional[int] = 80_000
     fit_sample: Optional[int] = 800_000
+    fit_sample_by_model: dict = field(default_factory=dict)
     use_smote: bool = True
     smote_params: dict = field(default_factory=dict)
     balance_classes: bool = True
@@ -1101,6 +1147,11 @@ def _make_estimator(name: str, cfg: TrainingConfig, spw: float, params: Optional
                 kwargs["algorithm"] = "SAMME"
         except Exception:
             pass
+        if cfg.balance_classes:
+            # AdaBoostClassifier exposes no class_weight, but its base learner
+            # does: without it AdaBoost is the family with no rebalancing at all.
+            kwargs["estimator"] = DecisionTreeClassifier(
+                max_depth=1, class_weight="balanced", random_state=cfg.random_state)
         estimator_cls = AdaBoostClassifier
     elif name == "ANN":
         estimator_cls = MLPClassifier
@@ -1248,16 +1299,15 @@ def train_binary_classifiers(
     Xs, ys = X_fit.loc[idx], y_fit[pos]
     log(f"Tuning subsample: {s_n:,} rows  |  search: {cfg.search} (cv={cfg.cv}, scoring={cfg.scoring})")
 
-    if cfg.use_smote and SMOTE_AVAILABLE and cfg.search != "none":
-        log(f"Applying SMOTE to the tuning subset {cfg.smote_params or ''}...")
-        try:
-            Xs, ys = SMOTE(random_state=cfg.random_state, **cfg.smote_params).fit_resample(Xs, ys)
-            u, c = np.unique(ys, return_counts=True)
-            log(f"After SMOTE: {dict(zip(u.tolist(), c.tolist()))}")
-        except Exception as e:
-            log(f"SMOTE failed ({e}) — continuing without it")
-    elif not cfg.use_smote:
-        log("SMOTE disabled (use_smote=False)")
+    # No resampling here: SMOTE applied to the whole tuning subset before the
+    # cross-validation put interpolated copies of a minority point in the
+    # validation fold while its neighbours stayed in the training fold. The CV
+    # score then measured memorisation of synthetic data (0.99 ROC-AUC against
+    # 0.75 on the test set) and the search selected whichever model memorised
+    # best — a RandomForest with unlimited depth. Rebalancing now happens
+    # strictly inside each fold: the ANN carries SMOTE in its own pipeline, the
+    # other families use class weights, which need no resampling at all.
+    log(f"Class rebalancing: {'class weights (ANN: SMOTE inside its pipeline)' if cfg.balance_classes else 'disabled'}")
 
     models = ModelSet()
     rows = []
@@ -1273,11 +1323,22 @@ def train_binary_classifiers(
         else:
             log(f"{name}: no search (search='{cfg.search}') — direct fit with the fixed parameters")
 
+        # Per-model fit size: the parallel families take the whole training
+        # set, the sequential ones (AdaBoost, MLP) need a ceiling or they never
+        # finish. Falls back to the shared X_fit when no override is given.
+        if name in cfg.fit_sample_by_model:
+            cap = cfg.fit_sample_by_model[name]
+            m_n = len(X_train) if cap is None else min(cap, len(X_train))
+            m_idx = X_train.sample(n=m_n, random_state=cfg.random_state).index
+            X_m, y_m = X_train.loc[m_idx], y_tr[X_train.index.get_indexer(m_idx)]
+        else:
+            X_m, y_m = X_fit, y_fit
+
         t0 = time.time()
         model = _make_estimator(name, cfg, spw, params=best_params)
-        model.fit(X_fit, y_fit)
+        model.fit(X_m, y_m)
         t_fit = time.time() - t0
-        log(f"{name} trained on {len(X_fit):,} rows in {t_fit:.1f}s")
+        log(f"{name} trained on {len(X_m):,} rows in {t_fit:.1f}s")
 
         models[name] = model
         rows.append({
@@ -1286,6 +1347,7 @@ def train_binary_classifiers(
             "Candidates": n_cand,
             f"CV {cfg.scoring}": round(cv_score, 4) if n_cand else np.nan,
             "Best params": str(best_params) if best_params else str(cfg.base_for(name)),
+            "Fit rows": len(X_m),
             "Search time (s)": round(t_search, 1),
             "Fit time (s)": round(t_fit, 1),
         })

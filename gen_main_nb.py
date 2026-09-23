@@ -305,6 +305,7 @@ code("""\
 X_train, X_test, X_inference, feature_cols, scaler, cat_encodings = prepare_features(
     train_df, test_df, inference_df=df_inference,
     categorical_cols=["stopcode", "sta3n", "non_va", "state", "zip"],
+    onehot_max_cardinality=150,   # one-hot below this, integer code above
     excluded_cols={"service_time", "NoShow", "group_label", "cluster",
                    "discontinued", "dts", "dta",
                    "completed"},  # safeguard: no longer produced, except in an older Parquet
@@ -342,13 +343,20 @@ md("### 4.0 Training control panel\n\n"
    "| `cv` | cross-validation folds of the tuning | 5 for a more stable choice, 2 to go fast |\n"
    "| `scoring` | score optimised by the search | `average_precision` suits ~3% positives better than `roc_auc`; `recall` when missing a no-show is costly |\n"
    "| `search_sample` | tuning rows | raising it makes hyperparameter selection more reliable (roughly linear cost) |\n"
-   "| `fit_sample` | final fit rows | first lever on raw performance; `None` = the whole `train_df` (very slow for AdaBoost/ANN) |\n"
+   "| `fit_sample` / `fit_sample_by_model` | final fit rows, globally or per family | `None` = the whole `train_df`; the sequential families (AdaBoost, ANN) need a ceiling |\n"
    "| `use_smote` / `smote_params` | synthetic oversampling of the tuning subset | `{\"sampling_strategy\": 0.3}` avoids the overcorrection of full SMOTE |\n"
    "| `balance_classes` / `scale_pos_weight` | class weighting | three imbalance mechanisms stack up: switching one off can improve precision |\n"
    "| `param_grids` / `base_params` | grids explored / fixed hyperparameters | `DEFAULT_PARAM_GRIDS` is the starting point, printed below |\n"
    "| `threshold_metric` | decision-threshold criterion | `f1_positive` or `youden` favour no-show recall — **without retraining** |\n\n"
    "Reported metrics are fixed: **AUC, accuracy, precision, recall, F1-score**, "
    "the last three macro-averaged over both classes.\n\n"
+   "**On rebalancing.** SMOTE is no longer applied to the tuning subset before "
+   "the cross-validation: interpolated copies of a minority point ended up in "
+   "the validation fold while its neighbours stayed in the training fold, so "
+   "the CV score measured memorisation of synthetic data (0.99 ROC-AUC against "
+   "0.75 on the test set) and the search kept whichever model memorised best — "
+   "a forest of unlimited depth. Rebalancing now happens strictly inside each "
+   "fold: class weights for the tree families, SMOTE inside the ANN pipeline.\n\n"
    "**On the ANN.** `MLPClassifier` accepts neither `class_weight` nor "
    "`sample_weight`, so it was the only family left untreated against a 3% "
    "positive rate and collapsed onto the majority class. It is now fitted "
@@ -366,9 +374,15 @@ TRAIN_CFG_NOSHOW = TrainingConfig(
     search="grid",                  # "grid" | "random" | "none"
     n_iter=20,                      # draws when search="random"
     cv=3,                           # cross-validation folds of the tuning
-    scoring="roc_auc",              # e.g. "average_precision", "f1_macro", "recall"
+    scoring="f1_macro",             # optimise the search on the reported metric,
+                                    # not on ranking quality (roc_auc)
     search_sample=80_000,           # tuning rows     (None = all of X_fit)
-    fit_sample=800_000,             # final fit rows  (None = all of X_train)
+    fit_sample=None,                # final fit rows  (None = all of X_train)
+    fit_sample_by_model={           # ceilings for the families that cannot take it all
+        "RandomForest": 5_000_000,  #   O(n log n) per tree, 400 trees
+        "AdaBoost": 3_000_000,      #   sequential boosting
+        "ANN": 2_000_000,           #   sequential, and SMOTE expands the data further
+    },                              #   XGBoost keeps the full training set
     use_smote=True,                 # SMOTE on the tuning subset only
     smote_params={},                # e.g. {"sampling_strategy": 0.3, "k_neighbors": 3}
     balance_classes=True,           # class_weight="balanced" / scale_pos_weight
