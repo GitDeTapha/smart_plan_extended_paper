@@ -371,18 +371,22 @@ code("""\
 # Edit here, rerun 4a, compare with training_history_table() (4c).
 TRAIN_CFG_NOSHOW = TrainingConfig(
     models=["RandomForest", "XGBoost", "AdaBoost", "ANN"],  # families to train
-    search="grid",                  # "grid" | "random" | "none"
-    n_iter=20,                      # draws when search="random"
+    search="random",                # "grid" | "random" | "none"
+    n_iter=12,                      # draws when search="random"
     cv=3,                           # cross-validation folds of the tuning
     scoring="f1_macro",             # optimise the search on the reported metric,
                                     # not on ranking quality (roc_auc)
-    search_sample=80_000,           # tuning rows     (None = all of X_fit)
-    fit_sample=None,                # final fit rows  (None = all of X_train)
-    fit_sample_by_model={           # ceilings for the families that cannot take it all
-        "RandomForest": 5_000_000,  #   O(n log n) per tree, 400 trees
-        "AdaBoost": 3_000_000,      #   sequential boosting
-        "ANN": 2_000_000,           #   sequential, and SMOTE expands the data further
-    },                              #   XGBoost keeps the full training set
+    search_sample=50_000,           # tuning rows     (None = all of X_fit)
+    # Sized for a wall-clock budget: section 4 trains every family TWICE
+    # (no-show, then A/B group), and the design matrix went from 12 to ~200
+    # columns, which costs the sequential families roughly one order of
+    # magnitude. Raise these once the budget allows.
+    fit_sample=2_000_000,           # default, used by RandomForest
+    fit_sample_by_model={
+        "XGBoost": 5_000_000,       #   histogram method, parallel: the cheapest per row
+        "AdaBoost": 500_000,        #   stumps scan every feature: cost grows with the 200 columns
+        "ANN": 400_000,             #   sequential, and SMOTE nearly doubles it again
+    },
     use_smote=True,                 # SMOTE on the tuning subset only
     smote_params={},                # e.g. {"sampling_strategy": 0.3, "k_neighbors": 3}
     balance_classes=True,           # class_weight="balanced" / scale_pos_weight

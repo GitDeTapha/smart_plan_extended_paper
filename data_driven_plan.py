@@ -909,7 +909,7 @@ DEFAULT_BASE_PARAMS: dict[str, dict] = {
     "RandomForest": {},
     "XGBoost": {"eval_metric": "logloss", "verbosity": 0} if XGB_AVAILABLE else {},
     "AdaBoost": {},
-    "ANN": {"solver": "adam", "max_iter": 800, "early_stopping": True,
+    "ANN": {"solver": "adam", "max_iter": 400, "early_stopping": True,
             "validation_fraction": 0.1, "n_iter_no_change": 25,
             "batch_size": 512, "learning_rate": "adaptive"},
 }
