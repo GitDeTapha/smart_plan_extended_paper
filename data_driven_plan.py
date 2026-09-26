@@ -895,7 +895,7 @@ DEFAULT_PARAM_GRIDS: dict[str, dict] = {
     # reference model of the study, and the narrow (64,32)/(128,64) grid used
     # previously left it far behind the tree ensembles.
     "ANN": {
-        "hidden_layer_sizes": [(128, 64), (256, 128), (256, 128, 64)],
+        "hidden_layer_sizes": [(128, 64), (256, 128)],
         "alpha": [1e-5, 1e-4, 1e-3],
         "learning_rate_init": [1e-3, 3e-4],
     },
@@ -909,7 +909,7 @@ DEFAULT_BASE_PARAMS: dict[str, dict] = {
     "RandomForest": {},
     "XGBoost": {"eval_metric": "logloss", "verbosity": 0} if XGB_AVAILABLE else {},
     "AdaBoost": {},
-    "ANN": {"solver": "adam", "max_iter": 400, "early_stopping": True,
+    "ANN": {"solver": "adam", "max_iter": 300, "early_stopping": True,
             "validation_fraction": 0.1, "n_iter_no_change": 25,
             "batch_size": 512, "learning_rate": "adaptive"},
 }
@@ -924,6 +924,12 @@ THRESHOLD_METRICS: tuple[str, ...] = (
 )
 
 SEARCH_STRATEGIES: tuple[str, ...] = ("grid", "random", "none")
+
+#: Families rebalanced by resampling inside the fit rather than by class
+#: weights, because neither accepts a weight: the MLP has no such parameter and
+#: AdaBoost breaks when its base learner carries one.
+SMOTE_BALANCED_MODELS: tuple[str, ...] = ("ANN", "AdaBoost")
+PIPE_STEP = "clf"   # name of the classifier step inside the resampling pipeline
 
 # Reported metric set, fixed by the paper's conventions: AUC, accuracy,
 # precision, recall, F1-score. Precision, recall and F1 are MACRO-averaged
@@ -1147,11 +1153,6 @@ def _make_estimator(name: str, cfg: TrainingConfig, spw: float, params: Optional
                 kwargs["algorithm"] = "SAMME"
         except Exception:
             pass
-        if cfg.balance_classes:
-            # AdaBoostClassifier exposes no class_weight, but its base learner
-            # does: without it AdaBoost is the family with no rebalancing at all.
-            kwargs["estimator"] = DecisionTreeClassifier(
-                max_depth=1, class_weight="balanced", random_state=cfg.random_state)
         estimator_cls = AdaBoostClassifier
     elif name == "ANN":
         estimator_cls = MLPClassifier
@@ -1160,25 +1161,28 @@ def _make_estimator(name: str, cfg: TrainingConfig, spw: float, params: Optional
 
     kwargs.update(cfg.base_for(name))
 
-    if name == "ANN" and cfg.balance_classes and SMOTE_AVAILABLE:
-        # MLPClassifier accepts neither class_weight nor sample_weight, so the
-        # only way to rebalance it is to resample inside the fit itself. Without
-        # this the ANN is the one family left untreated against a 3% positive
-        # rate, and it collapses onto the majority class (recall 0.000 at the
-        # default threshold). An imbalanced-learn pipeline resamples on fit only,
-        # never on predict, so the reported probabilities stay honest.
+    if name in SMOTE_BALANCED_MODELS and cfg.balance_classes and SMOTE_AVAILABLE:
+        # These two families cannot be rebalanced by weighting. MLPClassifier
+        # accepts neither class_weight nor sample_weight. AdaBoostClassifier
+        # exposes no class_weight either, and weighting its base learner breaks
+        # the algorithm outright: the stump then optimises a different criterion
+        # than the boosting distribution, its weighted error exceeds 50% and
+        # sklearn aborts with "BaseClassifier ... is worse than random".
+        # Resampling inside the fit is the way that works for both. An
+        # imbalanced-learn pipeline resamples on fit only, never on predict, so
+        # the reported probabilities stay honest.
         estimator = ImbPipeline([
             ("smote", SMOTE(random_state=cfg.random_state, **cfg.smote_params)),
-            ("mlp", MLPClassifier(**kwargs)),
+            (PIPE_STEP, estimator_cls(**kwargs)),
         ])
     else:
         estimator = estimator_cls(**kwargs)
 
     if params:
-        # Grid keys addressing a pipeline step need the "mlp__" prefix; accept
-        # them written either way so callers need not know about the wrapper.
-        if isinstance(estimator, ImbPipeline) if ImbPipeline else False:
-            params = {(k if "__" in k else f"mlp__{k}"): v for k, v in params.items()}
+        # Grid keys addressing a pipeline step need the step prefix; accept them
+        # written either way so callers need not know about the wrapper.
+        if ImbPipeline is not None and isinstance(estimator, ImbPipeline):
+            params = {(k if "__" in k else f"{PIPE_STEP}__{k}"): v for k, v in params.items()}
         estimator.set_params(**params)
     return estimator
 
@@ -1206,7 +1210,7 @@ def _search_hyperparams(name: str, cfg: TrainingConfig, spw: float,
     # candidates); doing both oversubscribes the cores.
     base = _make_estimator(name, cfg, spw, n_jobs=1)
     if ImbPipeline is not None and isinstance(base, ImbPipeline):
-        grid = {(k if "__" in k else f"mlp__{k}"): v for k, v in grid.items()}
+        grid = {(k if "__" in k else f"{PIPE_STEP}__{k}"): v for k, v in grid.items()}
     if cfg.search == "random":
         n_cand = min(cfg.n_iter, _n_candidates(grid))
         search = RandomizedSearchCV(base, grid, n_iter=n_cand, cv=cfg.cv, scoring=cfg.scoring,

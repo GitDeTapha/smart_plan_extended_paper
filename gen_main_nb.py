@@ -376,16 +376,17 @@ TRAIN_CFG_NOSHOW = TrainingConfig(
     cv=3,                           # cross-validation folds of the tuning
     scoring="f1_macro",             # optimise the search on the reported metric,
                                     # not on ranking quality (roc_auc)
-    search_sample=50_000,           # tuning rows     (None = all of X_fit)
-    # Sized for a wall-clock budget: section 4 trains every family TWICE
-    # (no-show, then A/B group), and the design matrix went from 12 to ~200
-    # columns, which costs the sequential families roughly one order of
-    # magnitude. Raise these once the budget allows.
-    fit_sample=2_000_000,           # default, used by RandomForest
+    search_sample=40_000,           # tuning rows     (None = all of X_fit)
+    # Sized from the timings measured on this machine with the ~200-column
+    # design matrix: RandomForest 204 s for 2M rows, XGBoost 50 s for 5M. The
+    # sequential families are the constraint, and section 4 trains every family
+    # TWICE (no-show, then A/B group).
+    fit_sample=2_000_000,
     fit_sample_by_model={
-        "XGBoost": 5_000_000,       #   histogram method, parallel: the cheapest per row
-        "AdaBoost": 500_000,        #   stumps scan every feature: cost grows with the 200 columns
-        "ANN": 400_000,             #   sequential, and SMOTE nearly doubles it again
+        "XGBoost": None,            #   histogram method: takes the whole training set
+        "RandomForest": 5_000_000,  #   ~8 min at this size
+        "AdaBoost": 250_000,        #   stumps rescan the 200 columns at every iteration
+        "ANN": 200_000,             #   sequential, and SMOTE doubles it again
     },
     use_smote=True,                 # SMOTE on the tuning subset only
     smote_params={},                # e.g. {"sampling_strategy": 0.3, "k_neighbors": 3}
