@@ -77,26 +77,29 @@ be skipped on a later run.
 train 28.1M / test 8.0M / inference holdout 4.0M). Precision, recall and
 F1-score are macro-averaged over both classes.
 
-| Model | AUC | Accuracy | Precision | Recall | F1-score |
-|---|---|---|---|---|---|
-| XGBoost | **0.7538** | 0.9455 | 0.5764 | 0.5855 | 0.5806 |
-| RandomForest | 0.7302 | 0.9475 | 0.5735 | 0.5742 | 0.5738 |
-| AdaBoost | 0.7248 | 0.9265 | 0.5427 | 0.5710 | 0.5516 |
-| ANN | 0.6396 | 0.9312 | 0.5325 | 0.5462 | 0.5374 |
+No-show prediction, test set, each model at its optimal threshold:
 
-No-show prediction, test set, at each model's optimal threshold. Brier score of
-the calibrated XGBoost: 0.0290. The A/B service-time classifier ranks the same
-way (XGBoost 0.7362). Clustering: K=2, bootstrapped silhouette 0.6917 ± 0.0035,
-cutoff 38.5 min. The ILP instance built from 30 held-out patients over 6 slots
-solves in 3.3 s (Z_complete 40.7221).
+| Model | AUC | Accuracy | Precision | Recall | F1-score | train-test AUC gap |
+|---|---|---|---|---|---|---|
+| XGBoost | **0.77** | 0.94 | 0.58 | 0.59 | **0.59** | 0.00 |
+| RandomForest | 0.76 | 0.95 | 0.58 | 0.58 | 0.58 | 0.02 |
+| AdaBoost | 0.69 | 0.89 | 0.53 | 0.58 | 0.53 | 0.00 |
+| ANN | 0.63 | 0.94 | 0.54 | 0.54 | 0.54 | 0.03 |
 
-- `run_20260923_0229.ipynb` — the executed notebook, figures included
+Brier score of the calibrated XGBoost: 0.0288. The A/B service-time classifier
+ranks the same way (XGBoost 0.73). Clustering: K=2, bootstrapped silhouette
+0.6917 ± 0.0035, cutoff 38.5 min. The ILP instance built from 30 held-out
+patients over 6 slots solves in 2.9 s (Z_complete 39.9288).
+
+The near-zero train-test gaps matter as much as the scores. An earlier run
+reported 0.99 cross-validated ROC-AUC against 0.75 on the test set, because
+SMOTE was applied to the tuning subset before the cross-validation: the search
+then selected whichever model best memorised interpolated data, and the forest
+it picked scored a perfect 1.00 on its own training set. Resampling now happens
+inside each fold only.
+
+- `run_20260926_2002.ipynb` — the executed notebook, figures included
 - `recap_data_driven_plan.csv`, `training_history.csv` — summary tables
-
-The decision threshold trades recall against accuracy at identical AUC: 0.5855
-recall and 0.9455 accuracy under `f1_macro` (threshold 0.75) against 0.6943
-recall and 0.7154 accuracy under `youden` (threshold 0.43). Which one to report
-depends on the cost of missing a no-show against the cost of overbooking.
 
 ## Tuning the models
 

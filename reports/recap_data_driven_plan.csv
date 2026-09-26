@@ -1,13 +1,13 @@
 Item,Value
 Split,"40,133,413 rows (full dataset) | train=28,093,389 test=8,026,683 inference=4,013,341"
 No-show — best model,XGBoost
-No-show — AUC (test),0.7538
-No-show — Brier (calibrated),0.0290
+No-show — AUC (test),0.7700
+No-show — Brier (calibrated),0.0288
 service_time clustering — selected K,2
 Clustering — bootstrapped silhouette,"mean=0.6917, sd=0.0035"
 Cutoff (decision tree),38.5 min
 Group — best classifier,XGBoost
-Group — AUC (test),0.7362
+Group — AUC (test),0.7300
 ILP — real instance (n patients),30
-ILP — Z_complete,40.7221
-ILP — solve time,3.279 s
+ILP — Z_complete,39.9288
+ILP — solve time,2.898 s

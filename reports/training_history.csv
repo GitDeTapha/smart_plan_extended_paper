@@ -1,25 +1,25 @@
 Run,Model,search,scoring,cv,fit_sample,smote,balance,threshold,AUC,Accuracy,Precision,Recall,F1-score,Threshold,Notes
-no-show — reference config,XGBoost,grid,roc_auc,3,800000,True,True,f1_macro,0.7538,0.9455,0.5764,0.5855,0.5806,0.75,grid / roc_auc / SMOTE / f1_macro threshold
-no-show — youden threshold,XGBoost,grid,roc_auc,3,800000,True,True,f1_macro,0.7538,0.7154,0.5286,0.6943,0.48,0.43,"same models, threshold only"
-no-show — f1_positive threshold,XGBoost,grid,roc_auc,3,800000,True,True,f1_macro,0.7538,0.9335,0.5656,0.6027,0.5787,0.72,"same models, threshold only"
-no-show — f1_macro threshold,XGBoost,grid,roc_auc,3,800000,True,True,f1_macro,0.7538,0.9455,0.5764,0.5855,0.5806,0.75,"same models, threshold only"
-no-show — balanced_accuracy threshold,XGBoost,grid,roc_auc,3,800000,True,True,f1_macro,0.7538,0.7154,0.5286,0.6943,0.48,0.43,"same models, threshold only"
-A/B group — reference config,XGBoost,grid,roc_auc,3,800000,True,True,f1_macro,0.7362,0.7917,0.6191,0.6334,0.6253,0.62,
-no-show — reference config,RandomForest,grid,roc_auc,3,800000,True,True,f1_macro,0.7302,0.9475,0.5735,0.5742,0.5738,0.13,grid / roc_auc / SMOTE / f1_macro threshold
-no-show — balanced_accuracy threshold,RandomForest,grid,roc_auc,3,800000,True,True,f1_macro,0.7302,0.804,0.5316,0.663,0.5157,0.05,"same models, threshold only"
-no-show — f1_positive threshold,RandomForest,grid,roc_auc,3,800000,True,True,f1_macro,0.7302,0.9345,0.5606,0.5901,0.5715,0.11,"same models, threshold only"
-no-show — youden threshold,RandomForest,grid,roc_auc,3,800000,True,True,f1_macro,0.7302,0.804,0.5316,0.663,0.5157,0.05,"same models, threshold only"
-no-show — f1_macro threshold,RandomForest,grid,roc_auc,3,800000,True,True,f1_macro,0.7302,0.9475,0.5735,0.5742,0.5738,0.13,"same models, threshold only"
-no-show — youden threshold,AdaBoost,grid,roc_auc,3,800000,True,True,f1_macro,0.7248,0.661,0.5238,0.6772,0.4526,0.29,"same models, threshold only"
-no-show — reference config,AdaBoost,grid,roc_auc,3,800000,True,True,f1_macro,0.7248,0.9265,0.5427,0.571,0.5516,0.36,grid / roc_auc / SMOTE / f1_macro threshold
-no-show — balanced_accuracy threshold,AdaBoost,grid,roc_auc,3,800000,True,True,f1_macro,0.7248,0.661,0.5238,0.6772,0.4526,0.29,"same models, threshold only"
-no-show — f1_macro threshold,AdaBoost,grid,roc_auc,3,800000,True,True,f1_macro,0.7248,0.9265,0.5427,0.571,0.5516,0.36,"same models, threshold only"
-no-show — f1_positive threshold,AdaBoost,grid,roc_auc,3,800000,True,True,f1_macro,0.7248,0.8912,0.5356,0.6001,0.543,0.35,"same models, threshold only"
-A/B group — reference config,RandomForest,grid,roc_auc,3,800000,True,True,f1_macro,0.7112,0.7812,0.6054,0.621,0.6117,0.24,
-A/B group — reference config,AdaBoost,grid,roc_auc,3,800000,True,True,f1_macro,0.6605,0.7785,0.5749,0.5739,0.5744,0.42,
-no-show — f1_positive threshold,ANN,grid,roc_auc,3,800000,True,True,f1_macro,0.6396,0.8964,0.5266,0.568,0.5311,0.44,"same models, threshold only"
-no-show — reference config,ANN,grid,roc_auc,3,800000,True,True,f1_macro,0.6396,0.9312,0.5325,0.5462,0.5374,0.56,grid / roc_auc / SMOTE / f1_macro threshold
-no-show — balanced_accuracy threshold,ANN,grid,roc_auc,3,800000,True,True,f1_macro,0.6396,0.6872,0.5152,0.6065,0.4531,0.2,"same models, threshold only"
-no-show — f1_macro threshold,ANN,grid,roc_auc,3,800000,True,True,f1_macro,0.6396,0.9312,0.5325,0.5462,0.5374,0.56,"same models, threshold only"
-no-show — youden threshold,ANN,grid,roc_auc,3,800000,True,True,f1_macro,0.6396,0.6872,0.5152,0.6065,0.4531,0.2,"same models, threshold only"
-A/B group — reference config,ANN,grid,roc_auc,3,800000,True,True,f1_macro,0.626,0.7493,0.5507,0.5578,0.5533,0.63,
+no-show — reference config,XGBoost,random,f1_macro,3,2000000,True,True,f1_macro,0.77,0.94,0.58,0.59,0.59,0.77,grid / roc_auc / SMOTE / f1_macro threshold
+no-show — youden threshold,XGBoost,random,f1_macro,3,2000000,True,True,f1_macro,0.77,0.72,0.53,0.71,0.48,0.5,"same models, threshold only"
+no-show — f1_positive threshold,XGBoost,random,f1_macro,3,2000000,True,True,f1_macro,0.77,0.94,0.57,0.61,0.58,0.75,"same models, threshold only"
+no-show — f1_macro threshold,XGBoost,random,f1_macro,3,2000000,True,True,f1_macro,0.77,0.94,0.58,0.59,0.59,0.77,"same models, threshold only"
+no-show — balanced_accuracy threshold,XGBoost,random,f1_macro,3,2000000,True,True,f1_macro,0.77,0.72,0.53,0.71,0.48,0.5,"same models, threshold only"
+no-show — reference config,RandomForest,random,f1_macro,3,2000000,True,True,f1_macro,0.76,0.95,0.58,0.58,0.58,0.76,grid / roc_auc / SMOTE / f1_macro threshold
+no-show — youden threshold,RandomForest,random,f1_macro,3,2000000,True,True,f1_macro,0.76,0.7,0.53,0.7,0.47,0.46,"same models, threshold only"
+no-show — balanced_accuracy threshold,RandomForest,random,f1_macro,3,2000000,True,True,f1_macro,0.76,0.7,0.53,0.7,0.47,0.46,"same models, threshold only"
+no-show — f1_positive threshold,RandomForest,random,f1_macro,3,2000000,True,True,f1_macro,0.76,0.93,0.57,0.61,0.58,0.72,"same models, threshold only"
+no-show — f1_macro threshold,RandomForest,random,f1_macro,3,2000000,True,True,f1_macro,0.76,0.95,0.58,0.58,0.58,0.76,"same models, threshold only"
+A/B group — reference config,XGBoost,random,f1_macro,3,2000000,True,True,f1_macro,0.73,0.79,0.61,0.62,0.62,0.61,
+A/B group — reference config,RandomForest,random,f1_macro,3,2000000,True,True,f1_macro,0.72,0.79,0.61,0.62,0.61,0.59,
+no-show — youden threshold,AdaBoost,random,f1_macro,3,2000000,True,True,f1_macro,0.69,0.77,0.53,0.65,0.49,0.48,"same models, threshold only"
+no-show — balanced_accuracy threshold,AdaBoost,random,f1_macro,3,2000000,True,True,f1_macro,0.69,0.77,0.53,0.65,0.49,0.48,"same models, threshold only"
+no-show — f1_macro threshold,AdaBoost,random,f1_macro,3,2000000,True,True,f1_macro,0.69,0.89,0.53,0.58,0.53,0.49,"same models, threshold only"
+no-show — reference config,AdaBoost,random,f1_macro,3,2000000,True,True,f1_macro,0.69,0.89,0.53,0.58,0.53,0.49,grid / roc_auc / SMOTE / f1_macro threshold
+no-show — f1_positive threshold,AdaBoost,random,f1_macro,3,2000000,True,True,f1_macro,0.69,0.89,0.53,0.58,0.53,0.49,"same models, threshold only"
+no-show — f1_positive threshold,ANN,random,f1_macro,3,2000000,True,True,f1_macro,0.63,0.92,0.53,0.56,0.53,0.44,"same models, threshold only"
+no-show — reference config,ANN,random,f1_macro,3,2000000,True,True,f1_macro,0.63,0.94,0.54,0.54,0.54,0.78,grid / roc_auc / SMOTE / f1_macro threshold
+A/B group — reference config,ANN,random,f1_macro,3,2000000,True,True,f1_macro,0.63,0.75,0.56,0.57,0.56,0.59,
+no-show — balanced_accuracy threshold,ANN,random,f1_macro,3,2000000,True,True,f1_macro,0.63,0.84,0.52,0.58,0.51,0.05,"same models, threshold only"
+no-show — f1_macro threshold,ANN,random,f1_macro,3,2000000,True,True,f1_macro,0.63,0.94,0.54,0.54,0.54,0.78,"same models, threshold only"
+no-show — youden threshold,ANN,random,f1_macro,3,2000000,True,True,f1_macro,0.63,0.84,0.52,0.58,0.51,0.05,"same models, threshold only"
+A/B group — reference config,AdaBoost,random,f1_macro,3,2000000,True,True,f1_macro,0.6,0.79,0.55,0.54,0.54,0.5,
