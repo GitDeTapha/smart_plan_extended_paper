@@ -31,6 +31,9 @@ RANDOM_STATE    = 0
 SMOKE           = False         # True : 1 % des données, budgets minimaux
 PLNE_PARAMS_PATH = "data/inference/plne_parameters.json"  # exporté par data_driven_plan.ipynb
 HOLDOUT_SCORES_PATH = None  # holdout_scores.parquet du même run (q_i, groupes, no-show) ; requis
+CAMPAIGN_OVERRIDES = {}     # ex. {"R": 10, "time_limit": 600.0} ; voir ilp_campaign.CampaignConfig
+N_WORKERS = None            # None : un processus par cœur physique
+CACHE_DIR = "results/ilp_cache"  # solutions par (cellule, graine, méthode, configuration)
 """)
 
 code("""\
@@ -356,10 +359,13 @@ print(_obj_tex)
 
 # ── Section 4 : Générateur + DOE ─────────────────────────────────────────────
 md("## 4. Générateur d'instances et plan d'expériences\n\n"
-   "**⚠ Simplification computationnelle :** S réduit à 20 créneaux (4 jours × 5) "
-   "et R=10 réplications (vs S=40, R=30 dans le plan original) pour respecter le budget 45 min. "
-   "Plan OFAT autour de la cellule centrale "
-   "(ratio=1.5, p̄=0.20, long_share=0.15, c_W/c_I=0.50).")
+   "Tailles, budgets et grilles viennent de `ilp_campaign.CampaignConfig` : production "
+   "(S = 40 créneaux, 5 jours × 8, R = 30 graines, 1 800 s et gap cible 1e-4 par PLNE) ou "
+   "smoke (S = 10, R = 2), modifiables par `CAMPAIGN_OVERRIDES`. Plan OFAT autour de la "
+   "cellule centrale (n/S = 1,5 ; p̄ = 0,20 ; part de créneaux longs 0,15 ; c_W/c_I = 0,50). "
+   "Chaque PLNE est résolu une fois (cache disque), démarré à chaud depuis le glouton B3, "
+   "avec un fil HiGHS par processus et un processus par cœur physique, les instances les "
+   "plus chargées en premier (LPT).")
 
 code("""\
 # ── 4.1 Générateur (ilp_campaign.generate_instance) ──────────────────────────
@@ -369,13 +375,11 @@ code("""\
 import ilp_campaign as campaign
 from ilp_campaign import BETA_CONCENTRATION, Q_CLIP, check_beta_mean, load_holdout_scores
 
-S_TOTAL, D_DOE, SLOTS_PER_DAY = 20, 4, 5  # ⚠ réduit (40,5,8)→(20,4,5) budget 45 min
-
 def generate_instance(seed, ratio=1.5, p_bar=0.20, long_share=0.15, cW_ratio=0.5,
                       c_I=1.0, c_O=C_O_BASE, s_A_=None, s_B_=None, pi_A_=None,
                       Q_bar=None, q_pool=None) -> Instance:
     return campaign.generate_instance(
-        seed, days=D_DOE, slots_per_day=SLOTS_PER_DAY, slot_lengths=SLOT_LENGTHS,
+        seed, days=CC.days, slots_per_day=CC.slots_per_day, slot_lengths=SLOT_LENGTHS,
         ratio=ratio, p_bar=p_bar, long_share=long_share, cW_ratio=cW_ratio,
         s_A=s_A if s_A_ is None else s_A_, s_B=s_B if s_B_ is None else s_B_,
         pi_A=pi_A if pi_A_ is None else pi_A_, c_O=c_O, c_I=c_I, Q_bar=Q_bar, q_pool=q_pool)
@@ -398,100 +402,82 @@ print(f"Holdout : {len(HOLDOUT):,} patients, q̄ = {Q_POOL.mean():.4f}, "
 """)
 
 code("""\
-# ── 4.2 Plan d'expériences OFAT ───────────────────────────────────────────────
-R = 10  # ⚠ réduit de 30 → 10 pour budget 45 min
-SEEDS = [1000 + r for r in range(R)]
+# ── 4.2 Configuration de la campagne ─────────────────────────────────────────
+import dataclasses, functools, json
+from ilp_campaign import (CampaignConfig, CampaignContext, doe_specs, run_lpt, solve_spec,
+                          simulate_spec, spec_cost)
 
-DOE_CELLS = []
-# Cellule centrale
-for r in range(R):
-    DOE_CELLS.append(dict(ratio=1.5, p_bar=0.20, long_share=0.15,
-                          cW_ratio=0.50, seed=SEEDS[r], label="central"))
-# Variations ratio
-for ratio in [1.0, 1.25, 2.0]:
-    for r in range(R):
-        DOE_CELLS.append(dict(ratio=ratio, p_bar=0.20, long_share=0.15,
-                              cW_ratio=0.50, seed=SEEDS[r], label=f"ratio_{ratio}"))
-# Variations p_bar
-for p_bar in [0.03, 0.10, 0.30]:
-    for r in range(R):
-        DOE_CELLS.append(dict(ratio=1.5, p_bar=p_bar, long_share=0.15,
-                              cW_ratio=0.50, seed=SEEDS[r], label=f"pbar_{p_bar}"))
-# Variante P2 : q rééchantillonnés parmi les q_i calibrés du holdout
-for r in range(R):
-    DOE_CELLS.append(dict(ratio=1.5, p_bar=float(1 - Q_POOL.mean()), long_share=0.15,
-                          cW_ratio=0.50, seed=SEEDS[r], label="q_empirique", q_pool=Q_POOL))
-# Variations long_share
-for ls in [0.25, 0.50]:
-    for r in range(R):
-        DOE_CELLS.append(dict(ratio=1.5, p_bar=0.20, long_share=ls,
-                              cW_ratio=0.50, seed=SEEDS[r], label=f"ls_{ls}"))
-# Variations c_W/c_I
-for cwr in [0.1, 0.25, 1.0, 2.0]:
-    for r in range(R):
-        DOE_CELLS.append(dict(ratio=1.5, p_bar=0.20, long_share=0.15,
-                              cW_ratio=cwr, seed=SEEDS[r], label=f"cW_{cwr}"))
-
-print(f"Plan DOE : {len(DOE_CELLS)} cellules × 1 solve")
-print(f"Facteurs : ratio×{len([c for c in DOE_CELLS if 'ratio' in c['label'] or c['label']=='central'])} ...")
+CC = (CampaignConfig.smoke if SMOKE else CampaignConfig.production)(n_workers=N_WORKERS)
+CC = dataclasses.replace(CC, **CAMPAIGN_OVERRIDES)
+# Les q_i du holdout voyagent vers chaque processus : on en garde au plus 100 000,
+# tirés une fois pour toutes (la loi rééchantillonnée reste celle du holdout).
+_rng_pool = np.random.default_rng(RANDOM_STATE)
+Q_POOL_SAMPLE = Q_POOL if len(Q_POOL) <= 100_000 else _rng_pool.choice(Q_POOL, 100_000, replace=False)
+CTX = CampaignContext(cc=CC, s_A=s_A, s_B=s_B, pi_A=pi_A, c_O=C_O_BASE,
+                      slot_lengths=tuple(float(v) for v in SLOT_LENGTHS),
+                      cache_root=CACHE_DIR, q_pool=Q_POOL_SAMPLE)
+R, SEEDS = CC.R, CC.seeds
+with open("results/ilp_campaign_config.json", "w", encoding="utf-8") as fh:
+    json.dump({"campaign": CC.as_dict(), "decisions": DECISIONS, "plne_parameters": PLNE},
+              fh, indent=2, default=str)
+for _k, _v in CC.as_dict().items():
+    print(f"{_k:<20} {_v}")
 """)
 
 code("""\
-# ── 4.3 Exécution du DOE (joblib parallel) ───────────────────────────────────
-# ⚠ Simplification computationnelle : S_TOTAL=20, R=10 (vs 40/30 dans le plan).
-# Réduit pour respecter le budget 45 min (DOE S=40 R=30 dépassait 3600s).
-
-def _solve_cell(cell):
-    inst = generate_instance(**{k:v for k,v in cell.items() if k not in ("label",)})
-    sol  = solve_ilp(inst, Config(time_limit=60.0))
-    occ  = sol.n_served / (inst.n + 1e-9)
-    double_rate = sol.n_double / (sum(inst.T) + 1e-9)
-    return {
-        "label": cell["label"], "seed": cell["seed"],
-        "ratio": cell["ratio"], "p_bar": cell["p_bar"],
-        "long_share": cell["long_share"], "cW_ratio": cell["cW_ratio"],
-        "n": inst.n, "Z_reduced": sol.Z_reduced, "Z_complete": sol.Z_complete,
-        "E_idle": sol.E_idle, "E_wait": sol.E_wait, "E_OT": sol.E_OT,
-        "n_served": sol.n_served, "n_double": sol.n_double,
-        "occ": occ, "double_rate": double_rate,
-        "solve_time": sol.solve_time, "gap": sol.gap,
-    }
-
+# ── 4.3 Exécution du plan d'expériences ──────────────────────────────────────
+DOE_SPECS = doe_specs(CC, with_holdout_q=True)
 _t0_doe = time.perf_counter()
-doe_results = joblib.Parallel(n_jobs=-1, prefer="processes")(
-    joblib.delayed(_solve_cell)(c) for c in DOE_CELLS
-)
+doe_results = run_lpt(functools.partial(solve_spec, CTX), DOE_SPECS, spec_cost, CC.n_workers)
 _t_doe = time.perf_counter() - _t0_doe
-print(f"DOE terminé en {_t_doe/60:.1f} min ({_t_doe:.0f} s)")
-if _t_doe > 2400:
-    print("⚠ Budget dépassé, envisager R=10 pour les expériences ultérieures.")
-
 _df_doe = pd.DataFrame(doe_results)
+_df_doe["occ"] = _df_doe["n_served"] / _df_doe["n"]
+_df_doe["double_rate"] = _df_doe["n_double"] / CC.S
 _df_doe.to_csv("results/doe_ilp.csv", index=False)
-print(_df_doe.groupby("label")[["Z_complete","E_idle","E_wait","E_OT",
-                                 "n_served","double_rate","solve_time"]].mean().round(3))
+print(f"{len(DOE_SPECS)} PLNE en {_t_doe/60:.1f} min sur {CC.n_workers} processus")
+print(_df_doe.groupby("label")[["Z_complete", "E_idle", "E_wait", "E_OT", "n_served",
+                                "double_rate", "solve_time"]].mean().round(3))
 """)
 
 code("""\
-# ── 4.4 Figures DOE ──────────────────────────────────────────────────────────
-os.makedirs("figures", exist_ok=True)
-fig, axes = plt.subplots(2, 2, figsize=(10, 7))
-metrics = ["Z_complete", "E_idle", "E_wait", "E_OT"]
-titles  = ["Coût total Z", "E[Idle]", "E[Wait]", "E[OT]"]
-factors = ["ratio", "p_bar", "long_share", "cW_ratio"]
-colors  = ["#2196F3", "#4CAF50", "#FF9800", "#E91E63"]
+# ── 4.4 Statut de terminaison et gap (audit B1) ──────────────────────────────
+print("Statuts HiGHS :", _df_doe["status"].value_counts().to_dict())
+_unproven = _df_doe[_df_doe["status"] != "optimal"]
+print(f"Optimalité prouvée : {100*(1-len(_unproven)/len(_df_doe)):.1f} % des PLNE")
+if len(_unproven):
+    print("Gap (coût complet) des solutions non prouvées : "
+          f"médiane {_unproven['gap_complete'].median():.2e}, max {_unproven['gap_complete'].max():.2e}")
+    print(_unproven.groupby("label").size().rename("non prouvés").to_string())
+""")
 
-for ax, metric, title in zip(axes.flat, metrics, titles):
-    for fac, col in zip(factors, colors):
-        grp = _df_doe.groupby(fac)[metric].mean()
-        ax.plot(grp.index, grp.values, "o-", label=fac, color=col, alpha=0.8)
-    ax.set_title(title); ax.set_xlabel("Niveau"); ax.legend(fontsize=7)
-    ax.grid(True, alpha=0.3)
+code("""\
+# ── 4.5 Figures du plan d'expériences (moyenne et IC à 95 %) ────────────────
+from scipy import stats as sps
+
+def _mean_ci(x):
+    x = np.asarray(x, float)
+    h = sps.t.ppf(0.975, len(x) - 1) * x.std(ddof=1) / np.sqrt(len(x)) if len(x) > 1 else np.nan
+    return x.mean(), h
+
+_FACTORS = [("ratio", "Charge n/S", "ratio_", CC.central_ratio),
+            ("p_bar", "Taux de no-show moyen p̄", "pbar_", CC.central_p_bar),
+            ("long_share", "Part de créneaux longs", "ls_", CC.central_long_share),
+            ("cW_ratio", "c_W / c_I", "cW_", CC.central_cw_ratio)]
+_METRICS = [("Z_complete", "Coût espéré Z (min pondérées)"), ("E_idle", "E[Idle] pondéré (min)"),
+            ("E_wait", "E[Wait] pondéré (min)"), ("E_OT", "E[OT] pondéré (min)")]
+fig, axes = plt.subplots(len(_METRICS), len(_FACTORS), figsize=(14, 11))
+for c, (fac, xlabel, prefix, center) in enumerate(_FACTORS):
+    sub = _df_doe[(_df_doe["label"] == "central") | _df_doe["label"].str.startswith(prefix)]
+    for r, (met, ylabel) in enumerate(_METRICS):
+        g = sub.groupby(fac)[met].apply(_mean_ci)
+        lv = np.array(g.index, float); mu = np.array([v[0] for v in g]); hw = np.array([v[1] for v in g])
+        ax = axes[r, c]
+        ax.errorbar(lv, mu, yerr=hw, fmt="o-", capsize=3)
+        ax.set_xlabel(xlabel); ax.set_ylabel(ylabel); ax.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig("figures/doe_metrics.pdf", bbox_inches="tight")
-plt.savefig("figures/doe_metrics.png", dpi=150, bbox_inches="tight")
+plt.savefig("figures/doe_metrics.png", dpi=300, bbox_inches="tight")
 plt.show()
-print("Figure doe_metrics sauvegardée.")
 """)
 
 # ── Section 5 : Benchmarks ───────────────────────────────────────────────────
@@ -794,9 +780,9 @@ print("table_benchmarks.tex exportée.")
 """)
 
 # ── Section 6 : Simulation Lindley ───────────────────────────────────────────
-md("## 6. Simulation hors-échantillon, Dynamique séquentielle (Lindley)\n\n"
-   "**Simplification signalée** : M=1 000 tirages pour le DOE (M=10 000 pour l'exemple "
-   "illustratif). Réduire davantage si le budget est dépassé.")
+md("## 6. Simulation hors hypothèse d'indépendance, dynamique séquentielle (Lindley)\n\n"
+   "Chaque planning optimal est rejoué sur une journée réelle : retard propagé d'un créneau "
+   "au suivant, idle terminal compté (correction P1). M scénarios par planning (`CC.M_sim`).")
 
 code("""\
 # ── 6.1 Simulateur Lindley (data_driven_plan.simulate_day / simulate_instance) ─
@@ -829,83 +815,50 @@ print(f"  Écart jour/modèle : {100*(_exact_Z3/_model_Z3-1):+.2f} % (erreur de 
 """)
 
 code("""\
-# ── 6.3 Écart modèle/simulé sur le DOE (M=1000) ──────────────────────────────
-M_DOE_SIM = 1_000   # ⚠ réduit à 1000 pour respecter le budget 45 min
-
-def _sim_cell(cell):
-    rng = np.random.default_rng(cell["seed"] + 9999)
-    inst = generate_instance(**{k:v for k,v in cell.items() if k not in ("label",)})
-    sol  = solve_ilp(inst, Config(time_limit=60.0))
-    Z_model = sol.E_idle + sol.E_wait + sol.E_OT
-    Z_sim   = simulate_instance(inst, sol.planning, M_DOE_SIM, rng, cv=0.0).mean()
-    Z_sim_ln3 = simulate_instance(inst, sol.planning, M_DOE_SIM, rng, cv=0.3).mean()
-    Z_sim_ln5 = simulate_instance(inst, sol.planning, M_DOE_SIM, rng, cv=0.5).mean()
-    gap_pct   = 100*(Z_sim/Z_model - 1) if Z_model > 1e-9 else 0.0
-    return {
-        "label": cell["label"], "seed": cell["seed"],
-        "ratio": cell["ratio"], "p_bar": cell["p_bar"],
-        "long_share": cell["long_share"],
-        "Z_model": Z_model, "Z_sim": Z_sim,
-        "Z_sim_cv03": Z_sim_ln3, "Z_sim_cv05": Z_sim_ln5,
-        "gap_pct": gap_pct,
-        "n_double": sol.n_double,
-        "double_rate": sol.n_double / (sum(inst.T) + 1e-9),
-    }
-
+# ── 6.3 Écart modèle / simulé sur le plan d'expériences ─────────────────────
+# Les plannings viennent du cache de la section 4 (aucune nouvelle résolution).
+# Durées déterministes (cv = 0) puis lognormales (cv = 0,3 et 0,5), même moyenne.
+M_DOE_SIM = CC.M_sim
 _t0_sim = time.perf_counter()
-sim_results = joblib.Parallel(n_jobs=-1)(
-    joblib.delayed(_sim_cell)(c) for c in DOE_CELLS
-)
-_t_sim = time.perf_counter() - _t0_sim
-print(f"Simulation DOE terminée en {_t_sim/60:.1f} min")
-
+sim_results = run_lpt(functools.partial(simulate_spec, CTX), DOE_SPECS, spec_cost, CC.n_workers)
+print(f"Simulation de {len(DOE_SPECS)} plannings (M={M_DOE_SIM:,}) en {(time.perf_counter()-_t0_sim)/60:.1f} min")
 _df_sim = pd.DataFrame(sim_results)
 _df_sim.to_csv("results/simulation_doe.csv", index=False)
-print("\\nÉcart % moyen par cellule :")
-print(_df_sim.groupby("label")["gap_pct"].agg(["mean","std"]).round(2))
+print("Écart % simulé (cv = 0) / modèle, par cellule :")
+print(_df_sim.groupby("label")["gap_pct"].agg(["mean", "std"]).round(2))
 """)
 
 code("""\
-# ── 6.4 Figures : écart % vs n/S et part de doubles ─────────────────────────
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
-
-# Écart vs ratio (n/S)
-grp_ratio = _df_sim.groupby("ratio")["gap_pct"].mean()
-ax1.plot(grp_ratio.index, grp_ratio.values, "o-", color="#2196F3", linewidth=2)
-ax1.set_xlabel("Ratio n/S"); ax1.set_ylabel("Écart % (simulé vs modèle)")
-ax1.set_title("Écart % vs charge n/S"); ax1.grid(True, alpha=0.3)
-
-# Écart vs double_rate
-ax2.scatter(_df_sim["double_rate"], _df_sim["gap_pct"], alpha=0.4, s=15, color="#FF9800")
-ax2.set_xlabel("Part de créneaux doubles"); ax2.set_ylabel("Écart %")
-ax2.set_title("Écart % vs part de doubles"); ax2.grid(True, alpha=0.3)
-
+# ── 6.4 Figures : écart % selon la charge et la part de doubles ─────────────
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
+_sub = _df_sim[(_df_sim["label"] == "central") | _df_sim["label"].str.startswith("ratio_")]
+g = _sub.groupby("ratio")["gap_pct"].apply(_mean_ci)
+ax1.errorbar(g.index, [v[0] for v in g], yerr=[v[1] for v in g], fmt="o-", capsize=3)
+ax1.set_xlabel("Charge n/S"); ax1.set_ylabel("Écart coût simulé / modèle (%)")
+ax1.grid(True, alpha=0.3)
+ax2.scatter(_df_sim["double_rate"], _df_sim["gap_pct"], alpha=0.4, s=15)
+ax2.set_xlabel("Part de créneaux doublés"); ax2.set_ylabel("Écart coût simulé / modèle (%)")
+ax2.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig("figures/sim_gap_analysis.pdf", bbox_inches="tight")
-plt.savefig("figures/sim_gap_analysis.png", dpi=150, bbox_inches="tight")
+plt.savefig("figures/sim_gap_analysis.png", dpi=300, bbox_inches="tight")
 plt.show()
-print("Figure sim_gap_analysis sauvegardée.")
 """)
 
 code("""\
-# ── 6.5 Variante lognormale (CV=0.3 et 0.5) ───────────────────────────────────
-fig, axes = plt.subplots(1, 3, figsize=(13, 4))
-cvs = ["gap_pct", "Z_sim_cv03", "Z_sim_cv05"]
-lbls = ["CV=0 (déterministe)", "CV=0.3 (lognorm.)", "CV=0.5 (lognorm.)"]
-for ax, col, lbl in zip(axes, cvs, lbls):
-    if col == "gap_pct":
-        vals = _df_sim.groupby("ratio")["gap_pct"].mean()
-        ax.plot(vals.index, vals.values, "o-")
-        ax.set_ylabel("Écart % coût simulé/modèle")
-    else:
-        ref = _df_sim["Z_model"]
-        vals = _df_sim.groupby("ratio")[col].mean() / _df_sim.groupby("ratio")["Z_model"].mean()
-        ax.plot(vals.index, (vals.values-1)*100, "o-", color="#E91E63")
-        ax.set_ylabel("Dégradation % vs modèle")
-    ax.set_title(lbl); ax.set_xlabel("Ratio n/S"); ax.grid(True, alpha=0.3)
+# ── 6.5 Variabilité des durées (lognormale, cv = 0,3 et 0,5) ────────────────
+fig, ax = plt.subplots(figsize=(6.5, 4))
+for cv in (0.0, 0.3, 0.5):
+    col = f"Z_sim_cv{cv:g}"
+    dev = 100 * (_sub[col] / _sub["Z_model"] - 1)
+    g = dev.groupby(_sub["ratio"]).apply(_mean_ci)
+    ax.errorbar(g.index, [v[0] for v in g], yerr=[v[1] for v in g], fmt="o-", capsize=3,
+                label=f"cv = {cv:g}")
+ax.set_xlabel("Charge n/S"); ax.set_ylabel("Écart coût simulé / modèle (%)")
+ax.legend(); ax.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig("figures/sim_lognormal.pdf", bbox_inches="tight")
-plt.savefig("figures/sim_lognormal.png", dpi=150, bbox_inches="tight")
+plt.savefig("figures/sim_lognormal.png", dpi=300, bbox_inches="tight")
 plt.show()
 """)
 

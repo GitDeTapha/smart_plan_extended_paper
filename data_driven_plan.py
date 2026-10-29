@@ -2299,6 +2299,7 @@ def load_artifacts(name_prefix: str = "final") -> dict:
 # a run without HiGHS must fail, not switch silently to another algorithm.
 from pyomo.contrib.appsi.solvers import Highs as _AppsiHighs
 from pyomo.contrib.appsi.base import TerminationCondition as _TC
+from pyomo.common.collections import ComponentMap
 
 SOLVER_NAME = "appsi_highs"
 if not _AppsiHighs().available():  # pragma: no cover - environment check
@@ -2346,7 +2347,7 @@ def solve_model(m, cfg: "Config", warm_start: Optional[dict] = None) -> SolveRep
     Args:
         m: Pyomo model with a single minimised objective.
         cfg: solver options (`time_limit`, `mip_gap`, `threads`).
-        warm_start: optional {Var component data: value}; values are set on the
+        warm_start: optional ComponentMap {variable: value}; values are set on the
             model and HiGHS is asked to start from them.
 
     Returns:
@@ -2575,12 +2576,16 @@ def compute_coefficients(inst: Instance) -> dict:
     return dict(a=a, delta=delta, w=w, o=o, gamma=gamma, slots=slots, pairs=pairs, total_L=total_L)
 
 
-def solve_ilp(inst: Instance, cfg: Optional[Config] = None) -> Solution:
+def solve_ilp(inst: Instance, cfg: Optional[Config] = None,
+              warm_start: Optional[dict] = None) -> Solution:
     """Build and solve the overbooking ILP (k<=2) with Pyomo/HiGHS.
 
     Args:
         inst: problem instance.
         cfg: solver options (default: Config()).
+        warm_start: optional feasible schedule {(d, t): [patients]} (e.g. the
+            greedy B3) given to HiGHS as its first incumbent; x and z are set
+            consistently (z = 1 for the pair of a double slot).
 
     Returns:
         Full solution (SPT schedule, E[Idle]/E[Wait]/E[OT] breakdown, etc.).
@@ -2637,7 +2642,19 @@ def solve_ilp(inst: Instance, cfg: Optional[Config] = None) -> Solution:
                 for t, t_next in zip(same, same[1:]):
                     m.SB.add(sum(m.x[i, d, t] for i in I) >= sum(m.x[i, d, t_next] for i in I))
 
-    report = solve_model(m, cfg)
+    start = None
+    if warm_start is not None:
+        start = ComponentMap((m.x[k], 0) for k in x_idx)   # Pyomo variables are not hashable
+        start.update((m.z[k], 0) for k in z_idx)
+        for (d, t), pats in warm_start.items():
+            if len(pats) > 2:
+                raise ValueError(f"warm start: slot {(d, t)} holds {len(pats)} patients")
+            for i in pats:
+                start[m.x[i, d, t]] = 1
+            if len(pats) == 2 and (min(pats), max(pats), d, t) in m.z:
+                start[m.z[min(pats), max(pats), d, t]] = 1
+
+    report = solve_model(m, cfg, warm_start=start)
     if cfg.require_optimal and not report.proven_optimal:
         raise RuntimeError(f"Optimality not proven: status {report.status}, gap {report.gap:.3e}")
 
