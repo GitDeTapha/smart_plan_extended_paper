@@ -104,3 +104,16 @@ def test_disk_check_stops_before_writing(tmp_path):
     assert check_free_disk(str(tmp_path), 0.001) > 0
     with pytest.raises(RuntimeError, match="volume"):
         check_free_disk(str(tmp_path), 10 ** 9)
+
+
+def test_rows_read_sequentially_and_stage_loads_without_mmap(tmp_path):
+    import numpy as np
+    from data_driven_plan import StageRunner, read_npy_rows
+    X = np.arange(60, dtype=np.float32).reshape(20, 3)
+    np.save(tmp_path / "X.npy", X)
+    np.testing.assert_array_equal(read_npy_rows(str(tmp_path / "X.npy"), 7), X[:7])
+    run = StageRunner("t", root=str(tmp_path / "m"), status_dir=str(tmp_path / "r"), mmap=False)
+    run.configure("prep", a=1); run.compute("prep"); run.finish("prep", X=X)
+    loaded = run.load("prep")["X"]
+    assert not isinstance(loaded, np.memmap)
+    np.testing.assert_array_equal(loaded, X)
