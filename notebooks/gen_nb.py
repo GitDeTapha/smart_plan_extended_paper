@@ -696,6 +696,37 @@ SENS_VERDICT = (f"{len(_sig)}/{len(_df_sens)} perturbations significatives ; reg
                 f"{_df_sens['Regret exact (%)'].max():.2f} %")
 """)
 
+# ── Section 7.6 : seuil de double-booking ───────────────────────────────────
+md("### 7.6 Seuil de double-booking (rec. 11)\n\n"
+   "Placer j derrière i dans un créneau (sans saturation, durées égales) échange $c_I q_j s$ "
+   "d'inactivité contre $c_W q_i q_j s$ d'attente : le double est rentable si "
+   "$c_W/c_I < 1/q_i$, où $i$ est le patient servi en premier. Le seuil est **individuel** ; "
+   "avec des $q_i$ dispersés, on attend une bande de transition centrée sur $1/\\bar q$ et non "
+   "une bascule nette. Grille fine de $c_W/c_I$ de 1,0 à 1,5 par pas de 0,05, R graines.")
+
+code("""\
+# ── 7.6 Balayage fin de c_W/c_I ─────────────────────────────────────────────
+from ilp_campaign import threshold_spec, threshold_specs
+_df_thr = pd.DataFrame(run_lpt(functools.partial(threshold_spec, CTX), threshold_specs(CC),
+                               spec_cost, CC.n_workers))
+_df_thr.to_csv("results/threshold_cw_fine.csv", index=False)
+_thr = _df_thr.groupby("cW_ratio").agg(instances_avec_double=("has_double", "mean"),
+                                       doubles_moyens=("n_double", "mean"),
+                                       patients_sous_seuil=("share_below_threshold", "mean"),
+                                       doubles_conformes=("doubles_rule_ok", "mean"))
+print("Statuts :", _df_thr["status"].value_counts().to_dict())
+print(_thr.round(3).to_string())
+fig, ax = plt.subplots(figsize=(6.5, 4))
+ax.plot(_thr.index, 100 * _thr["instances_avec_double"], "o-", label="Instances avec au moins un double")
+ax.plot(_thr.index, 100 * _thr["patients_sous_seuil"], "s--", label="Patients avec c_W/c_I < 1/q_i")
+ax.axvline(1 / (1 - CC.central_p_bar), color="grey", lw=0.8, ls=":", label="1 / q̄")
+ax.set_xlabel("c_W / c_I"); ax.set_ylabel("Part (%)"); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("figures/threshold_cw_fine.pdf", bbox_inches="tight")
+plt.savefig("figures/threshold_cw_fine.png", dpi=300, bbox_inches="tight")
+plt.show()
+""")
+
 # ── RESULTS.md ────────────────────────────────────────────────────────────────
 code("""\
 # ── 8. Export RESULTS.md ─────────────────────────────────────────────────────

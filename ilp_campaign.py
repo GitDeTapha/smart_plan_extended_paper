@@ -631,3 +631,26 @@ def sensitivity_table(df) -> "pd.DataFrame":
                      "p simulé": sim["p_wilcoxon"],
                      "Significatif (5 %)": bool(ex["p_wilcoxon"] < 0.05) if ex["n"] > 1 else False})
     return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------------
+# Double-booking threshold (rec. 11)
+# ----------------------------------------------------------------------------
+def threshold_spec(ctx: CampaignContext, spec: dict) -> dict:
+    """Worker: ILP of a cell of the fine c_W/c_I grid, read against the
+    per-patient threshold. Putting j behind i in a slot (no saturation, equal
+    durations) trades c_I q_j s of idle for c_W q_i q_j s of waiting, so it pays
+    when c_W / c_I < 1 / q_i, where i is the patient served first. The
+    threshold is individual, 1/q_i, not 1/q_bar."""
+    rec = ctx.solve(spec)
+    inst = ctx.instance(spec)
+    r = spec["cW_ratio"]
+    first = [p[0] for p in rec["planning"].values() if len(p) == 2]
+    return {**spec, "n_double": rec["n_double"], "has_double": rec["n_double"] > 0,
+            "status": rec["status"],
+            "share_below_threshold": float(np.mean(r < 1.0 / inst.q)),
+            "doubles_rule_ok": float(np.mean([r < 1.0 / inst.q[i] for i in first])) if first else float("nan")}
+
+
+def threshold_specs(cc: CampaignConfig) -> list:
+    return [cell_spec(cc, "cw_fine", seed, cW_ratio=v) for v in cc.cw_fine for seed in cc.seeds]
