@@ -727,50 +727,74 @@ plt.savefig("figures/threshold_cw_fine.png", dpi=300, bbox_inches="tight")
 plt.show()
 """)
 
+# ── Section 8 : validation hors échantillon sur le holdout ──────────────────
+md("## 8. Validation hors échantillon sur des patients du holdout (rec. 10)\n\n"
+   "Journées construites à partir de patients du holdout, jamais vus à l'apprentissage : "
+   "le PLNE planifie avec les $q_i$ et les groupes **prédits** ; chaque planning est ensuite jugé "
+   "sur la vérité : groupes **réels** (durées), coût espéré du modèle, coût espéré exact de la "
+   "journée (Lindley, idle terminal) et coût **réalisé** compte tenu des présences observées. "
+   "Références : PLNE oracle (groupes réels), B1, B3, B5. Comparaisons appariées par journée.")
+
+code("""\
+# ── 8.1 Journées du holdout ──────────────────────────────────────────────────
+from ilp_campaign import holdout_day, holdout_day_specs
+HOLDOUT_SPECS = holdout_day_specs(CC, HOLDOUT, seed=RANDOM_STATE)
+_df_hold = pd.DataFrame(run_lpt(functools.partial(holdout_day, CTX), HOLDOUT_SPECS,
+                                lambda sp: 1.0, CC.n_workers))
+_df_hold.to_csv("results/holdout_days.csv", index=False)
+print(f"{len(_df_hold)} journées de {_df_hold['n'].iloc[0]} patients ; statut du PLNE :",
+      _df_hold["ILP_status"].value_counts().to_dict())
+_rows = []
+for _ref in ("ILP_oracle", "B1", "B3", "B5"):
+    for _kind, _suffix in (("espéré, modèle", "_Zmodel"), ("espéré, journée", "_Zday"), ("réalisé", "_Zreal")):
+        _ps = paired_summary(_df_hold[_ref + _suffix], _df_hold["ILP" + _suffix])
+        _rows.append({"Politique": _ref, "Coût": _kind, "ΔZ moyen vs PLNE": _ps["mean_diff"],
+                      "IC 95 % bas": _ps["ci_low"], "IC 95 % haut": _ps["ci_high"],
+                      "Écart moyen (%)": _ps["rel_pct"], "Fait mieux": f"{_ps['n_better']}/{_ps['n']}",
+                      "p (Wilcoxon)": _ps["p_wilcoxon"]})
+_df_hold_cmp = pd.DataFrame(_rows)
+_df_hold_cmp.to_csv("results/holdout_days_summary.csv", index=False)
+print(_df_hold_cmp.round(3).to_string(index=False))
+""")
+
 # ── RESULTS.md ────────────────────────────────────────────────────────────────
 code("""\
-# ── 8. Export RESULTS.md ─────────────────────────────────────────────────────
-_central = _df_doe[_df_doe.label=="central"]
-_bench_lines = "\\n".join(
-    f"- {r['Politique']} : {r['Écart moyen (%)']:+.1f} % vs PLNE, IC 95 % de ΔZ "
-    f"[{r['IC 95 % bas']:.2f} ; {r['IC 95 % haut']:.2f}], p = {r['p (Wilcoxon)']:.3g}"
-    for _, r in _df_bench_cmp[_df_bench_cmp["Coût"] == "modèle exact"].iterrows())
+# ── 9. Export RESULTS.md ─────────────────────────────────────────────────────
+_central = _df_doe[_df_doe.label == "central"]
+_sol_hist = ILLUS["historique"][1]
+def _cmp_lines(df, kind):
+    return "\\n".join(
+        f"- {r['Politique']} : {r.iloc[2]:+.2f} [{r['IC 95 % bas']:.2f} ; {r['IC 95 % haut']:.2f}], "
+        f"p = {r['p (Wilcoxon)']:.3g}" for _, r in df[df["Coût"] == kind].iterrows())
 
-_md = f\"\"\"# RESULTS.md, Chiffres clés pour le manuscrit
+_md = f\"\"\"# RESULTS.md, chiffres clés pour le manuscrit
 
-## Table 1 (Section 3)
-- Z_complet instance illustrative : {_sol3.Z_complete:.4f}
-- E[Idle] : {_sol3.E_idle:.4f}  E[Wait] : {_sol3.E_wait:.4f}  E[OT] : {_sol3.E_OT:.4f}
-- Patients servis : {_sol3.n_served}/10  Créneaux doubles : {_sol3.n_double}/4
-- Temps solveur : {_sol3.solve_time:.3f} s
+Paramètres : {PLNE['source_run']} (commit {PLNE['git_commit']}), s_A = {s_A:.2f}, s_B = {s_B:.2f},
+pi_A = {pi_A:.4f}, c_O = {C_O_BASE}. Campagne : S = {CC.S}, R = {CC.R}, limite {CC.time_limit:g} s,
+gap cible {CC.mip_gap:g}. Smoke : {SMOKE}.
 
-## DOE, Cellule centrale (ratio=1.5, p̄=0.20, ls=0.15, c_W=0.50, R={R})
-- Z_complet moyen : {_central['Z_complete'].mean():.3f} ± {_central['Z_complete'].std():.3f}
-- E[Idle] moyen : {_central['E_idle'].mean():.3f}
-- E[Wait] moyen : {_central['E_wait'].mean():.3f}
-- E[OT]   moyen : {_central['E_OT'].mean():.3f}
-- Patients servis / n : {_central['occ'].mean():.3f}
-- Créneaux doubles / S : {_central['double_rate'].mean():.3f}
-- Temps solveur moyen : {_central['solve_time'].mean():.2f} s
+## Table 1 (section 3)
+- Historique (s_A = 43, s_B = 8) : Z* = {_sol_hist.Z_complete:.4f} ({_sol_hist.status})
+- Données : Z* = {ILLUS['donnees'][1].Z_complete:.4f}
 
-## Benchmarks (R={R}, coût exact du modèle)
-{_bench_lines}
+## Plan d'expériences
+- Optimalité prouvée : {100*(_df_doe['status'] == 'optimal').mean():.1f} % des PLNE
+- Cellule centrale : Z = {_central['Z_complete'].mean():.3f} ± {_central['Z_complete'].std():.3f}
 
-## Simulation (M={M_DOE_SIM})
-- Écart % modèle/simulé (cellule centrale) : {_df_sim[_df_sim.label=='central']['gap_pct'].mean():.2f}%
+## Benchmarks (coût exact du modèle, Delta Z vs PLNE, IC 95 %)
+{_cmp_lines(_df_bench_cmp.rename(columns={'ΔZ moyen': 'd'}), 'modèle exact')}
+
+## Simulation (M = {M_DOE_SIM})
+- Écart simulé / modèle, cellule centrale : {_df_sim[_df_sim.label == 'central']['gap_pct'].mean():.2f} %
 
 ## Robustesse
 - {SENS_VERDICT}
 
-## Fichiers
-- results/doe_ilp.csv, results/benchmarks.csv
-- results/simulation_doe.csv, results/sensitivity_*.csv
-- tables/table1_planning.tex, tables/table_benchmarks.tex, tables/table_sensitivity.tex
-- figures/doe_metrics.pdf, figures/sim_gap_analysis.pdf, figures/pareto_idle_wait.pdf
+## Hors échantillon (holdout, coût réalisé, Delta Z vs PLNE)
+{_cmp_lines(_df_hold_cmp, 'réalisé')}
 \"\"\"
-
-with open("RESULTS.md", "w") as f:
-    f.write(_md)
+with open("results/RESULTS.md", "w", encoding="utf-8") as fh:
+    fh.write(_md)
 print(_md)
 """)
 

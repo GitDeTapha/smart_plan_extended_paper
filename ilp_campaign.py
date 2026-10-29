@@ -654,3 +654,79 @@ def threshold_spec(ctx: CampaignContext, spec: dict) -> dict:
 
 def threshold_specs(cc: CampaignConfig) -> list:
     return [cell_spec(cc, "cw_fine", seed, cW_ratio=v) for v in cc.cw_fine for seed in cc.seeds]
+
+
+# ----------------------------------------------------------------------------
+# Out-of-sample validation on holdout patients (rec. 10)
+# ----------------------------------------------------------------------------
+def holdout_day_specs(cc: CampaignConfig, scores, seed: int) -> list:
+    """Clinic days made of holdout patients, sampled without replacement.
+
+    Each day has cc.slots_per_day slots (share of long slots: central cell) and
+    round(central_ratio * slots_per_day) patients. The patients' predicted q_i
+    and group, their true group and their realised no-show travel in the spec.
+    """
+    n = round(cc.central_ratio * cc.slots_per_day)
+    if n * cc.holdout_days > len(scores):
+        raise ValueError(f"holdout too small: {len(scores)} patients for {cc.holdout_days} days of {n}")
+    rng = np.random.default_rng(seed)
+    rows = rng.choice(len(scores), n * cc.holdout_days, replace=False)
+    specs = []
+    for k in range(cc.holdout_days):
+        day = scores.iloc[rows[k * n:(k + 1) * n]]
+        specs.append({"label": "holdout_day", "seed": int(seed) * 100_003 + k, "day": k,
+                      "ratio": cc.central_ratio, "long_share": cc.central_long_share,
+                      "cW_ratio": cc.central_cw_ratio,
+                      "q": [round(float(v), 12) for v in day["q_i"]],
+                      "group_pred": day["group_pred"].tolist(),
+                      "group_actual": day["group_actual"].tolist(),
+                      "no_show": [int(v) for v in day["no_show"]]})
+    return specs
+
+
+def _holdout_instance(ctx: CampaignContext, spec: dict, groups: Sequence[str]) -> Instance:
+    cc = ctx.cc
+    rng = np.random.default_rng(spec["seed"])
+    L_short, L_long = sorted(ctx.slot_lengths)
+    n_long = round(spec["long_share"] * cc.slots_per_day)
+    L = rng.permutation([L_long] * n_long + [L_short] * (cc.slots_per_day - n_long)).tolist()
+    s = np.where(np.asarray(groups) == "A", ctx.s_A, ctx.s_B)
+    return Instance(n=len(groups), D=1, T=[cc.slots_per_day], L=[L], s=s, q=np.asarray(spec["q"]),
+                    c_I=1.0, c_W=spec["cW_ratio"], c_O=ctx.c_O)
+
+
+def holdout_day(ctx: CampaignContext, spec: dict) -> dict:
+    """Worker: plan one holdout day on predicted inputs, judge it on the truth.
+
+    Policies: the ILP on predicted groups (the CPS pipeline), the ILP on true
+    groups (oracle on durations), single booking B1, greedy B3 and uniform
+    overbooking B5, all planned on predicted inputs except the oracle. Each
+    schedule is scored on the true instance (true groups, predicted q_i):
+    expected cost of the model, exact expected cost of the day (Lindley,
+    terminal idle), and realised cost of the day given who actually came.
+    """
+    from data_driven_plan import eval_day_exact, simulate_day
+    pred = _holdout_instance(ctx, spec, spec["group_pred"])
+    true = _holdout_instance(ctx, spec, spec["group_actual"])
+    cfg = ctx.cc.solver_config()
+    cache = SolutionCache(ctx.cache_root)
+    plans = {
+        "ILP": cache.get_or_compute(ctx.key(spec, "holdout_ilp_pred"), lambda: solve_record(pred, cfg)),
+        "ILP_oracle": cache.get_or_compute(ctx.key(spec, "holdout_ilp_true"), lambda: solve_record(true, cfg)),
+        "B1": cache.get_or_compute(ctx.key(spec, "holdout_B1"), lambda: bench_b1_single(pred, cfg)),
+        "B3": bench_b3_greedy(pred), "B5": bench_b5_uniform(pred)}
+    shows = (1 - np.asarray(spec["no_show"]))[None, :].astype(bool)
+    durations = true.s[None, :]
+    row = {k: spec[k] for k in ("label", "seed", "day")}
+    row["n"], row["n_A_pred"], row["n_A_true"] = pred.n, spec["group_pred"].count("A"), spec["group_actual"].count("A")
+    row["no_shows"] = int(sum(spec["no_show"]))
+    for name, rec in plans.items():
+        slot_patients = [rec["planning"].get((0, t), []) for t in range(true.T[0])]
+        ei, ew, eo = eval_day_exact(slot_patients, true.q, true.s, true.L[0])
+        idle, wait, ot = simulate_day(slot_patients, true.q, true.s, true.L[0], 1, None,
+                                      shows=shows, durations=durations)
+        row[f"{name}_Zmodel"] = model_cost(true, rec["planning"])
+        row[f"{name}_Zday"] = true.c_I * ei + true.c_W * ew + true.c_O * eo
+        row[f"{name}_Zreal"] = float(true.c_I * idle[0] + true.c_W * wait[0] + true.c_O * ot[0])
+        row[f"{name}_status"] = rec["status"]
+    return row
