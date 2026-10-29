@@ -11,10 +11,38 @@
 # Main pipeline
 !/data_driven_plan.py
 !/gen_main_nb.py
+!/ilp_campaign.py
 !/data_driven_plan.ipynb
 
 # Published results of a validated run (executed notebook + summary tables)
 !/reports/
+# Internal audit: kept out of the published repository
+/reports/audit_cps*
+/reports/audit_figures/
+/reports/Makefile
+/reports/audit_checks/
+/reports/fixes_*.pdf
+/reports/fixes_*.tex
+/reports/fixes_figures/
+
+# ILP validation: generator (single source to edit) and the notebook it writes
+!/notebooks/
+/notebooks/*
+!/notebooks/gen_nb.py
+!/notebooks/01_ilp_validation.ipynb
+
+# Unit tests
+!/tests/
+__pycache__/
+.pytest_cache/
+
+# The only versioned data file: aggregate ILP parameters exported by the pipeline
+# (durations, shares, rates, provenance). No patient-level record.
+!/data/
+/data/*
+!/data/inference/
+/data/inference/*
+!/data/inference/plne_parameters.json
 
 # Data ingestion (produces the notebook's input)
 !/scripts/

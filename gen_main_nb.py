@@ -10,6 +10,7 @@ previously executed cell.
 import hashlib
 import json
 import os
+import textwrap
 
 os.makedirs("figures", exist_ok=True)
 os.makedirs("models", exist_ok=True)
@@ -41,23 +42,37 @@ def code(src):
                   "metadata": {}, "outputs": [], "source": src.splitlines(keepends=True)})
 
 
+def code_stage(stage, src):
+    """Code cell run only when `stage` must be computed (resumable run, audit 1.7)."""
+    code(f'if RUN.compute("{stage}"):\n' + textwrap.indent(src, "    "))
+
+
+def params(src):
+    """Code cell tagged `parameters`: papermill injects overrides right after it."""
+    cells.append({"cell_type": "code", "execution_count": None, "id": _cell_id(src),
+                  "metadata": {"tags": ["parameters"]}, "outputs": [],
+                  "source": src.splitlines(keepends=True)})
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Title
 # ═══════════════════════════════════════════════════════════════════════════
-md("# data_driven_plan — Cluster-Predict-Schedule pipeline\n\n"
+md("# data_driven_plan, Cluster-Predict-Schedule pipeline\n\n"
    "Data-driven outpatient appointment scheduling: no-show and service-time "
    "group prediction, feeding a stochastic overbooking ILP "
    "(at most k = 2 patients per slot).\n\n"
    "A single CRISP-DM pipeline. All utility functions live in "
-   "`data_driven_plan.py` — this notebook holds only the orchestration, the "
+   "`data_driven_plan.py`, this notebook holds only the orchestration, the "
    "narrative and the outputs.\n\n"
-   "**Previously validated results, reproduced identically:** K=2 "
-   "(service_time clustering, bootstrapped silhouette), cutoff ~38.5 min "
-   "(decision tree), XGBoost as best no-show classifier.")
+   "**Changes since run_20260926_2002 (audit of 27/09):** duration groups by exact "
+   "K-medians on the training durations (the cutoff moves from about 38.5 to about "
+   "21.5 min), fit / valid / calib split inside the training set, calibration and "
+   "thresholds chosen outside the test set, ILP parameters exported with their "
+   "provenance. See reports/fixes_*.md.")
 
 code("""\
 # ── Configuration and reproducibility ─────────────────────────────────────────
-import sys, platform, warnings
+import json, os, sys, platform, warnings
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -66,8 +81,6 @@ import pandas as pd
 sys.path.insert(0, ".")
 from data_driven_plan import *
 
-RANDOM_STATE = 0
-np.random.seed(RANDOM_STATE)
 ensure_output_dirs()
 
 print(f"Python   : {sys.version.split()[0]}")
@@ -75,7 +88,43 @@ print(f"NumPy    : {np.__version__}")
 print(f"Pandas   : {pd.__version__}")
 print(f"Platform : {platform.processor()}")
 print(f"ILP solver : {SOLVER_NAME}")
-print(f"Native XGBoost: {XGB_AVAILABLE} | SMOTE available: {SMOTE_AVAILABLE}")
+""")
+
+params("""\
+# ── Authors' decisions (papermill parameters) ────────────────────────────────
+DURATION_METHOD = "kmedians"    # B3: method of the manuscript; "kmeans" for the ablation
+DURATION_STAT   = "median"      # s_A, s_B = K-medians centroids
+C_O_BASE        = 0.0           # V9: no overtime, as in the manuscript (eq. 1, 8, 9); 0.5 for the extension of section 8.5
+SLOT_LENGTHS    = (30, 60)      # B4: s_A <= max(SLOT_LENGTHS) is asserted, the run stops otherwise
+SPLIT_MODE      = "stratified"  # "patient_group" for the ablation
+RANDOM_STATE    = 0
+SMOKE           = False         # True: 1% of the patients, minimal budgets
+RUN_ID          = None          # None: timestamp; artifacts in models/run_<RUN_ID>/, results/run_<RUN_ID>/
+STAGE           = "all"         # "prep" | "durations" | "tune" | "fit" | "calibrate" | "evaluate" | "export" | "all"
+N_JOBS          = -1            # processes / threads of the searches and of RF, XGBoost (nthread)
+BLAS_THREADS    = 1             # BLAS / OpenMP threads per process (the parallelism is in N_JOBS)
+SMOKE_PATIENT_FRACTION = 0.01   # SMOKE: share of patients kept, by hashed identifier
+""")
+
+code("""\
+# ── Decisions check: any value outside its allowed set stops the run ─────────
+DECISIONS = validate_decisions(DURATION_METHOD, DURATION_STAT, C_O_BASE, SLOT_LENGTHS,
+                               SPLIT_MODE, RANDOM_STATE, SMOKE)
+np.random.seed(RANDOM_STATE)
+import time as _time
+RUN_ID = RUN_ID or _time.strftime("%Y%m%d_%H%M")
+RUN_RESULTS_DIR = os.path.join(RESULTS_DIR, f"run_{RUN_ID}")
+os.makedirs(RUN_RESULTS_DIR, exist_ok=True)
+from threadpoolctl import threadpool_limits
+# BLAS only: XGBoost's OpenMP threads are set by n_jobs, a global OpenMP cap would override them
+threadpool_limits(limits=BLAS_THREADS, user_api="blas")
+RUN = StageRunner(RUN_ID, target=STAGE)
+for k, v in {**DECISIONS, "RUN_ID": RUN_ID, "STAGE": STAGE, "N_JOBS": N_JOBS,
+             "BLAS_THREADS": BLAS_THREADS}.items():
+    print(f"{k:<16} {v}")
+print(f"Status file: {RUN.status_path}")
+RUN.configure("prep", decisions=DECISIONS, data=RAW_PARQUET_DIR,
+              patient_fraction=SMOKE_PATIENT_FRACTION if SMOKE else None)
 """)
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -105,12 +154,13 @@ md("## 2. Data Understanding\n\n"
    "(`dts`/`dtc`), the attendance status (`disp`) and administrative metadata "
    "(facility, clinic stop code, region).")
 
-code("""\
+code_stage("prep", """\
 # ── 2.1 Load the raw data ─────────────────────────────────────────────────────
 # Paths come from the module and follow SMART_PLAN_DATA (default: ./data), so
 # this notebook runs unchanged wherever the dataset lives.
 print(f"Data root: {DATA_DIR}")
-data = pd.read_parquet(RAW_PARQUET_DIR, engine="pyarrow")
+data = load_raw_data(RAW_PARQUET_DIR, patient_fraction=SMOKE_PATIENT_FRACTION if SMOKE else None,
+                     key=f"smoke{RANDOM_STATE}")
 print(f"Raw shape: {data.shape}")
 data.info(memory_usage="deep")
 data.head()
@@ -128,7 +178,7 @@ md("### 2.2 Target description and class imbalance\n\n"
    "`NoShow` already encodes CANCELLED and `discontinued` the third state, so "
    "the COMPLETE/UPDATE category follows from the two.")
 
-code("""\
+code_stage("prep", """\
 # ── 2.2 Target decomposition + class imbalance ───────────────────────────────
 data = decompose_disp_column(data, disp_column="disp")
 plot_target_balance(data, "NoShow", labels={0: "Attended", 1: "No-show"}, prefix="eda")
@@ -136,22 +186,22 @@ print(data["NoShow"].value_counts(normalize=True).rename("proportion"))
 """)
 
 md("The observed no-show rate (~3%) is far more imbalanced than the initial "
-   "85/15 assumption — which drives the choice of imbalance strategy (SMOTE + "
+   "85/15 assumption, which drives the choice of imbalance strategy (SMOTE + "
    "class weighting + optimal threshold, section 4a) and makes calibration "
    "(section 5) more important than discrimination alone.")
 
 md("### 2.3 Exploring the numeric and temporal variables\n\n"
    "`dta` (waiting time before the appointment) and `dts`/`dtc` (service "
-   "start/end) are explored before cleaning — their raw values contain "
+   "start/end) are explored before cleaning, their raw values contain "
    "inconsistencies (dts > dtc) handled in Data Preparation.")
 
-code("""\
+code_stage("prep", """\
 # ── 2.3 Raw numeric distributions ─────────────────────────────────────────────
 plot_numeric_histograms(data, ["dta", "dts", "dtc"], bins=[50, 50, 50],
                         xlims=[(0, 100), (0, 250), (0, 500)], prefix="eda")
 """)
 
-code("""\
+code_stage("prep", """\
 # ── 2.3 (cont.) Missing values ────────────────────────────────────────────────
 missing_pct = display_missing_values(data, sentinel_col="state", sentinel_value="*Missing*")
 print(missing_pct[missing_pct > 0].sort_values(ascending=False))
@@ -159,16 +209,16 @@ print(missing_pct[missing_pct > 0].sort_values(ascending=False))
 
 md("`AdministrativeFlag` exceeds 55% missing values: reliable imputation is "
    "illusory at that rate, so the column is dropped rather than imputed "
-   "(section 3). `zip`/`state` are missing for a marginal share of rows — "
+   "(section 3). `zip`/`state` are missing for a marginal share of rows, "
    "listwise deletion is preferred to imputation, with no material impact on a "
    "dataset of this size.")
 
-code("""\
-# ── 2.3 (cont.) Outlier diagnostic (IQR) — visualisation only ────────────────
+code_stage("prep", """\
+# ── 2.3 (cont.) Outlier diagnostic (IQR), visualisation only ────────────────
 visualize_outliers(data, prefix="eda")
 """)
 
-code("""\
+code_stage("prep", """\
 # ── 2.3 (cont.) Activity patterns (weekday / hour) ───────────────────────────
 _ = analyze_temporal_patterns(data, "activitydatetime", prefix="eda")
 """)
@@ -178,19 +228,19 @@ _ = analyze_temporal_patterns(data, "activitydatetime", prefix="eda")
 # ═══════════════════════════════════════════════════════════════════════════
 md("## 3. Data Preparation\n\n"
    "### 3.1 Cleaning\n\n"
-   "**Temporal filtering:** data prior to 2016-08-30 is excluded — it predates "
+   "**Temporal filtering:** data prior to 2016-08-30 is excluded, it predates "
    "a major operational reorganisation (launch of the Veteran Choice Program) "
    "that durably changed waiting times and therefore no-show rates; including "
    "it would bias learning towards an obsolete operating regime.")
 
-code("""\
+code_stage("prep", """\
 # ── 3.1 Temporal filtering + calendar features ────────────────────────────────
 data = filter_dates_after(data, "activitydatetime", "2016-08-30 00:00:00")
 data = add_temporal_features(data, "activitydatetime")
 print(f"Shape after temporal filtering: {data.shape}")
 """)
 
-code("""\
+code_stage("prep", """\
 # ── 3.1 Missing values: column and row removal ───────────────────────────────
 data = drop_high_missing_columns(data, ["AdministrativeFlag"])
 data = drop_missing_rows(data, ["zip", "state"], missing_sentinels={"state": "*Missing*"})
@@ -198,12 +248,12 @@ print(f"Shape after missing-value handling: {data.shape}")
 """)
 
 md("**dts/dtc consistency:** a record whose service end time precedes its "
-   "start time (`dtc < dts`) reflects a data-entry error — `service_time` "
+   "start time (`dtc < dts`) reflects a data-entry error, `service_time` "
    "would not be interpretable there. Those rows are removed, including the "
    "rare `NoShow=1` cases with `dts>dtc` (the patient's absence makes `dtc` "
    "meaningless).")
 
-code("""\
+code_stage("prep", """\
 # ── 3.1 dts/dtc consistency + duplicates + service_time ──────────────────────
 data = filter_dts_dtc_consistency(data, "dts", "dtc", "NoShow")
 data = data.drop_duplicates()
@@ -213,10 +263,10 @@ print(f"Shape after dts/dtc consistency + deduplication: {data.shape}")
 
 md("### 3.2 Transformation\n\n"
    "**Stop-code filtering:** only clinic codes that have recorded at least one "
-   "no-show are kept — a stop code with no no-show history carries no "
+   "no-show are kept, a stop code with no no-show history carries no "
    "discriminating signal for this task and dilutes the training sample.")
 
-code("""\
+code_stage("prep", """\
 # ── 3.2 Filter out stop codes with no no-show history ────────────────────────
 data, _data_without_ns, _codes_dropped = separate_stopcodes_by_no_show(data)
 print(f"Stop codes excluded (never any no-show): {len(_codes_dropped)}")
@@ -228,65 +278,51 @@ md("**Patient history features:** days since the previous visit (per "
    "service times (per patient), lagged by one rank to exclude any information "
    "leaking from the current visit.")
 
-code("""\
+code_stage("prep", """\
 # ── 3.2 Patient history features ──────────────────────────────────────────────
 data = add_patient_history_features(data, "patientsid", "stopcode", "activitydatetime",
                                     "NoShow", "service_time")
 print(data[["days_between_visits", "prior_noShow_rate", "prior_service_time_avg"]].describe())
 """)
 
-code("""\
+code_stage("prep", """\
 # ── 3.2 Final feature selection + checkpoint ─────────────────────────────────
-data = data.drop(columns=["activitydatetime", "patientsid"])
+# patientsid is kept until the split (SPLIT_MODE="patient_group" needs it) and
+# excluded from the features by prepare_features.
+data = data.drop(columns=["activitydatetime"])
 print(f"Final preprocessed shape: {data.shape}")
 print(f"Columns: {data.columns.tolist()}")
 save_preprocessed_data(data, PREPROCESSED_PATH)
 print(f"Saved -> {PREPROCESSED_PATH}")
 """)
 
-md("### 3.2bis Fast resume point (optional)\n\n"
-   "Section 2 (Data Understanding) and sections 3.1-3.2 (cleaning + feature "
-   "engineering) are expensive on the 40M+ raw rows. If "
-   "the preprocessed Parquet file already exists from a "
-   "previous run, the cell below skips them entirely when resuming: run only "
-   "the configuration cell at the very top, uncomment and run this one, then "
-   "continue normally from section 3.3. On a full run from the raw data, leave "
-   "it commented out (the `data` already in memory is identical).\n\n"
-   "**Parquet rather than CSV:** it preserves the optimised dtypes (category, "
-   "uint32, float32...) — a CSV round-trip would restore them as "
-   "object/int64/float64, multiplying the memory footprint of a dataset of "
-   "this size.")
-
-code("""\
-# ── 3.2bis Fast resume: reload the preprocessed data instead of sections 2-3.2 ──
-# data = load_preprocessed_data(PREPROCESSED_PATH)
-# print(f"Preprocessed data reloaded: {data.shape}")
-""")
-
 md("### 3.3 Single partition\n\n"
-   "One split, stratified jointly on `NoShow` (strong imbalance) and on "
-   "`service_time` quantiles, guarantees that BOTH modelling pipelines "
-   "(no-show and service time) inherit a representative train/test split, with "
-   "no leakage between them or with the ILP holdout — reserved exclusively for "
-   "patients never seen during training (section 7).\n\n"
-   "**The full set of rows is used** (no subsampling at this stage): the split "
-   "yields exactly 70% train / 20% test / 10% inference holdout of the total. "
-   "Subsampling to 800k rows, consistent with the already validated clustering "
-   "(K=2, bootstrapped silhouette), happens later, when the models are trained "
-   "(section 4), to keep AdaBoost/ANN tractable.")
+   "One split of the full data: train 70 % / test 20 % / ILP holdout 10 %, stratified "
+   "jointly on `NoShow` and on `service_time` deciles (same seeds as run_20260926_2002, "
+   "so test and holdout are unchanged). The training part is then split into **fit** "
+   "(80 %), **valid** (10 %) and **calib** (10 %), stratified the same way (audit rec. 13):\n\n"
+   "- fit: fitting and hyperparameter search;\n"
+   "- valid: model choice inside a family (successive halving, boosting iterations);\n"
+   "- calib: probability calibration, choice of the calibration method, of the model and of "
+   "the decision thresholds;\n"
+   "- test: final metrics only, nothing is fitted or chosen on it;\n"
+   "- holdout: never seen by the models, it feeds the ILP.\n\n"
+   "`SPLIT_MODE = \"patient_group\"` (ablation) keeps every visit of a patient in the same "
+   "partition, from a hash of `patientsid`.")
 
-code("""\
-# ── 3.3 Single split (train / test / ILP holdout) ────────────────────────────
-df_sample, train_df, test_df, df_inference = make_master_split(
-    data, train_size=0.70, test_size=0.20, inference_size=0.10,
-    noshow_col="NoShow", service_time_col="service_time",
+code_stage("prep", """\
+# ── 3.3 Single split (fit / valid / calib / test / ILP holdout) ──────────────
+SPLIT = make_master_split(
+    data, train_size=0.70, test_size=0.20, inference_size=0.10, inner_sizes=(0.80, 0.10, 0.10),
+    split_mode=SPLIT_MODE, noshow_col="NoShow", service_time_col="service_time",
     n_quantile_bins=10, random_state=RANDOM_STATE,
 )
+df_sample, train_df, test_df, df_inference = SPLIT.data, SPLIT.train, SPLIT.test, SPLIT.inference
 """)
 
 md("**Leakage warning:** `discontinued` (section 2.2) is derived from the same "
    "source column `disp` as `NoShow`, and is not known before the appointment "
-   "in any case — it is therefore excluded from the features, like the targets "
+   "in any case, it is therefore excluded from the features, like the targets "
    "themselves. `completed`, which made the target reconstructible "
    "(NoShow ≈ 1 − completed − discontinued), is no longer produced at all "
    "since section 2.2; it is nevertheless still listed below as a safeguard, "
@@ -294,568 +330,366 @@ md("**Leakage warning:** `discontinued` (section 2.2) is derived from the same "
    "preprocessed by an earlier run.\n\n"
    "**Real-world availability warning:** `dts` (actual service start) and "
    "`dta` (waiting time before the appointment) are known only once the visit "
-   "is under way or finished — at the moment the prediction must actually be "
+   "is under way or finished, at the moment the prediction must actually be "
    "used (before the appointment, to decide on overbooking), they do not yet "
    "exist. `dtc` is already dropped after `service_time` is computed "
    "(section 3.1); `dts`/`dta` are therefore excluded from the features too, "
    "even though they remain in `data` for now.")
 
-code("""\
+code_stage("prep", """\
 # ── 3.3 Encoding + standardisation (fitted on train only) ────────────────────
 X_train, X_test, X_inference, feature_cols, scaler, cat_encodings = prepare_features(
     train_df, test_df, inference_df=df_inference,
     categorical_cols=["stopcode", "sta3n", "non_va", "state", "zip"],
     onehot_max_cardinality=150,   # one-hot below this, integer code above
     excluded_cols={"service_time", "NoShow", "group_label", "cluster",
-                   "discontinued", "dts", "dta",
+                   "discontinued", "dts", "dta", "patientsid",
                    "completed"},  # safeguard: no longer produced, except in an older Parquet
     random_state=RANDOM_STATE,
 )
+# Views of the training matrix on the three inner partitions (same rows, no copy of logic)
+X_fit, X_valid, X_calib = (X_train.loc[SPLIT.fit.index], X_train.loc[SPLIT.valid.index],
+                           X_train.loc[SPLIT.calib.index])
+print(f"X_fit {X_fit.shape} | X_valid {X_valid.shape} | X_calib {X_calib.shape}")
+""")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. Modeling
+# ═══════════════════════════════════════════════════════════════════════════
+code_stage("prep", """\
+# ── 3.4 Contiguous float32 matrices, cached once (fit | valid | calib rows) ──
+_XA = np.ascontiguousarray(X_train.to_numpy(dtype=np.float32))
+_XT = np.ascontiguousarray(X_test.to_numpy(dtype=np.float32))
+_XI = np.ascontiguousarray(X_inference.to_numpy(dtype=np.float32))
+del X_train, X_test, X_inference, X_fit, X_valid, X_calib, data
+RUN.finish("prep", XA=_XA, X_test=_XT, X_inf=_XI,
+           y_ns=train_df["NoShow"].to_numpy().astype(int),
+           y_test_ns=test_df["NoShow"].to_numpy().astype(int),
+           y_inf_ns=df_inference["NoShow"].to_numpy().astype(int),
+           st_train=train_df["service_time"].to_numpy(), st_test=test_df["service_time"].to_numpy(),
+           st_inf=df_inference["service_time"].to_numpy(),
+           N_FIT=len(SPLIT.fit), N_VALID=len(SPLIT.valid), split_sizes=SPLIT.sizes(), split_mode=SPLIT.mode,
+           feature_cols=feature_cols, scaler=scaler, cat_encodings=cat_encodings)
+del _XA, _XT, _XI
+""")
+
+code("""\\
+# ── 3.5 Prep artifacts (memory-mapped matrices) ──────────────────────────────
+if RUN.wanted("prep"):
+    PREP = RUN.load("prep")
+    XA, X_test_np, X_inf_np = PREP["XA"], PREP["X_test"], PREP["X_inf"]
+    y_ns, y_test_ns, y_inf_ns = PREP["y_ns"], PREP["y_test_ns"], PREP["y_inf_ns"]
+    N_FIT, N_VALID = PREP["N_FIT"], PREP["N_VALID"]
+    N_FV = N_FIT + N_VALID
+    feature_cols = PREP["feature_cols"]
+    display(PREP["split_sizes"])
+    print(f"XA {XA.shape} | test {X_test_np.shape} | holdout {X_inf_np.shape} | split {PREP['split_mode']}")
 """)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 4. Modeling
 # ═══════════════════════════════════════════════════════════════════════════
 md("## 4. Modeling\n\n"
-   "Two parallel sub-pipelines, on the SAME split and the SAME features "
-   "(section 3.3): no-show prediction (4a) and service-time group assignment "
-   "(4b). Both reuse the single function `train_binary_classifiers` "
-   "(RandomForest, XGBoost, AdaBoost, ANN — SMOTE + class weighting + optimal "
-   "threshold).\n\n"
-   "`train_df` (70% of the full dataset, potentially tens of millions of rows) "
-   "acts as a reservoir, but the final model fit runs on a bounded subsample "
-   "`fit_sample` drawn from `train_df` — AdaBoost and the scikit-learn MLP "
-   "(sequential, non-distributed implementations) would be impractical on the "
-   "full training set. The tuning subsample (`search_sample`) is itself drawn "
-   "from that fit subsample.\n\n"
-   "**No hyperparameter is hard-coded in the module:** section 4.0 below "
-   "gathers every training lever into an editable `TrainingConfig`, and "
-   "section 4c provides the tuning loop (variant → re-evaluation → "
-   "comparison).")
+   "Two sub-pipelines on the SAME split and features: no-show (4a) and service-time "
+   "group (4b). Four families, as in the published study: RandomForest, XGBoost, "
+   "AdaBoost, MLP (scikit-learn, xgboost), with the encoding of run_20260926_2002.\n\n"
+   "**Protocol (audit 1.3).** Hyperparameters by successive halving "
+   "(`HalvingRandomSearchCV`) on the predefined fit / valid split: candidates are trained "
+   "on fit and scored on valid, with training rows growing from 500,000 to all of fit. "
+   "Criterion: log-loss on valid of the probabilities corrected back to the true base rate "
+   "(the models are trained on balanced classes). AdaBoost: one fit per learning rate at "
+   "the maximal number of estimators, iterations chosen on valid by `staged_predict_proba`, "
+   "in a separate process running in parallel. Final model refitted on fit + valid.\n\n"
+   "**Imbalance (audit 1.4, as in the first paper: SMOTE with class weighting).** Every "
+   "family is a pipeline applying SMOTE at fit time only, up to a minority / majority "
+   "ratio of 0.1, then weights balancing the resampled classes (`class_weight` for the "
+   "forest, `scale_pos_weight` for XGBoost, `sample_weight` for AdaBoost and the MLP).")
 
-md("### 4.0 Training control panel\n\n"
-   "Each lever, what it changes, and when to touch it:\n\n"
-   "| Setting | Effect | Tuning hint |\n"
-   "|---|---|---|\n"
-   "| `models` | families trained | keep only one (e.g. `[\"XGBoost\"]`) to iterate fast, then reopen |\n"
-   "| `search` | `grid` exhaustive / `random` (n_iter draws) / `none` (direct fit) | `random` affords far wider grids at equal budget |\n"
-   "| `n_iter` | budget of `search=\"random\"` | 40-60 explores a wide space seriously |\n"
-   "| `cv` | cross-validation folds of the tuning | 5 for a more stable choice, 2 to go fast |\n"
-   "| `scoring` | score optimised by the search | `average_precision` suits ~3% positives better than `roc_auc`; `recall` when missing a no-show is costly |\n"
-   "| `search_sample` | tuning rows | raising it makes hyperparameter selection more reliable (roughly linear cost) |\n"
-   "| `fit_sample` / `fit_sample_by_model` | final fit rows, globally or per family | `None` = the whole `train_df`; the sequential families (AdaBoost, ANN) need a ceiling |\n"
-   "| `use_smote` / `smote_params` | synthetic oversampling of the tuning subset | `{\"sampling_strategy\": 0.3}` avoids the overcorrection of full SMOTE |\n"
-   "| `balance_classes` / `scale_pos_weight` | class weighting | three imbalance mechanisms stack up: switching one off can improve precision |\n"
-   "| `param_grids` / `base_params` | grids explored / fixed hyperparameters | `DEFAULT_PARAM_GRIDS` is the starting point, printed below |\n"
-   "| `threshold_metric` | decision-threshold criterion | `f1_positive` or `youden` favour no-show recall — **without retraining** |\n\n"
-   "Reported metrics are fixed: **AUC, accuracy, precision, recall, F1-score**, "
-   "the last three macro-averaged over both classes.\n\n"
-   "**On rebalancing.** SMOTE is no longer applied to the tuning subset before "
-   "the cross-validation: interpolated copies of a minority point ended up in "
-   "the validation fold while its neighbours stayed in the training fold, so "
-   "the CV score measured memorisation of synthetic data (0.99 ROC-AUC against "
-   "0.75 on the test set) and the search kept whichever model memorised best — "
-   "a forest of unlimited depth. Rebalancing now happens strictly inside each "
-   "fold: class weights for the tree families, SMOTE inside the ANN pipeline.\n\n"
-   "**On the ANN.** `MLPClassifier` accepts neither `class_weight` nor "
-   "`sample_weight`, so it was the only family left untreated against a 3% "
-   "positive rate and collapsed onto the majority class. It is now fitted "
-   "inside an imbalanced-learn pipeline that applies SMOTE during training "
-   "only, and searched over a wider space (three architectures, three "
-   "regularisation levels, two learning rates).\n\n"
-   "The split (section 3.3), clustering (4b) and calibration (5.2) settings "
-   "stay in their own cells.")
-
-code("""\
-# ── 4.0 Training settings — no-show ───────────────────────────────────────────
-# Edit here, rerun 4a, compare with training_history_table() (4c).
+code("""\\
+# ── 4.0 Training settings ───────────────────────────────────────────────────
 TRAIN_CFG_NOSHOW = TrainingConfig(
-    models=["RandomForest", "XGBoost", "AdaBoost", "ANN"],  # families to train
-    search="random",                # "grid" | "random" | "none"
-    n_iter=12,                      # draws when search="random"
-    cv=3,                           # cross-validation folds of the tuning
-    scoring="f1_macro",             # optimise the search on the reported metric,
-                                    # not on ranking quality (roc_auc)
-    search_sample=40_000,           # tuning rows     (None = all of X_fit)
-    # Sized from the timings measured on this machine with the ~200-column
-    # design matrix: RandomForest 204 s for 2M rows, XGBoost 50 s for 5M. The
-    # sequential families are the constraint, and section 4 trains every family
-    # TWICE (no-show, then A/B group).
-    fit_sample=2_000_000,
-    fit_sample_by_model={
-        "XGBoost": None,            #   histogram method: takes the whole training set
-        "RandomForest": 5_000_000,  #   ~8 min at this size
-        "AdaBoost": 250_000,        #   stumps rescan the 200 columns at every iteration
-        "ANN": 200_000,             #   sequential, and SMOTE doubles it again
-    },
-    use_smote=True,                 # SMOTE on the tuning subset only
-    smote_params={},                # e.g. {"sampling_strategy": 0.3, "k_neighbors": 3}
-    balance_classes=True,           # class_weight="balanced" / scale_pos_weight
-    scale_pos_weight=None,          # None = n_neg/n_pos; a number to damp it
-    param_grids={},                 # per-model grid overrides
-    base_params={},                 # per-model fixed hyperparameters
-    threshold_metric="f1_macro",    # "f1_positive" | "balanced_accuracy" | "youden" | "fixed"
-    threshold_range=(0.05, 0.96, 0.01),
-    fixed_threshold=0.5,            # used when threshold_metric="fixed"
-    n_jobs=-1, verbose=1, random_state=RANDOM_STATE,
+    models=["RandomForest", "XGBoost", "AdaBoost", "ANN"],
+    search="halving", n_candidates=12, halving_factor=3,
+    min_resources=500_000,        # fit rows of the first halving iteration
+    max_resources=None,           # None: all of fit at the last iteration
+    smote_sampling_strategy=0.1, smote_k_neighbors=5,
+    adaboost_max_estimators=400, adaboost_learning_rates=(0.5, 1.0),
+    threshold_metric="youden", n_jobs=N_JOBS, verbose=1, random_state=RANDOM_STATE,
 )
-
-print("Module default grids (starting point for param_grids):")
-for _m, _g in DEFAULT_PARAM_GRIDS.items():
-    print(f"  {_m:<13} {_g}")
-print("\\nDefault fixed hyperparameters (starting point for base_params):")
-for _m, _b in DEFAULT_BASE_PARAMS.items():
-    print(f"  {_m:<13} {_b}")
-print()
+if SMOKE:   # minimal budgets: the smoke run checks that the code runs, not the results
+    TRAIN_CFG_NOSHOW = TRAIN_CFG_NOSHOW.replace(
+        n_candidates=4, min_resources=20_000, adaboost_max_estimators=40,
+        param_grids={"RandomForest": {"n_estimators": [100], "max_depth": [8, 12]},
+                     "XGBoost": {"n_estimators": [100]}},
+        base_params={"ANN": {"max_iter": 20}})
+TRAIN_CFG_GROUP = TRAIN_CFG_NOSHOW.replace()
 display(TRAIN_CFG_NOSHOW.summary())
 """)
 
-md("**Ready-made variants.** Uncomment ONE line (or write another on the same "
-   "pattern) then rerun the training cell 4a. `.replace()` returns a copy, so "
-   "the reference configuration `TRAIN_CFG_NOSHOW` stays intact.")
+md("### 4b (first part). Duration groups\n\n"
+   "**Exact K-medians, K = 2, on the training durations only** (audit B3). Service times "
+   "are integer minutes, so the optimal 1-D K-medians partition is found exactly by "
+   "dynamic programming over the distinct values (no initialisation, no randomness). "
+   "s_A, s_B are the cluster medians. Groups and cutoff are fitted on train and applied "
+   "unchanged to test and holdout. K = 2 is imposed by the ILP (two duration classes); "
+   "cost and silhouette for K = 2 to 5 are reported. `DURATION_METHOD = \"kmeans\"` runs "
+   "the ablation with the former method.")
 
-code("""\
-# ── 4.0 (variants) Tuning recipes — uncomment the one to test ────────────────
-# Fast iteration (one family, reduced grid, less data):
-# TRAIN_CFG_NOSHOW = TRAIN_CFG_NOSHOW.replace(
-#     models=["XGBoost"], search_sample=20_000, fit_sample=200_000, cv=2)
-
-# Wide exploration at controlled budget (random search over an extended grid):
-# TRAIN_CFG_NOSHOW = TRAIN_CFG_NOSHOW.replace(
-#     search="random", n_iter=40, scoring="average_precision",
-#     param_grids={"XGBoost": {"n_estimators": [200, 400, 800],
-#                              "max_depth": [3, 4, 6, 8, 10],
-#                              "learning_rate": [0.01, 0.03, 0.05, 0.1],
-#                              "subsample": [0.6, 0.8, 1.0],
-#                              "colsample_bytree": [0.6, 0.8, 1.0],
-#                              "min_child_weight": [1, 5, 20],
-#                              "reg_lambda": [1.0, 5.0, 20.0]}})
-
-# Favour no-show recall (the ILP overbooks on that signal):
-# TRAIN_CFG_NOSHOW = TRAIN_CFG_NOSHOW.replace(
-#     scoring="average_precision", threshold_metric="f1_positive")
-
-# Test the threefold imbalance strategy by removing one component:
-# TRAIN_CFG_NOSHOW = TRAIN_CFG_NOSHOW.replace(use_smote=False)
-# TRAIN_CFG_NOSHOW = TRAIN_CFG_NOSHOW.replace(balance_classes=False)
-# TRAIN_CFG_NOSHOW = TRAIN_CFG_NOSHOW.replace(smote_params={"sampling_strategy": 0.3})
-
-# Regularise the ANN / widen the network:
-# TRAIN_CFG_NOSHOW = TRAIN_CFG_NOSHOW.replace(
-#     param_grids={"ANN": {"hidden_layer_sizes": [(128, 64), (256, 128, 64)],
-#                          "alpha": [1e-4, 1e-3, 1e-2], "learning_rate_init": [1e-3, 3e-4]}},
-#     base_params={"ANN": {"max_iter": 800, "n_iter_no_change": 25}})
-
-# Imposed hyperparameters, no search at all (reproduce a known setting):
-# TRAIN_CFG_NOSHOW = TRAIN_CFG_NOSHOW.replace(
-#     search="none", models=["XGBoost"],
-#     base_params={"XGBoost": {"n_estimators": 400, "max_depth": 6, "learning_rate": 0.05}})
-
-display(TRAIN_CFG_NOSHOW.summary())
-""")
-
-md("### 4a. No-show prediction")
-
-code("""\
-# ── 4a. Train the no-show classifiers ─────────────────────────────────────────
-noshow_models, y_train_ns, y_test_ns, X_fit_ns, y_fit_ns = train_binary_classifiers(
-    X_train, train_df["NoShow"], X_test, test_df["NoShow"],
-    feature_cols, positive_label=1, config=TRAIN_CFG_NOSHOW,
-)
-""")
-
-code("""\
-# ── 4a. What the search actually selected ─────────────────────────────────────
-# Grid explored, winning hyperparameters, CV score and timings per family.
-display(noshow_models.search_report)
-""")
-
-code("""\
-# ── 4a. Save the training state (resume without retraining) ─────────────────
-save_model_bundle(
-    {"models": noshow_models, "y_train": y_train_ns, "y_test": y_test_ns,
-     "X_fit": X_fit_ns, "y_fit": y_fit_ns, "config": TRAIN_CFG_NOSHOW},
-    name="noshow_training_state",
-)
-""")
-
-md("**Fast resume point (optional):** tuning four model families plus the fit "
-   "on `fit_sample=800_000` rows can take a long time. To skip them when "
-   "resuming, do NOT run the training cell above: uncomment and run this one "
-   "instead, then continue normally. The configuration used is reloaded along "
-   "with the models, which keeps the settings of the saved run on record.")
-
-code("""\
-# ── 4a. Fast resume: reload the models instead of retraining ────────────────
-# _state_ns = load_model_bundle("noshow_training_state")
-# noshow_models, y_train_ns, y_test_ns, X_fit_ns, y_fit_ns = (
-#     _state_ns["models"], _state_ns["y_train"], _state_ns["y_test"],
-#     _state_ns["X_fit"], _state_ns["y_fit"])
-# TRAIN_CFG_NOSHOW = _state_ns.get("config", TRAIN_CFG_NOSHOW)
-""")
-
-code("""\
-# ── 4a. Comparative evaluation (+ train vs test overfitting check) ───────────
-# config=... : the decision threshold follows the configuration's threshold_metric.
-# plots=[...] : restricting the figures speeds up tuning iterations
-#   (e.g. plots=["metrics"]); eval_sample=200_000 evaluates on a test extract.
-results_noshow = evaluate_binary_classification_models(
-    noshow_models, X_test, y_test_ns, positive_name="NoShow", reference_name="Attended",
-    feature_cols=feature_cols, X_train=X_fit_ns, y_tr=y_fit_ns, prefix="noshow",
-    config=TRAIN_CFG_NOSHOW, plots=ALL_EVAL_PLOTS, perm_sample=20_000, eval_sample=None,
-)
-""")
-
-code("""\
-# ── 4a. Record the run (to compare successive settings) ─────────────────────
-# Rename the label for each run: it is the lookup key in the comparison table
-# of section 4c.
-record_training_run("no-show — reference config", results_noshow, TRAIN_CFG_NOSHOW,
-                    notes="grid / roc_auc / SMOTE / f1_macro threshold")
-""")
-
-md("### 4b. Service time — clustering then classification\n\n"
-   "**K-means (K=2):** validated by the elbow method (SAE) and the silhouette "
-   "coefficient on a 200k-row sample, confirmed by bootstrap (silhouette "
-   "stability across resamples).\n\n"
-   "The clustering parameters (candidate K, sample size, bootstrap) are "
-   "gathered in the cell below, like the training ones.")
-
-code("""\
-# ── 4b. Clustering settings ───────────────────────────────────────────────────
-CLUSTER_KS = [2, 3, 4, 5]     # values of K compared (elbow + silhouette)
-CLUSTER_SAMPLE = 200_000      # rows used to evaluate K
-N_BOOTSTRAP = 10              # resamples validating the silhouette
+code("""\\
+# ── 4b. Duration-group settings ─────────────────────────────────────────────
+DURATION_KS = [2, 3, 4, 5]    # values of K reported (cost + silhouette)
+SIL_SAMPLE = 5_000 if SMOKE else 20_000   # durations used for each silhouette
+N_BOOTSTRAP = 10              # bootstrap resamples of the silhouette (local generator)
 BOOTSTRAP_SAMPLE = 10_000     # size of each resample
-KMEANS_N_INIT = 10            # K-means restarts (solution stability)
-FORCE_K = None                # impose K (e.g. 2) instead of the maximum silhouette
+RUN.configure("durations", method=DURATION_METHOD, stat=DURATION_STAT, ks=DURATION_KS,
+              sil=(SIL_SAMPLE, N_BOOTSTRAP, BOOTSTRAP_SAMPLE))
 """)
 
-code("""\
-# ── 4b. Selecting K (elbow + silhouette) ──────────────────────────────────────
-sae_results, sil_results, service_time_std, cluster_scaler = evaluate_clustering_ks(
-    df_sample, service_time_col="service_time", candidate_ks=CLUSTER_KS,
-    sample_size=CLUSTER_SAMPLE, random_state=RANDOM_STATE,
-)
-best_k = FORCE_K or max(sil_results, key=sil_results.get)
-print(f"K selected ({'imposed' if FORCE_K else 'maximum silhouette'}): {best_k}")
+code_stage("durations", """\\
+# ── 4b. Fit the groups on the training durations, apply them everywhere ─────
+_st = np.asarray(PREP["st_train"], dtype=float)
+_k_table = evaluate_duration_ks(_st, DURATION_KS, method=DURATION_METHOD, sil_sample=SIL_SAMPLE,
+                                random_state=RANDOM_STATE, prefix="servicetime")
+_groups = fit_duration_groups(_st, k=2, method=DURATION_METHOD, stat=DURATION_STAT,
+                              random_state=RANDOM_STATE)
+_sil = bootstrap_silhouette(_st, _groups, n_bootstrap=N_BOOTSTRAP, sample_size=BOOTSTRAP_SAMPLE,
+                            random_state=RANDOM_STATE)
+_tree, _cut = learn_decision_tree_cutoffs(pd.DataFrame({"service_time": _st, "group_label": _groups.labels(_st)}),
+                                          service_time_col="service_time", group_col="group_label",
+                                          label_names=["A", "B"])
+RUN.finish("durations", groups=_groups, k_table=_k_table, sil=_sil, tree=_tree, tree_cutoff=_cut)
 """)
 
-code("""\
-# ── 4b. Bootstrap validation + A/B labelling ──────────────────────────────────
-from sklearn.cluster import KMeans as _KMeans
-_labels_full = _KMeans(n_clusters=best_k, random_state=RANDOM_STATE, n_init=KMEANS_N_INIT).fit_predict(service_time_std)
-mu_sil, sd_sil = bootstrap_silhouette(service_time_std, _labels_full,
-                                      n_bootstrap=N_BOOTSTRAP, sample_size=BOOTSTRAP_SAMPLE)
-print(f"Bootstrapped silhouette (K={best_k}): mean={mu_sil:.4f}, sd={sd_sil:.4f}")
-
-df_sample, cluster_profile, label_map, label_names = fit_clustering_and_label(
-    df_sample, best_k, service_time_std, service_time_col="service_time", random_state=RANDOM_STATE,
-)
-service_time_by_group = df_sample.groupby("group_label")["service_time"].mean().to_dict()
-print("Mean service time per group:", service_time_by_group)
+code("""\\
+if RUN.wanted("durations"):
+    DUR = RUN.load("durations")
+    DURATION_GROUPS, cluster_tree = DUR["groups"], DUR["tree"]
+    mu_sil, sd_sil = DUR["sil"]
+    service_time_by_group = DURATION_GROUPS.s_by_group
+    display(DUR["k_table"])
+    latex_table(DUR["k_table"], os.path.join(TABLES_DIR, "table_duration_k.tex"),
+                caption="Duration groups: cost and silhouette by K (training durations).",
+                label="tab:duration-k", decimals=4)
+    y_grp = (DURATION_GROUPS.labels(PREP["st_train"]) == "A").astype(int)
+    y_test_grp = (DURATION_GROUPS.labels(PREP["st_test"]) == "A").astype(int)
+    grp_inf_actual = DURATION_GROUPS.labels(PREP["st_inf"])
+    print(f"{DURATION_GROUPS.method}/{DURATION_GROUPS.stat} on {DURATION_GROUPS.n_train:,} training durations: "
+          f"s_A = {service_time_by_group['A']:g} min, s_B = {service_time_by_group['B']:g} min, "
+          f"cutoff {DURATION_GROUPS.cutoff:g} min (tree root {DUR['tree_cutoff']:g}), "
+          f"training share of A {DURATION_GROUPS.shares['A']:.4f}")
+    print(f"Bootstrapped silhouette (K=2): mean={mu_sil:.4f}, sd={sd_sil:.4f}")
+    assert abs(DUR["tree_cutoff"] - DURATION_GROUPS.cutoff) <= 0.5 + 1e-9
+    # Audit B4: a long patient must fit in the longest slot, otherwise stop here
+    if service_time_by_group["A"] > max(SLOT_LENGTHS):
+        raise ValueError(f"s_A = {service_time_by_group['A']:g} min exceeds the longest slot "
+                         f"{max(SLOT_LENGTHS)} min: decision required (SLOT_LENGTHS or DURATION_METHOD)")
 """)
 
-code("""\
-# ── 4b. Interpretable cutoff (decision tree) ─────────────────────────────────
-cluster_tree, primary_cutoff = learn_decision_tree_cutoffs(
-    df_sample, service_time_col="service_time", group_col="group_label", label_names=label_names,
-)
+md("### 4a, 4b. Hyperparameter search on fit / valid")
+
+code("""\\
+RUN.configure("tune", noshow=TRAIN_CFG_NOSHOW.as_dict(), group=TRAIN_CFG_GROUP.as_dict())
 """)
 
-md("**Group classifier.** Same training function, hence the same levers: "
-   "`TRAIN_CFG_GROUP` starts from the no-show configuration and changes only "
-   "what needs changing. The A/B target being far less imbalanced than "
-   "no-show, SMOTE and class weighting matter less here — that is the setting "
-   "to test first.")
-
-code("""\
-# ── 4b. Training settings — A/B group classifier ─────────────────────────────
-TRAIN_CFG_GROUP = TRAIN_CFG_NOSHOW.replace(
-    # e.g. models=["XGBoost", "RandomForest"], use_smote=False, scoring="f1_macro"
-)
-display(TRAIN_CFG_GROUP.summary())
+code_stage("tune", """\\
+# ── 4a / 4b. Tune both tasks (AdaBoost in a separate process) ────────────────
+_xa_path = os.path.join(RUN.dir, "prep", "XA.npy")
+_y_ns_path, _y_grp_path = RUN.path("tune", "y_ns.npy"), RUN.path("tune", "y_grp.npy")
+np.save(_y_ns_path, np.asarray(y_ns)); np.save(_y_grp_path, np.asarray(y_grp))
+tuned_ns = tune_binary_classifiers(XA[:N_FV], y_ns[:N_FV], N_FIT, TRAIN_CFG_NOSHOW,
+                                   adaboost_files=(_xa_path, _y_ns_path))
+tuned_grp = tune_binary_classifiers(XA[:N_FV], y_grp[:N_FV], N_FIT, TRAIN_CFG_GROUP,
+                                    adaboost_files=(_xa_path, _y_grp_path))
+RUN.finish("tune", tuned_ns=tuned_ns, tuned_grp=tuned_grp)
 """)
 
-code("""\
-# ── 4b. Group assignment classifier for new patients ─────────────────────────
-y_train_grp, y_test_grp = get_group_labels_for_split(df_sample, X_train, X_test)
-group_models, y_train_grp_bin, y_test_grp_bin, X_fit_grp, y_fit_grp = train_binary_classifiers(
-    X_train, y_train_grp, X_test, y_test_grp,
-    feature_cols, positive_label="A", config=TRAIN_CFG_GROUP,
-)
-display(group_models.search_report)
+code("""\\
+if RUN.wanted("tune"):
+    TUNE = RUN.load("tune")
+    tuned_ns, tuned_grp = TUNE["tuned_ns"], TUNE["tuned_grp"]
+    for _task, _t in (("no-show", tuned_ns), ("group", tuned_grp)):
+        print(f"{_task}: " + "; ".join(f"{m} {b} (log-loss valid {_t['criterion'][m]:.5f})"
+                                       for m, b in _t["best"].items()))
+    RUN.configure("fit")
 """)
 
-code("""\
-# ── 4b. Save the training state (resume without retraining) ─────────────────
-save_model_bundle(
-    {"models": group_models, "y_train": y_train_grp_bin, "y_test": y_test_grp_bin,
-     "X_fit": X_fit_grp, "y_fit": y_fit_grp, "config": TRAIN_CFG_GROUP},
-    name="group_training_state",
-)
+code_stage("fit", """\\
+# ── 4a / 4b. Refit on fit + valid ───────────────────────────────────────────
+noshow_models = fit_binary_classifiers(XA[:N_FV], y_ns[:N_FV], tuned_ns, TRAIN_CFG_NOSHOW)
+group_models = fit_binary_classifiers(XA[:N_FV], y_grp[:N_FV], tuned_grp, TRAIN_CFG_GROUP)
+RUN.finish("fit", noshow_models=noshow_models, group_models=group_models)
 """)
 
-md("**Fast resume point (optional):** same logic as in 4a — to skip retraining "
-   "when resuming, do NOT run the training cell above: uncomment and run this "
-   "one instead.")
-
-code("""\
-# ── 4b. Fast resume: reload the models instead of retraining ────────────────
-# _state_grp = load_model_bundle("group_training_state")
-# group_models, y_train_grp_bin, y_test_grp_bin, X_fit_grp, y_fit_grp = (
-#     _state_grp["models"], _state_grp["y_train"], _state_grp["y_test"],
-#     _state_grp["X_fit"], _state_grp["y_fit"])
-# TRAIN_CFG_GROUP = _state_grp.get("config", TRAIN_CFG_GROUP)
-""")
-
-code("""\
-# ── 4b. Comparative evaluation (+ train vs test overfitting check) ───────────
-results_group = evaluate_binary_classification_models(
-    group_models, X_test, y_test_grp_bin, positive_name="Group A (long)", reference_name="Group B (short)",
-    feature_cols=feature_cols, X_train=X_fit_grp, y_tr=y_fit_grp, prefix="servicetime",
-    config=TRAIN_CFG_GROUP, plots=ALL_EVAL_PLOTS, eval_sample=None,
-)
-record_training_run("A/B group — reference config", results_group, TRAIN_CFG_GROUP)
-""")
-
-md("### 4c. Tuning loop — comparing runs\n\n"
-   "Three ways to improve the results, from fastest to heaviest:\n\n"
-   "1. **Change the decision threshold alone** — no retraining: rerun the "
-   "evaluation with `threshold_metric=\"f1_positive\"`.\n"
-   "2. **Retrain a single family** with imposed hyperparameters — "
-   "`train_single_model(...)`, a few minutes, and the model joins the dict "
-   "under an alias so it can be compared with the others.\n"
-   "3. **Rerun a full campaign** — edit `TRAIN_CFG_NOSHOW` (4.0) and rerun 4a.\n\n"
-   "In all three cases `record_training_run(...)` archives the result and "
-   "`training_history_table()` puts the runs side by side. The history is "
-   "saved at the end of the section so it can be picked up across sessions.")
-
-code("""\
-# ── 4c. (1) Effect of the decision threshold alone — no retraining ──────────
-# Compares the recall/precision trade-offs reachable without touching the model.
-for _metric in ["f1_macro", "f1_positive", "balanced_accuracy", "youden"]:
-    _res = compute_classification_metrics(
-        noshow_models, X_test, y_test_ns, "NoShow", "Attended", threshold_metric=_metric)[0]
-    record_training_run(f"no-show — {_metric} threshold", _res, TRAIN_CFG_NOSHOW,
-                        notes="same models, threshold only")
-""")
-
-code("""\
-# ── 4c. (2) Single-model variant, imposed hyperparameters ───────────────────
-# Adds "XGBoost_v2" to the no-show model dict: the next evaluation compares it
-# directly with the models produced by the search.
-# train_single_model(
-#     "XGBoost", X_fit_ns, y_fit_ns,
-#     params={"n_estimators": 600, "max_depth": 6, "learning_rate": 0.03,
-#             "subsample": 0.8, "colsample_bytree": 0.8, "min_child_weight": 10},
-#     config=TRAIN_CFG_NOSHOW, models_dict=noshow_models, alias="XGBoost_v2",
-# )
-# results_noshow = evaluate_binary_classification_models(
-#     noshow_models, X_test, y_test_ns, positive_name="NoShow", reference_name="Attended",
-#     feature_cols=feature_cols, prefix="noshow", config=TRAIN_CFG_NOSHOW, plots=["metrics"],
-# )
-# record_training_run("no-show — hand-tuned XGBoost_v2", results_noshow, TRAIN_CFG_NOSHOW)
-""")
-
-code("""\
-# ── 4c. Comparison table of every recorded run ──────────────────────────────
-history = training_history_table(sort_by="AUC")
-display(history)
-save_dataframe(history, "results/training_history.csv")
-print("History saved -> results/training_history.csv")
+code("""\\
+if RUN.wanted("fit"):
+    FIT = RUN.load("fit")
+    noshow_models, group_models = FIT["noshow_models"], FIT["group_models"]
+    display(noshow_models.search_report)
+    display(group_models.search_report)
+    RUN.configure("calibrate", methods=("sigmoid", "isotonic"))
 """)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 5. Evaluation
 # ═══════════════════════════════════════════════════════════════════════════
-md("## 5. Evaluation\n\n"
-   "Metrics on the **test set only** (never used for training or "
-   "hyperparameter tuning). The ILP consumes q_i = 1 − P(NoShow) directly: a "
-   "well-discriminating but poorly calibrated probability would bias the "
-   "optimisation parameters systematically. Calibration (Platt/isotonic) is "
-   "therefore evaluated explicitly through the Brier score, on top of the "
-   "AUC, precision, recall, F1-score and accuracy already obtained in "
-   "section 4.")
+md("## 5. Calibration, model choice and evaluation\n\n"
+   "**On calib** (never on test): each family is calibrated (analytic prior correction, "
+   "Platt scaling or isotonic regression, fitted on one half of calib); on the other half "
+   "the calibrated Brier score chooses the method of each family, then the model; Youden's "
+   "threshold is read there, and for the group classifier the threshold that makes the "
+   "predicted share of A equal to the observed one (rec. 12). **On test**: AUC-ROC, "
+   "AUC-PR, log-loss, Brier, Brier skill score against the training base rate, then at "
+   "the calib threshold accuracy (with the majority-class accuracy for reference) and "
+   "precision, recall, F1 in macro average and for the positive class (audit P5).")
 
-code("""\
-# ── 5.0 Selection and calibration settings ───────────────────────────────────
-SELECTION_METRIC = "AUC"       # criterion for picking the best model, among the
-                               # reported metrics: "AUC", "Accuracy", "Precision",
-                               # "Recall" (when missing a no-show is costly), "F1-score"
-FORCE_NOSHOW_MODEL = None      # impose a model (e.g. "XGBoost_v2") instead of the best one
-FORCE_GROUP_MODEL = None
-CALIB_METHODS = ("sigmoid", "isotonic")  # calibration methods compared (Brier)
-CALIB_FRACTION = 0.5           # share of the test set used to FIT the calibration
-CALIB_BINS = 10                # bins of the reliability curves
+code_stage("calibrate", """\\
+# ── 5.1 Calibration and model choice on calib ───────────────────────────────
+cal_ns = calibrate_and_select(noshow_models, XA[N_FV:], y_ns[N_FV:], random_state=RANDOM_STATE)
+cal_grp = calibrate_and_select(group_models, XA[N_FV:], y_grp[N_FV:], random_state=RANDOM_STATE)
+_thr = share_matching_threshold(cal_grp.p_calib_eval[cal_grp.best_name],
+                                target_share=float(cal_grp.y_calib_eval.mean()))
+RUN.finish("calibrate", cal_ns=cal_ns, cal_grp=cal_grp, group_threshold=_thr)
 """)
 
-code("""\
-# ── 5.1 Selected no-show model ────────────────────────────────────────────────
-best_noshow_name = FORCE_NOSHOW_MODEL or results_noshow.set_index("Model")[SELECTION_METRIC].idxmax()
-best_noshow_model = noshow_models[best_noshow_name]
-print(f"Best no-show model (test {SELECTION_METRIC}): {best_noshow_name}")
-display(results_noshow.set_index("Model").loc[[best_noshow_name]])
+code("""\\
+if RUN.wanted("calibrate"):
+    CAL = RUN.load("calibrate")
+    cal_ns, cal_grp, GROUP_THRESHOLD = CAL["cal_ns"], CAL["cal_grp"], CAL["group_threshold"]
+    best_noshow_name, best_group_name = cal_ns.best_name, cal_grp.best_name
+    calibrated_noshow_model, best_group_model = cal_ns.models[best_noshow_name], cal_grp.models[best_group_name]
+    display(cal_ns.table.round(5)); display(cal_grp.table.round(5))
+    latex_table(pd.concat([cal_ns.table.assign(Task="no-show"), cal_grp.table.assign(Task="group A")]),
+                os.path.join(TABLES_DIR, "table_calibration.tex"),
+                caption="Calibration methods on calib (half B): Brier score and log-loss.",
+                label="tab:calibration", decimals=5)
+    print(f"No-show model: {best_noshow_name} ({cal_ns.methods[best_noshow_name]}) | "
+          f"group model: {best_group_name} ({cal_grp.methods[best_group_name]})")
+    print(f"Group threshold on calibrated p_A: {GROUP_THRESHOLD:.4f} (Youden {cal_grp.thresholds[best_group_name]:.4f}), "
+          f"observed share of A on calib {cal_grp.y_calib_eval.mean():.4f}")
+    plot_calibration_curve_(cal_ns.y_calib_eval, cal_ns.p_calib_eval[best_noshow_name],
+                            f"{best_noshow_name}_calibrated", n_bins=10, prefix="calib")
+    RUN.configure("evaluate", plots=list(ALL_EVAL_PLOTS))
 """)
 
-code("""\
-# ── 5.2 Calibration of the selected no-show model ────────────────────────────
-# The test set is split into a calibration subset (fit) and a disjoint
-# evaluation subset, to avoid calibrating and evaluating on the same data
-# (see the docstring of calibrate_and_select).
-calibrated_noshow_model, calib_comparison, X_calib_eval, y_calib_eval = calibrate_and_select(
-    best_noshow_model, X_test, y_test_ns, methods=CALIB_METHODS,
-    calib_fraction=CALIB_FRACTION, random_state=RANDOM_STATE,
-)
-raw_prob_eval = best_noshow_model.predict_proba(X_calib_eval)[:, 1]
-plot_calibration_curve_(y_calib_eval, raw_prob_eval, f"{best_noshow_name}_raw", n_bins=CALIB_BINS, prefix="calib")
-
-calibrated_prob_eval = calibrated_noshow_model.predict_proba(X_calib_eval)[:, 1]
-plot_calibration_curve_(y_calib_eval, calibrated_prob_eval, f"{best_noshow_name}_calibrated", n_bins=CALIB_BINS, prefix="calib")
+code_stage("evaluate", """\\
+# ── 5.2 Test metrics and figures (thresholds from calib) ────────────────────
+_tt = np.sort(np.random.default_rng(RANDOM_STATE).choice(N_FV, size=min(200_000, N_FV), replace=False))
+results_noshow = evaluate_binary_classification_models(
+    cal_ns, X_test_np, y_test_ns, base_rate=noshow_models.prior,
+    positive_name="NoShow", reference_name="Attended", feature_cols=feature_cols,
+    X_train=XA[_tt], y_tr=y_ns[_tt], prefix="noshow", cache_dir=RUN.path("evaluate", "proba_noshow"))
+results_group = evaluate_binary_classification_models(
+    cal_grp, X_test_np, y_test_grp, base_rate=group_models.prior,
+    positive_name="Group A (long)", reference_name="Group B (short)", feature_cols=feature_cols,
+    X_train=XA[_tt], y_tr=y_grp[_tt], prefix="servicetime", cache_dir=RUN.path("evaluate", "proba_group"))
+RUN.finish("evaluate", results_noshow=results_noshow, results_group=results_group)
 """)
 
-code("""\
-# ── 5.3 Selected group model ──────────────────────────────────────────────────
-best_group_name = FORCE_GROUP_MODEL or results_group.set_index("Model")[SELECTION_METRIC].idxmax()
-best_group_model = group_models[best_group_name]
-print(f"Best group classifier (test {SELECTION_METRIC}): {best_group_name}")
-display(results_group.set_index("Model").loc[[best_group_name]])
-""")
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 6. Deployment
-# ═══════════════════════════════════════════════════════════════════════════
-md("## 6. Deployment\n\n"
-   "Serialisation of the three inference artifacts (calibrated no-show model, "
-   "service_time→group tree for interpretability, group classifier for "
-   "inference on new patients) and of the preprocessing objects fitted on the "
-   "training set. `predict_patient` is the single inference entry point, used "
-   "as-is by section 7.")
-
-code("""\
-# ── 6.1 Serialise the artifacts ───────────────────────────────────────────────
-save_artifacts(
-    calibrated_noshow_model, cluster_tree, best_group_model,
-    scaler, cat_encodings, feature_cols, name_prefix="final",
-)
-""")
-
-code("""\
-# ── 6.2 predict_patient demonstration on a test-set sample ──────────────────
-demo_scores = predict_patient(
-    X_test.head(10), calibrated_noshow_model, best_group_model,
-    positive_group_label="A", reference_group_label="B",
-)
-demo_scores["NoShow_actual"] = test_df["NoShow"].head(10).values
-display(demo_scores)
+code("""\\
+if RUN.wanted("evaluate"):
+    EV = RUN.load("evaluate")
+    results_noshow, results_group = EV["results_noshow"], EV["results_group"]
+    _metrics = pd.concat([results_noshow.assign(Task="no-show"), results_group.assign(Task="group A")])
+    display(_metrics.set_index(["Task", "Model"]).round(4))
+    save_dataframe(_metrics, os.path.join(RUN_RESULTS_DIR, "test_metrics.csv"))
+    latex_table(_metrics[["Task", "Model", "Calibration", AUC_COL, AP_COL, LOGLOSS_COL, BRIER_COL, BSS_COL,
+                          ACC_COL, BASE_ACC_COL, F1_COL, F1_POS_COL, THR_COL]],
+                os.path.join(TABLES_DIR, "table_test_metrics.tex"),
+                caption="Test metrics of the calibrated models (thresholds chosen on calib).",
+                label="tab:test-metrics", decimals=4)
+    RUN.configure("export", c=(1.0, 0.5, C_O_BASE), slots=SLOT_LENGTHS)
 """)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 7. Solving the ILP
+# 6-7. Deployment and ILP
 # ═══════════════════════════════════════════════════════════════════════════
-md("## 7. Solving the ILP (outside CRISP-DM)\n\n"
-   "The inference holdout (`data/inference/inference_set_raw.csv`, "
-   "`df_inference`) was never seen by any model of sections 4-6. It is used "
-   "here to demonstrate the end-to-end bridge: serialised artifacts → "
-   "`predict_patient` → real ILP instance → `solve_ilp`.\n\n"
-   "`Instance`/`Config`/`Solution`/`compute_coefficients`/`solve_ilp` are "
-   "imported from `data_driven_plan.py` — the **same** model core as "
-   "`01_ilp_validation.ipynb` (regenerated by `notebooks/gen_nb.py`), which "
-   "carries the full experimental campaign (illustrative example, design of "
-   "experiments, benchmarks B1-B4, out-of-sample simulation, sensitivity "
-   "analysis). This section does not duplicate it: it adds the missing step — "
-   "building an instance from **real patients never used in training**, rather "
-   "than from synthetic patients drawn from distributions calibrated on "
-   "aggregate statistics.")
+md("## 6. Deployment and 7. ILP bridge\n\n"
+   "Serialisation of the calibrated models, the group threshold and the duration groups; "
+   "scoring of the ILP holdout (patients never seen by any model) with `predict_patient`; "
+   "export of `plne_parameters.json` (the only input of the ILP campaign, "
+   "`notebooks/01_ilp_validation.ipynb`) and of the scored holdout; one real ILP day "
+   "solved as a demonstration, with its termination status and gap.")
 
-code("""\
-# ── 7.1 Load the serialised artifacts ─────────────────────────────────────────
-artifacts = load_artifacts(name_prefix="final")
-print("Artifacts loaded:", list(artifacts.keys()))
-""")
-
-code("""\
-# ── 7.2 Inference on the holdout patients (never trained on) ────────────────
-scored_inference = predict_patient(
-    X_inference, artifacts["noshow_model"], artifacts["group_classifier"],
-    positive_group_label="A", reference_group_label="B",
-)
-scored_inference["NoShow_actual"] = df_inference["NoShow"].values
-scored_inference["group_label_actual"] = df_sample.loc[df_inference.index, "group_label"].values
-
-print("Predictions on patients never seen during training:")
-display(scored_inference.head(10))
-print(f"\\nMean predicted show-up rate (q_i): {scored_inference['q_i'].mean():.3f}"
-      f"   |   observed (1-NoShow): {(1 - scored_inference['NoShow_actual']).mean():.3f}")
-print(f"Predicted group distribution:\\n{scored_inference['group'].value_counts()}")
-print(f"Actual group distribution   :\\n{scored_inference['group_label_actual'].value_counts()}")
-""")
-
-code("""\
-# ── 7.3 Build a real ILP instance (one clinic day) ──────────────────────────
-N_DEMO = 30  # size of an illustrative day, at realistic scale
-demo_patients = scored_inference.sample(n=min(N_DEMO, len(scored_inference)), random_state=RANDOM_STATE)
-
-T_demo = [6]
-L_demo = [[30.0, 30.0, 30.0, 60.0, 60.0, 60.0]]
-s_A_real = service_time_by_group["A"]
-s_B_real = service_time_by_group["B"]
-
+code_stage("export", """\\
+# ── 6.1 Artifacts ───────────────────────────────────────────────────────────
+save_artifacts(calibrated_noshow_model, cluster_tree, best_group_model,
+               PREP["scaler"], PREP["cat_encodings"], feature_cols, name_prefix="final",
+               inference={"group_threshold": GROUP_THRESHOLD, "duration_groups": DURATION_GROUPS,
+                          "run_id": RUN_ID, "noshow_model_name": best_noshow_name,
+                          "group_model_name": best_group_name})
+# ── 7.1 Score the holdout ───────────────────────────────────────────────────
+scored_inference = predict_patient(X_inf_np, calibrated_noshow_model, best_group_model,
+                                   threshold_A=GROUP_THRESHOLD, s_A=service_time_by_group["A"],
+                                   s_B=service_time_by_group["B"])
+scored_inference["NoShow_actual"] = y_inf_ns
+scored_inference["group_label_actual"] = grp_inf_actual
+HOLDOUT_SCORES = pd.DataFrame({"q_i": scored_inference["q_i"], "group_pred": scored_inference["group"],
+                               "group_actual": grp_inf_actual, "no_show": y_inf_ns})
+# ── 7.2 Export the ILP parameters (run directory; versioned file for a full run)
+_paths = [os.path.join(RUN_RESULTS_DIR, "plne_parameters.json")]
+if not SMOKE:
+    _paths.append(os.path.join(INFERENCE_DIR, "plne_parameters.json"))
+PLNE_PARAMS = export_plne_parameters(_paths, DURATION_GROUPS, HOLDOUT_SCORES, n_train=len(y_ns),
+                                     source_run=f"run_{RUN_ID}", smoke=SMOKE, slot_lengths=SLOT_LENGTHS)
+export_holdout_scores(os.path.join(RUN_RESULTS_DIR, "holdout_scores.parquet"), HOLDOUT_SCORES)
+# ── 7.3 One real ILP day from holdout patients ──────────────────────────────
+_day = scored_inference.sample(n=min(30, len(scored_inference)), random_state=RANDOM_STATE)
+T_demo, L_demo = [6], [[30.0, 30.0, 30.0, 60.0, 60.0, 60.0]]
 real_instance = build_instance_from_patients(
-    demo_patients, T=T_demo, L=L_demo, s_A=s_A_real, s_B=s_B_real,
-    c_I=1.0, c_W=0.5, c_O=0.5, group_col="group", q_col="q_i", positive_group="A",
-)
-print(f"Real instance: n={real_instance.n} patients, {sum(T_demo)} slots "
-      f"(max capacity {2*sum(T_demo)} seats), s_A={s_A_real:.1f} min, s_B={s_B_real:.1f} min")
-""")
-
-code("""\
-# ── 7.4 Solve ─────────────────────────────────────────────────────────────────
+    _day, T=T_demo, L=L_demo, s_A=service_time_by_group["A"], s_B=service_time_by_group["B"],
+    c_I=1.0, c_W=0.5, c_O=C_O_BASE, duration_mode="class")   # "expected": s = p_A s_A + (1 - p_A) s_B
 real_solution = solve_ilp(real_instance, Config(time_limit=60.0))
-print(f"Solve time: {real_solution.solve_time:.3f} s   |   MIP gap: {real_solution.gap:.2e}")
-print(f"Z_reduced = {real_solution.Z_reduced:.4f}   Z_complete = {real_solution.Z_complete:.4f}")
-print(f"E[Idle]={real_solution.E_idle:.3f}  E[Wait]={real_solution.E_wait:.3f}  E[OT]={real_solution.E_OT:.3f}")
-print(f"Patients served: {real_solution.n_served}/{real_instance.n}   "
-      f"Double-booked slots: {real_solution.n_double}/{sum(T_demo)}")
+RUN.finish("export", plne_params=PLNE_PARAMS, scored_head=scored_inference.head(10),
+           share_A=((scored_inference["group"] == "A").mean(), (grp_inf_actual == "A").mean()),
+           q_mean=(scored_inference["q_i"].mean(), 1 - y_inf_ns.mean()),
+           real_solution={k: getattr(real_solution, k) for k in
+                          ("status", "best_bound", "gap", "gap_complete", "Z_complete", "E_idle",
+                           "E_wait", "E_OT", "n_served", "n_double", "solve_time")},
+           real_c=(real_instance.c_I, real_instance.c_W, real_instance.c_O), real_n=real_instance.n)
 """)
 
-md("**Full experimental campaign** (design of experiments with distributional "
-   "notation and factor levels, benchmarks B1-B4, out-of-sample simulation, "
-   "sensitivity analysis to the no-show rate / variance / load with percentage "
-   "deviation and solve time): see the companion notebook "
-   "**`01_ilp_validation.ipynb`**, regenerated by `notebooks/gen_nb.py` and "
-   "not included in this repository. It imports its model core "
-   "(`Instance`/`Config`/`solve_ilp`) from `data_driven_plan.py`, so both "
-   "solve exactly the same model.")
+code("""\\
+if RUN.wanted("export"):
+    EX = RUN.load("export")
+    print(json.dumps(EX["plne_params"], indent=2))
+    display(EX["scored_head"])
+    print(f"Share of group A, predicted / actual: {EX['share_A'][0]:.4f} / {EX['share_A'][1]:.4f}")
+    print(f"Mean q_i predicted / observed show-up rate: {EX['q_mean'][0]:.4f} / {EX['q_mean'][1]:.4f}")
+    _rs = EX["real_solution"]
+    print(f"Real ILP day (n={EX['real_n']}): status {_rs['status']}, Z = {_rs['Z_complete']:.4f}, "
+          f"gap on complete cost {_rs['gap_complete']:.2e}, gap on reduced objective {_rs['gap']:.2e}, "
+          f"{_rs['n_served']} served, {_rs['n_double']} double slots, {_rs['solve_time']:.1f} s")
+    from IPython.display import Math
+    _obj_tex = objective_latex(*EX["real_c"])
+    with open(os.path.join(TABLES_DIR, "objective_solved.tex"), "w", encoding="utf-8") as fh:
+        fh.write("\\\\begin{equation}\\n" + _obj_tex + "\\n\\\\end{equation}\\n")
+    display(Math(_obj_tex))
+""")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Final summary
-# ═══════════════════════════════════════════════════════════════════════════
+md("**Full experimental campaign**: `notebooks/01_ilp_validation.ipynb` (generated by "
+   "`notebooks/gen_nb.py`), with `PLNE_PARAMS_PATH` and `HOLDOUT_SCORES_PATH` pointing to "
+   "the files written above. It imports the same model core from `data_driven_plan.py`.")
+
 md("## Final summary")
 
-code("""\
-# ── Summary table ─────────────────────────────────────────────────────────────
-recap = pd.DataFrame([
-    {"Item": "Split", "Value": f"{len(df_sample):,} rows (full dataset) | "
-     f"train={len(train_df):,} test={len(test_df):,} inference={len(df_inference):,}"},
-    {"Item": "No-show — best model", "Value": best_noshow_name},
-    {"Item": "No-show — AUC (test)",
-     "Value": f"{results_noshow.set_index('Model').loc[best_noshow_name, 'AUC']:.4f}"},
-    {"Item": "No-show — Brier (calibrated)",
-     "Value": f"{calib_comparison.set_index('Method').loc[calib_comparison.iloc[0]['Method'], 'Brier']:.4f}"},
-    {"Item": "service_time clustering — selected K", "Value": str(best_k)},
-    {"Item": "Clustering — bootstrapped silhouette", "Value": f"mean={mu_sil:.4f}, sd={sd_sil:.4f}"},
-    {"Item": "Cutoff (decision tree)", "Value": f"{primary_cutoff:.1f} min"},
-    {"Item": "Group — best classifier", "Value": best_group_name},
-    {"Item": "Group — AUC (test)",
-     "Value": f"{results_group.set_index('Model').loc[best_group_name, 'AUC']:.4f}"},
-    {"Item": "ILP — real instance (n patients)", "Value": str(real_instance.n)},
-    {"Item": "ILP — Z_complete", "Value": f"{real_solution.Z_complete:.4f}"},
-    {"Item": "ILP — solve time", "Value": f"{real_solution.solve_time:.3f} s"},
-])
-display(recap)
-save_dataframe(recap, "results/recap_data_driven_plan.csv")
-print("Summary saved -> results/recap_data_driven_plan.csv")
+code("""\\
+if RUN.wanted("export"):
+    _rn, _rg = results_noshow.set_index("Model"), results_group.set_index("Model")
+    recap = pd.DataFrame([
+        {"Item": "Split", "Value": PREP["split_sizes"].to_dict("records")},
+        {"Item": "No-show: selected model", "Value": f"{best_noshow_name} ({cal_ns.methods[best_noshow_name]})"},
+        {"Item": "No-show: test AUC-ROC / AUC-PR / Brier / BSS",
+         "Value": " / ".join(f"{_rn.loc[best_noshow_name, c]:.4f}" for c in (AUC_COL, AP_COL, BRIER_COL, BSS_COL))},
+        {"Item": "Durations", "Value": f"{DURATION_GROUPS.method}/{DURATION_GROUPS.stat}: "
+         f"s_A={service_time_by_group['A']:g}, s_B={service_time_by_group['B']:g} min, cutoff {DURATION_GROUPS.cutoff:g} min"},
+        {"Item": "Durations: bootstrapped silhouette (K=2)", "Value": f"mean={mu_sil:.4f}, sd={sd_sil:.4f}"},
+        {"Item": "Group: selected model", "Value": f"{best_group_name} ({cal_grp.methods[best_group_name]})"},
+        {"Item": "Group: test AUC-ROC / Brier",
+         "Value": f"{_rg.loc[best_group_name, AUC_COL]:.4f} / {_rg.loc[best_group_name, BRIER_COL]:.4f}"},
+        {"Item": "ILP day: status, Z", "Value": f"{EX['real_solution']['status']}, {EX['real_solution']['Z_complete']:.4f}"},
+    ])
+    display(recap)
+    save_dataframe(recap, os.path.join(RUN_RESULTS_DIR, "recap_data_driven_plan.csv"))
 """)
 
 # ═══════════════════════════════════════════════════════════════════════════
