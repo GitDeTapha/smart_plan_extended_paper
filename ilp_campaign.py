@@ -399,3 +399,150 @@ def simulate_spec(ctx: CampaignContext, spec: dict, cvs: Sequence[float] = (0.0,
         out[f"se_sim_{tag}"] = float(cost.std(ddof=1) / np.sqrt(cost.size))
     out["gap_pct"] = 100.0 * (out["Z_sim_cv0"] / out["Z_model"] - 1.0)
     return out
+
+
+# ----------------------------------------------------------------------------
+# Benchmark policies (rec. 8). Every schedule is evaluated with the same exact
+# cost as the ILP (`model_cost`), whatever objective produced it.
+# ----------------------------------------------------------------------------
+def _x_model(inst: Instance, capacity: int):
+    import pyomo.environ as pyo
+    slots = [(d, t) for d in range(inst.D) for t in range(inst.T[d])]
+    idx = [(i, d, t) for i in range(inst.n) for (d, t) in slots]
+    m = pyo.ConcreteModel()
+    m.x = pyo.Var(idx, domain=pyo.Binary, initialize=0)
+    m.C1 = pyo.ConstraintList()
+    for i in range(inst.n):
+        m.C1.add(sum(m.x[i, d, t] for (d, t) in slots) <= 1)
+    m.C2 = pyo.ConstraintList()
+    for (d, t) in slots:
+        m.C2.add(sum(m.x[i, d, t] for i in range(inst.n)) <= capacity)
+    return m, slots, idx
+
+
+def _solve_x_model(m, inst, slots, cfg) -> dict:
+    from data_driven_plan import solve_model
+    import pyomo.environ as pyo
+    rep = solve_model(m, cfg)
+    planning = {}
+    for (d, t) in slots:
+        pats = [i for i in range(inst.n) if pyo.value(m.x[i, d, t]) > 0.5]
+        if pats:
+            planning[d, t] = sorted(pats, key=lambda i: inst.s[i])
+    return {"planning": planning, "status": rep.status, "gap": rep.gap, "solve_time": rep.solve_time}
+
+
+def bench_b1_single(inst: Instance, cfg: Config) -> dict:
+    """B1, single booking: the ILP's objective with at most one patient per slot."""
+    import pyomo.environ as pyo
+    from data_driven_plan import compute_coefficients
+    co = compute_coefficients(inst)
+    m, slots, idx = _x_model(inst, 1)
+    m.obj = pyo.Objective(expr=sum((inst.c_O * co["o"][k] - inst.c_I * co["a"][k]) * m.x[k] for k in idx))
+    return _solve_x_model(m, inst, slots, cfg)
+
+
+def bench_b2_fluid(inst: Instance, cfg: Config) -> dict:
+    """B2, fluid (Jensen) approximation: idle of a slot replaced by
+    (L - sum q_i s_i x_i)^+, linearised with u >= 0; waiting ignored."""
+    import pyomo.environ as pyo
+    from data_driven_plan import compute_coefficients
+    co = compute_coefficients(inst)
+    m, slots, idx = _x_model(inst, 2)
+    m.u = pyo.Var(slots, bounds=(0, None))
+    m.Cf = pyo.ConstraintList()
+    for (d, t) in slots:
+        m.Cf.add(m.u[d, t] >= inst.L[d][t] - sum(inst.q[i] * inst.s[i] * m.x[i, d, t] for i in range(inst.n)))
+    m.obj = pyo.Objective(expr=inst.c_I * sum(m.u[dt] for dt in slots)
+                          + sum(inst.c_O * co["o"][k] * m.x[k] for k in idx))
+    return _solve_x_model(m, inst, slots, cfg)
+
+
+def bench_b3_greedy(inst: Instance, cfg: Config = None) -> dict:
+    return {"planning": greedy_b3(inst), "status": "heuristic", "gap": float("nan"), "solve_time": 0.0}
+
+
+def bench_b4_valenzuela(inst: Instance, cfg: Config, Q_cap: float = 1.2) -> dict:
+    """B4, utility in the spirit of Valenzuela: max sum q_i x - 0.5 * (double slots),
+    expected attendance per slot capped at Q_cap, at most two patients per slot."""
+    import pyomo.environ as pyo
+    m, slots, idx = _x_model(inst, 2)
+    m.B = pyo.Var(slots, domain=pyo.Binary)
+    m.Cp = pyo.ConstraintList()
+    for (d, t) in slots:
+        m.Cp.add(sum(inst.q[i] * m.x[i, d, t] for i in range(inst.n)) <= Q_cap)
+        m.Cp.add(2 * m.B[d, t] >= sum(m.x[i, d, t] for i in range(inst.n)) - 1)
+    m.obj = pyo.Objective(expr=-sum(inst.q[i] * m.x[i, d, t] for (i, d, t) in idx)
+                          + 0.5 * sum(m.B[dt] for dt in slots))
+    return _solve_x_model(m, inst, slots, cfg)
+
+
+def bench_b5_uniform(inst: Instance, cfg: Config = None) -> dict:
+    """B5, uniform overbooking (manuscript section 11.3): patients in their index
+    (arrival) order rotate over the slots in chronological order, up to two per
+    slot, ignoring q and s."""
+    slots = [(d, t) for d in range(inst.D) for t in range(inst.T[d])]
+    planning = {}
+    for k in range(min(inst.n, 2 * len(slots))):
+        planning.setdefault(slots[k % len(slots)], []).append(k)
+    planning = {dt: sorted(p, key=lambda i: inst.s[i]) for dt, p in planning.items()}
+    return {"planning": planning, "status": "heuristic", "gap": float("nan"), "solve_time": 0.0}
+
+
+BENCHMARKS = {"B1": ("Réservation simple", bench_b1_single),
+              "B2": ("Fluide (Jensen)", bench_b2_fluid),
+              "B3": ("Glouton", bench_b3_greedy),
+              "B4": ("Utilité Valenzuela", bench_b4_valenzuela),
+              "B5": ("Surréservation uniforme", bench_b5_uniform)}
+
+
+def bench_spec(ctx: CampaignContext, spec: dict) -> dict:
+    """Worker: ILP (from the cache) and the five benchmarks on one cell, all
+    evaluated with the exact model cost and, with common random numbers, in the
+    Lindley simulator."""
+    from data_driven_plan import draw_scenarios, simulate_instance
+    inst = ctx.instance(spec)
+    cfg = ctx.cc.solver_config()
+    cache = SolutionCache(ctx.cache_root)
+    plans = {"ILP": ctx.solve(spec)}
+    for name, (_, fn) in BENCHMARKS.items():
+        plans[name] = cache.get_or_compute(ctx.key(spec, name), lambda fn=fn: fn(inst, cfg))
+    rng = np.random.default_rng(spec["seed"] + 104729)
+    scen = draw_scenarios(inst, ctx.cc.M_sim, rng)
+    row = {**spec}
+    for name, rec in plans.items():
+        row[f"{name}_Z"] = model_cost(inst, rec["planning"])
+        row[f"{name}_Zsim"] = float(simulate_instance(inst, rec["planning"], ctx.cc.M_sim, rng,
+                                                      scenarios=scen).mean())
+        row[f"{name}_status"] = rec["status"]
+        row[f"{name}_double"] = sum(1 for p in rec["planning"].values() if len(p) == 2)
+        row[f"{name}_served"] = sum(len(p) for p in rec["planning"].values())
+    return row
+
+
+# ----------------------------------------------------------------------------
+# Paired statistics
+# ----------------------------------------------------------------------------
+def paired_summary(values: Sequence[float], reference: Sequence[float]) -> dict:
+    """Paired comparison of a policy with a reference over the same seeds.
+
+    Returns the mean difference (values - reference) with its 95 % Student
+    interval, the mean relative difference in %, the number of seeds where the
+    policy does strictly better, and the two-sided Wilcoxon signed-rank p-value
+    (1.0 when every difference is zero; undefined below two seeds).
+    """
+    from scipy import stats
+    v, r = np.asarray(values, float), np.asarray(reference, float)
+    d = v - r
+    n = d.size
+    mean = float(d.mean())
+    half = float(stats.t.ppf(0.975, n - 1) * d.std(ddof=1) / np.sqrt(n)) if n > 1 else float("nan")
+    if n < 2:
+        p = float("nan")
+    elif np.allclose(d, 0.0):
+        p = 1.0
+    else:
+        p = float(stats.wilcoxon(d, zero_method="wilcox").pvalue)
+    return {"n": n, "mean_diff": mean, "ci_low": mean - half, "ci_high": mean + half,
+            "rel_pct": float(np.mean(100.0 * d / r)), "n_better": int((d < -1e-9).sum()),
+            "p_wilcoxon": p}

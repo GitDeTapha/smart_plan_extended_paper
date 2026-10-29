@@ -481,302 +481,44 @@ plt.show()
 """)
 
 # ── Section 5 : Benchmarks ───────────────────────────────────────────────────
-md("## 5. Benchmarks B1–B4\n\n"
-   "Mêmes instances et seeds. Tout est ré-évalué sous le coût exact du modèle.")
+md("## 5. Benchmarks B1 à B5\n\n"
+   "Cellule centrale, R graines appariées. B1 réservation simple (même objectif, un patient "
+   "par créneau) ; B2 approximation fluide (Jensen) ; B3 glouton ; B4 utilité de type "
+   "Valenzuela (plafond de présence espérée 1,2 par créneau) ; B5 surréservation uniforme "
+   "(rotation jusqu'à deux patients par créneau, sans regarder q ni s ; rec. 8). Chaque planning "
+   "est évalué avec le coût exact du modèle, puis rejoué en simulation avec les mêmes tirages "
+   "pour toutes les politiques (nombres aléatoires communs). Écart au PLNE : moyenne, IC à 95 % "
+   "de Student, test des rangs signés de Wilcoxon apparié.")
 
 code("""\
-# ── 5.1 B1 : Single booking (C2 : Σ_i x ≤ 1) ─────────────────────────────────
-def solve_b1_single(inst: Instance, cfg: Config = None) -> Solution:
-    \"\"\"Single booking : même PLNE mais C2 ≤ 1.\"\"\"
-    if cfg is None: cfg = Config()
-    coeffs = compute_coefficients(inst)
-    a, delta, w, o, gamma = (coeffs[k] for k in ("a","delta","w","o","gamma"))
-    slots, pairs = coeffs["slots"], coeffs["pairs"]
-    I = list(range(inst.n))
-    x_idx = [(i,d,t) for i in I for (d,t) in slots]
+# ── 5.1 Exécution ────────────────────────────────────────────────────────────
+from ilp_campaign import BENCHMARKS, bench_spec, cell_spec, paired_summary
 
-    m = pyo.ConcreteModel()
-    m.x = pyo.Var(x_idx, domain=pyo.Binary, initialize=0)
-
-    def _obj(m):
-        return sum((inst.c_O*o[i,d,t] - inst.c_I*a[i,d,t])*m.x[i,d,t]
-                   for (i,d,t) in x_idx)
-    m.obj = pyo.Objective(rule=_obj, sense=pyo.minimize)
-    m.C1 = pyo.ConstraintList()
-    for i in I: m.C1.add(sum(m.x[i,d,t] for (d,t) in slots) <= 1)
-    m.C2 = pyo.ConstraintList()
-    for (d,t) in slots: m.C2.add(sum(m.x[i,d,t] for i in I) <= 1)  # ≤ 1
-
-    solver = pyo.SolverFactory(SOLVER_NAME)
-    solver.options["time_limit"] = cfg.time_limit
-    t0 = time.perf_counter()
-    solver.solve(m, tee=False)
-    solve_time = time.perf_counter() - t0
-
-    x_val = {(i,d,t): pyo.value(m.x[i,d,t]) for (i,d,t) in x_idx}
-    planning = {}
-    for (d,t) in slots:
-        pats = [i for i in I if (x_val.get((i,d,t),0) or 0) > 0.5]
-        if pats: planning[d,t] = sorted(pats, key=lambda i: inst.s[i])
-
-    # Évaluer sous coût exact
-    E_idle=E_wait=E_OT=0.0
-    for (d,t), pats in planning.items():
-        L=inst.L[d][t]
-        ei,ew,eo = eval_slot_exact(pats, inst.q, inst.s, L)
-        E_idle+=inst.c_I*ei; E_wait+=inst.c_W*ew; E_OT+=inst.c_O*eo
-    # Créneaux vides
-    for (d,t) in slots:
-        if (d,t) not in planning: E_idle += inst.c_I*inst.L[d][t]
-
-    Z_reduced = pyo.value(m.obj)
-    Z_complete = Z_reduced + inst.c_I*coeffs["total_L"]
-    n_served = sum(len(v) for v in planning.values())
-    return Solution(planning=planning, E_idle=E_idle, E_wait=E_wait, E_OT=E_OT,
-                    Z_reduced=Z_reduced, Z_complete=Z_complete,
-                    solve_time=solve_time, gap=0.0,
-                    n_served=n_served, n_double=0,
-                    x_val=x_val, z_val={}, coeffs=coeffs)
-""")
-
-code("""\
-# ── 5.2 B2 : Approximation fluide (Jensen) ────────────────────────────────────
-# Simplification signalée : la linéarisation fluide remplace E[idle] = (L - Σq_i*s_i*x)^+
-# par u ≥ L - Σq_i*s_i*x, u ≥ 0 (relaxation convexe exacte pour variables continues).
-def solve_b2_fluid(inst: Instance, cfg: Config = None) -> Solution:
-    if cfg is None: cfg = Config()
-    coeffs = compute_coefficients(inst)
-    a, o = coeffs["a"], coeffs["o"]
-    slots = coeffs["slots"]
-    I = list(range(inst.n))
-    x_idx = [(i,d,t) for i in I for (d,t) in slots]
-    u_idx = list(slots)
-
-    m = pyo.ConcreteModel()
-    m.x = pyo.Var(x_idx, domain=pyo.Binary, initialize=0)
-    m.u = pyo.Var(u_idx, bounds=(0, None), initialize=0)
-
-    def _obj(m):
-        idle_part = inst.c_I * sum(m.u[d,t] for (d,t) in slots)
-        ot_part   = sum(inst.c_O*o[i,d,t]*m.x[i,d,t] for (i,d,t) in x_idx)
-        return idle_part + ot_part
-    m.obj = pyo.Objective(rule=_obj, sense=pyo.minimize)
-    m.C1 = pyo.ConstraintList()
-    for i in I: m.C1.add(sum(m.x[i,d,t] for (d,t) in slots) <= 1)
-    m.C2 = pyo.ConstraintList()
-    for (d,t) in slots: m.C2.add(sum(m.x[i,d,t] for i in I) <= 2)
-    # u ≥ L - Σ q_i*s_i*x
-    m.Cf = pyo.ConstraintList()
-    for (d,t) in slots:
-        L = inst.L[d][t]
-        m.Cf.add(m.u[d,t] >= L - sum(inst.q[i]*inst.s[i]*m.x[i,d,t] for i in I))
-
-    solver = pyo.SolverFactory(SOLVER_NAME)
-    solver.options["time_limit"] = cfg.time_limit
-    t0 = time.perf_counter()
-    solver.solve(m, tee=False)
-    solve_time = time.perf_counter() - t0
-
-    x_val = {(i,d,t): pyo.value(m.x[i,d,t]) for (i,d,t) in x_idx}
-    planning = {}
-    for (d,t) in slots:
-        pats = [i for i in I if (x_val.get((i,d,t),0) or 0) > 0.5]
-        if pats: planning[d,t] = sorted(pats, key=lambda i: inst.s[i])
-
-    # Ré-évaluer sous coût exact
-    E_idle=E_wait=E_OT=0.0
-    for (d,t), pats in planning.items():
-        L=inst.L[d][t]
-        ei,ew,eo = eval_slot_exact(pats, inst.q, inst.s, L)
-        E_idle+=inst.c_I*ei; E_wait+=inst.c_W*ew; E_OT+=inst.c_O*eo
-    for (d,t) in slots:
-        if (d,t) not in planning: E_idle += inst.c_I*inst.L[d][t]
-
-    Z_reduced  = pyo.value(m.obj)
-    Z_complete = E_idle + E_wait + E_OT  # coût exact
-    n_served = sum(len(v) for v in planning.values())
-    n_double = sum(1 for v in planning.values() if len(v)==2)
-    return Solution(planning=planning, E_idle=E_idle, E_wait=E_wait, E_OT=E_OT,
-                    Z_reduced=Z_reduced, Z_complete=Z_complete,
-                    solve_time=solve_time, gap=0.0,
-                    n_served=n_served, n_double=n_double,
-                    x_val=x_val, z_val={}, coeffs=coeffs)
-""")
-
-code("""\
-# ── 5.3 B3 : Glouton ──────────────────────────────────────────────────────────
-def solve_b3_greedy(inst: Instance) -> Solution:
-    \"\"\"Trie par q_i*s_i décroissant, remplit simple puis double les créneaux
-    à idle espéré résiduel maximal.\"\"\"
-    coeffs = compute_coefficients(inst)
-    slots = coeffs["slots"]
-    I = list(range(inst.n))
-
-    priority = sorted(I, key=lambda i: inst.q[i]*inst.s[i], reverse=True)
-    occupancy = {(d,t): [] for (d,t) in slots}
-    assigned  = set()
-
-    # Passe 1 : simple booking
-    slot_list = list(slots)
-    slot_idx  = 0
-    for i in priority:
-        while slot_idx < len(slot_list):
-            dt = slot_list[slot_idx]
-            if len(occupancy[dt]) < 1:
-                occupancy[dt].append(i); assigned.add(i); break
-            slot_idx += 1
-        if slot_idx >= len(slot_list): break
-
-    # Passe 2 : doubler les créneaux à idle résiduel max
-    remaining = [i for i in priority if i not in assigned]
-    idle_residual = {}
-    for (d,t), pats in occupancy.items():
-        if pats:
-            i = pats[0]; L = inst.L[d][t]
-            idle_residual[d,t] = inst.c_I*(L - inst.q[i]*inst.s[i])
-        else:
-            idle_residual[d,t] = inst.c_I*inst.L[d][t]
-
-    double_order = sorted([(d,t) for (d,t) in slots],
-                           key=lambda dt: idle_residual[dt], reverse=True)
-    rem_idx = 0
-    for (d,t) in double_order:
-        if rem_idx >= len(remaining): break
-        if len(occupancy[d,t]) < 2:
-            occupancy[d,t].append(remaining[rem_idx])
-            assigned.add(remaining[rem_idx]); rem_idx += 1
-
-    planning = {}
-    for (d,t), pats in occupancy.items():
-        if pats:
-            planning[d,t] = sorted(pats, key=lambda i: inst.s[i])
-
-    E_idle=E_wait=E_OT=0.0
-    for (d,t), pats in planning.items():
-        L=inst.L[d][t]
-        ei,ew,eo = eval_slot_exact(pats, inst.q, inst.s, L)
-        E_idle+=inst.c_I*ei; E_wait+=inst.c_W*ew; E_OT+=inst.c_O*eo
-    for (d,t) in slots:
-        if (d,t) not in planning: E_idle += inst.c_I*inst.L[d][t]
-
-    Z_complete = E_idle + E_wait + E_OT
-    n_served = sum(len(v) for v in planning.values())
-    n_double = sum(1 for v in planning.values() if len(v)==2)
-    return Solution(planning=planning, E_idle=E_idle, E_wait=E_wait, E_OT=E_OT,
-                    Z_reduced=Z_complete, Z_complete=Z_complete,
-                    solve_time=0.0, gap=0.0,
-                    n_served=n_served, n_double=n_double,
-                    x_val={}, z_val={}, coeffs=coeffs)
-""")
-
-code("""\
-# ── 5.4 B4 : Utilité type Valenzuela ─────────────────────────────────────────
-def solve_b4_valenzuela(inst: Instance, Q_cap=1.2, cfg: Config = None) -> Solution:
-    \"\"\"max Σ q_i*x - 0.5*Σ B[d,t], cap propension 1.2/créneau, k=2.
-    Ré-évalué sous coût exact.\"\"\"
-    if cfg is None: cfg = Config()
-    coeffs = compute_coefficients(inst)
-    slots = coeffs["slots"]
-    I = list(range(inst.n))
-    x_idx = [(i,d,t) for i in I for (d,t) in slots]
-    b_idx = list(slots)
-
-    m = pyo.ConcreteModel()
-    m.x = pyo.Var(x_idx, domain=pyo.Binary, initialize=0)
-    m.B = pyo.Var(b_idx, domain=pyo.Binary, initialize=0)
-
-    def _obj(m):
-        return -(sum(inst.q[i]*m.x[i,d,t] for (i,d,t) in x_idx)
-                 - 0.5*sum(m.B[d,t] for (d,t) in slots))
-    m.obj = pyo.Objective(rule=_obj, sense=pyo.minimize)
-    m.C1 = pyo.ConstraintList()
-    for i in I: m.C1.add(sum(m.x[i,d,t] for (d,t) in slots) <= 1)
-    m.C2 = pyo.ConstraintList()
-    for (d,t) in slots: m.C2.add(sum(m.x[i,d,t] for i in I) <= 2)
-    m.Cprop = pyo.ConstraintList()
-    for (d,t) in slots:
-        m.Cprop.add(sum(inst.q[i]*m.x[i,d,t] for i in I) <= Q_cap)
-    # B[d,t] = 1 si créneau double
-    m.CB = pyo.ConstraintList()
-    for (d,t) in slots:
-        m.CB.add(m.B[d,t] >= (sum(m.x[i,d,t] for i in I) - 1) / 2)
-
-    solver = pyo.SolverFactory(SOLVER_NAME)
-    solver.options["time_limit"] = cfg.time_limit
-    t0 = time.perf_counter()
-    solver.solve(m, tee=False)
-    solve_time = time.perf_counter() - t0
-
-    x_val = {(i,d,t): pyo.value(m.x[i,d,t]) for (i,d,t) in x_idx}
-    planning = {}
-    for (d,t) in slots:
-        pats = [i for i in I if (x_val.get((i,d,t),0) or 0) > 0.5]
-        if pats: planning[d,t] = sorted(pats, key=lambda i: inst.s[i])
-
-    E_idle=E_wait=E_OT=0.0
-    for (d,t), pats in planning.items():
-        L=inst.L[d][t]
-        ei,ew,eo = eval_slot_exact(pats, inst.q, inst.s, L)
-        E_idle+=inst.c_I*ei; E_wait+=inst.c_W*ew; E_OT+=inst.c_O*eo
-    for (d,t) in slots:
-        if (d,t) not in planning: E_idle += inst.c_I*inst.L[d][t]
-
-    Z_complete = E_idle + E_wait + E_OT
-    n_served = sum(len(v) for v in planning.values())
-    n_double = sum(1 for v in planning.values() if len(v)==2)
-    return Solution(planning=planning, E_idle=E_idle, E_wait=E_wait, E_OT=E_OT,
-                    Z_reduced=Z_complete, Z_complete=Z_complete,
-                    solve_time=solve_time, gap=0.0,
-                    n_served=n_served, n_double=n_double,
-                    x_val=x_val, z_val={}, coeffs=coeffs)
-""")
-
-code("""\
-# ── 5.5 Table comparative sur la cellule centrale (R réplications) ────────────
-_BENCH_R = min(R, 10)  # 10 reps pour les benchmarks (budget)
-
-def _bench_cell(seed):
-    inst = generate_instance(seed, ratio=1.5, p_bar=0.20, long_share=0.15, cW_ratio=0.50)
-    sol_ilp  = solve_ilp(inst)
-    sol_b1   = solve_b1_single(inst)
-    sol_b2   = solve_b2_fluid(inst)
-    sol_b3   = solve_b3_greedy(inst)
-    sol_b4   = solve_b4_valenzuela(inst)
-    ref_Z    = sol_ilp.Z_complete
-    def pct(z): return 100*(z/ref_Z - 1) if ref_Z > 1e-9 else 0.0
-    return {
-        "seed": seed,
-        "ILP_Z":  ref_Z,
-        "B1_Z":   sol_b1.Z_complete,  "B1_pct": pct(sol_b1.Z_complete),
-        "B2_Z":   sol_b2.Z_complete,  "B2_pct": pct(sol_b2.Z_complete),
-        "B3_Z":   sol_b3.Z_complete,  "B3_pct": pct(sol_b3.Z_complete),
-        "B4_Z":   sol_b4.Z_complete,  "B4_pct": pct(sol_b4.Z_complete),
-        "B1_double": sol_b1.n_double, "B2_double": sol_b2.n_double,
-        "B3_double": sol_b3.n_double, "B4_double": sol_b4.n_double,
-    }
-
-bench_rows = joblib.Parallel(n_jobs=-1)(
-    joblib.delayed(_bench_cell)(SEEDS[r]) for r in range(_BENCH_R)
-)
-_df_bench = pd.DataFrame(bench_rows)
+BENCH_SPECS = [cell_spec(CC, "central", sd) for sd in SEEDS]
+_df_bench = pd.DataFrame(run_lpt(functools.partial(bench_spec, CTX), BENCH_SPECS,
+                                 spec_cost, CC.n_workers))
 _df_bench.to_csv("results/benchmarks.csv", index=False)
-
-_bench_summary = _df_bench[["B1_pct","B2_pct","B3_pct","B4_pct",
-                              "B1_double","B2_double","B3_double","B4_double"]].mean().round(2)
-print("=== Table comparative (moyennes sur", _BENCH_R, "réplications) ===")
-print(_bench_summary.to_string())
-print("\\nNote : B2 (fluide Jensen) sur-booké si B2_double > ILP_double moyenne.")
-print(f"ILP double moyen : {_df_doe[_df_doe.label=='central']['n_double'].mean():.1f}")
+print("Statut du PLNE par graine :", _df_bench["ILP_status"].value_counts().to_dict())
 """)
 
 code("""\
-# ── 5.6 Export LaTeX table comparative ───────────────────────────────────────
-_cols_tex = ["ILP_Z","B1_Z","B2_Z","B3_Z","B4_Z","B1_pct","B2_pct","B3_pct","B4_pct"]
-_df_bench[_cols_tex].describe().round(3).to_latex(
-    "tables/table_benchmarks.tex",
-    caption="Comparaison des heuristiques vs PLNE (cellule centrale, R=10).",
-    label="tab:benchmarks")
-print("table_benchmarks.tex exportée.")
+# ── 5.2 Comparaison appariée au PLNE ─────────────────────────────────────────
+_rows = []
+for _b, (_name, _) in BENCHMARKS.items():
+    for _kind, _suffix in (("modèle exact", "_Z"), ("simulé, NAC", "_Zsim")):
+        _ps = paired_summary(_df_bench[_b + _suffix], _df_bench["ILP" + _suffix])
+        _rows.append({"Politique": f"{_b} {_name}", "Coût": _kind,
+                      "ΔZ moyen": _ps["mean_diff"], "IC 95 % bas": _ps["ci_low"],
+                      "IC 95 % haut": _ps["ci_high"], "Écart moyen (%)": _ps["rel_pct"],
+                      "Bat le PLNE": f"{_ps['n_better']}/{_ps['n']}", "p (Wilcoxon)": _ps["p_wilcoxon"],
+                      "Doubles moyens": _df_bench[f"{_b}_double"].mean()})
+_df_bench_cmp = pd.DataFrame(_rows)
+print(_df_bench_cmp.round(3).to_string(index=False))
+print(f"PLNE : doubles moyens {_df_bench['ILP_double'].mean():.1f}, coût exact moyen {_df_bench['ILP_Z'].mean():.2f}")
+_beaten = _df_bench_cmp[(_df_bench_cmp["Coût"] == "modèle exact") & (_df_bench_cmp["Bat le PLNE"].str[0] != "0")]
+if len(_beaten):
+    print("ATTENTION : une politique bat le PLNE sous son propre coût, donc au moins une "
+          "solution du PLNE n'est pas optimale (voir les statuts ci-dessus).")
 """)
 
 # ── Section 6 : Simulation Lindley ───────────────────────────────────────────
@@ -1083,7 +825,10 @@ _df_sens.to_latex("tables/table_sensitivity.tex", index=False, float_format="%.2
 code("""\
 # ── 8. Export RESULTS.md ─────────────────────────────────────────────────────
 _central = _df_doe[_df_doe.label=="central"]
-_bench_m  = _df_bench.mean()
+_bench_lines = "\\n".join(
+    f"- {r['Politique']} : {r['Écart moyen (%)']:+.1f} % vs PLNE, IC 95 % de ΔZ "
+    f"[{r['IC 95 % bas']:.2f} ; {r['IC 95 % haut']:.2f}], p = {r['p (Wilcoxon)']:.3g}"
+    for _, r in _df_bench_cmp[_df_bench_cmp["Coût"] == "modèle exact"].iterrows())
 
 _md = f\"\"\"# RESULTS.md, Chiffres clés pour le manuscrit
 
@@ -1102,11 +847,8 @@ _md = f\"\"\"# RESULTS.md, Chiffres clés pour le manuscrit
 - Créneaux doubles / S : {_central['double_rate'].mean():.3f}
 - Temps solveur moyen : {_central['solve_time'].mean():.2f} s
 
-## Benchmarks (R={_BENCH_R})
-- B1 (single) : +{_bench_m['B1_pct']:.1f}% vs ILP
-- B2 (fluide Jensen) : +{_bench_m['B2_pct']:.1f}% vs ILP
-- B3 (glouton) : +{_bench_m['B3_pct']:.1f}% vs ILP
-- B4 (Valenzuela) : +{_bench_m['B4_pct']:.1f}% vs ILP
+## Benchmarks (R={R}, coût exact du modèle)
+{_bench_lines}
 
 ## Simulation (M={M_DOE_SIM})
 - Écart % modèle/simulé (cellule centrale) : {_df_sim[_df_sim.label=='central']['gap_pct'].mean():.2f}%
