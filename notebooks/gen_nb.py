@@ -255,90 +255,88 @@ print("\\n=== Tous les tests d'exactitude sont passés ===")
 
 # ── Section 3 : Exemple illustratif ──────────────────────────────────────────
 md("## 3. Exemple illustratif, Table 1\n\n"
-   "Instance : n=10, D=1, 4 créneaux (2×30, 2×60) ; groupes [A,A,A,B,…B] ; "
-   "q=[0.90,…,0.45] ; c_I=1, c_W=0.5, c_O=0.5.")
+   "Instance : n=10, D=1, 4 créneaux (2×30, 2×60 min) ; patients 0 à 2 du groupe A, 3 à 9 du "
+   "groupe B ; q=[0,90 ; 0,85 ; … ; 0,45] ; c_I=1, c_W=0,5, c_O=0,5 (coûts de la Table 1 du "
+   "manuscrit, fixés ici indépendamment de `C_O_BASE`).\n\n"
+   "Correction rec. 5 : l'exemple ne dépend plus des données. La **table historique** fixe "
+   "$s_A=43$, $s_B=8$ min et doit redonner $Z^\\star = 70{,}82$ (assertion) ; la **table données** "
+   "reprend $s_A$, $s_B$ de `plne_parameters.json`, à titre d'illustration.")
 
 code("""\
-# ── 3.1 Construction et résolution ───────────────────────────────────────────
-_inst3 = Instance(
-    n=10, D=1, T=[4],
-    L=[[30.0, 30.0, 60.0, 60.0]],
-    s=np.array([s_A, s_A, s_A, s_B, s_B, s_B, s_B, s_B, s_B, s_B]),
-    q=np.array([0.90, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.55, 0.50, 0.45]),
-    c_I=1.0, c_W=0.5, c_O=0.5
-)
-_sol3 = solve_ilp(_inst3)
+# ── 3.1 Construction et résolution des deux variantes ───────────────────────
+ILLUS_Q = np.array([0.90, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.55, 0.50, 0.45])
+ILLUS_L = [[30.0, 30.0, 60.0, 60.0]]
+ILLUS_GROUPS = np.array(["A"] * 3 + ["B"] * 7)
 
-print(f"Temps solveur : {_sol3.solve_time:.3f} s   Gap MIP : {_sol3.gap:.2e}")
-print(f"Z_réduit = {_sol3.Z_reduced:.4f}   Z_complet = {_sol3.Z_complete:.4f}")
-print(f"E[Idle]={_sol3.E_idle:.3f}  E[Wait]={_sol3.E_wait:.3f}  E[OT]={_sol3.E_OT:.3f}")
-print(f"Patients servis : {_sol3.n_served}/10   Créneaux doubles : {_sol3.n_double}/4")
+def illustrative_instance(sA, sB):
+    return Instance(n=10, D=1, T=[4], L=ILLUS_L, s=np.where(ILLUS_GROUPS == "A", sA, sB),
+                    q=ILLUS_Q, c_I=1.0, c_W=0.5, c_O=0.5)
+
+ILLUS = {}
+for _tag, (_sA, _sB) in {"historique": (43.0, 8.0), "donnees": (s_A, s_B)}.items():
+    _inst = illustrative_instance(_sA, _sB)
+    _sol = solve_ilp(_inst, Config(require_optimal=True))
+    ILLUS[_tag] = (_inst, _sol)
+    print(f"[{_tag}] s_A={_sA:.2f}, s_B={_sB:.2f} : statut {_sol.status}, gap {_sol.gap_complete:.1e}, "
+          f"Z* = {_sol.Z_complete:.4f}  (E[Idle]={_sol.E_idle:.3f}, E[Wait]={_sol.E_wait:.3f}, "
+          f"E[OT]={_sol.E_OT:.3f}), servis {_sol.n_served}/10, doubles {_sol.n_double}/4")
+
+_Z_hist = ILLUS["historique"][1].Z_complete
+assert abs(_Z_hist - 70.82) < 5e-3, f"Table 1 historique : Z* = {_Z_hist:.4f}, attendu 70,82"
+print("Table 1 historique : Z* = 70,82 retrouvé.")
+# Les sections 3.2 à 6.2 utilisent la variante historique, stable d'un run à l'autre.
+_inst3, _sol3 = ILLUS["historique"]
 """)
 
 code("""\
-# ── 3.2 Test de validation Bernoulli sur l'exemple illustratif ────────────────
-_err3 = test_bernoulli_enum(_inst3, _sol3)
-print(f"Erreur max Bernoulli : {_err3:.2e}  ✓" if _err3 < 1e-9 else f"ERREUR : {_err3:.2e}")
+# ── 3.2 Test de validation Bernoulli sur les deux variantes ──────────────────
+for _tag, (_inst, _sol) in ILLUS.items():
+    _err = test_bernoulli_enum(_inst, _sol)
+    print(f"[{_tag}] erreur max formule fermée / énumération : {_err:.2e}")
 """)
 
 code("""\
-# ── 3.3 Affichage du planning (Table 1) ──────────────────────────────────────
-_slot_labels = ["S0 (30 min)", "S1 (30 min)", "S2 (60 min)", "S3 (60 min)"]
-rows = []
-for (d, t) in _sol3.coeffs["slots"]:
-    pats = _sol3.planning.get((d,t), [])
-    grp  = "".join(["A" if _inst3.s[i] == s_A else "B" for i in pats])
-    if len(pats) == 2:
-        pi, pj = (pats[0],pats[1]) if pats[0]<pats[1] else (pats[1],pats[0])
-        ei = _inst3.c_I*(_inst3.L[d][t]-_sol3.coeffs["a"][pi,d,t]
-                         -_sol3.coeffs["a"][pj,d,t]-_sol3.coeffs["delta"][pi,pj,d,t])
-        ew = _inst3.c_W*_sol3.coeffs["w"][pi,pj]
-        eo = _inst3.c_O*(_sol3.coeffs["o"][pi,d,t]+_sol3.coeffs["o"][pj,d,t]
-                         +_sol3.coeffs["gamma"][pi,pj,d,t])
-    elif len(pats) == 1:
-        i = pats[0]
-        ei = _inst3.c_I*(_inst3.L[d][t]-_sol3.coeffs["a"][i,d,t])
-        ew, eo = 0.0, _inst3.c_O*_sol3.coeffs["o"][i,d,t]
-    else:
-        ei = _inst3.c_I*_inst3.L[d][t]; ew=eo=0.0
-    rows.append({"Créneau": _slot_labels[t], "Patients": str(pats),
-                 "Groupe": grp, "Ordre SPT": str(pats),
-                 "E[Idle]": round(ei,3), "E[Wait]": round(ew,3), "E[OT]": round(eo,3)})
+# ── 3.3 Plannings et coefficients des paires (Table 1) ───────────────────────
+def illustrative_tables(inst, sol):
+    a, dl, w, o, gm = (sol.coeffs[k] for k in ("a", "delta", "w", "o", "gamma"))
+    rows, pair_rows = [], []
+    for (d, t) in sol.coeffs["slots"]:
+        pats = sol.planning.get((d, t), [])
+        ei, ew, eo = eval_slot_exact(pats, inst.q, inst.s, inst.L[d][t])
+        rows.append({"Créneau": f"S{t}", "L (min)": inst.L[d][t],
+                     "Patients (ordre SPT)": ", ".join(map(str, pats)) or "-",
+                     "Groupes": "".join(ILLUS_GROUPS[i] for i in pats) or "-",
+                     "E[Idle] (min)": inst.c_I * ei, "E[Wait] (min)": inst.c_W * ew,
+                     "E[OT] (min)": inst.c_O * eo})
+        if len(pats) == 2:
+            i, j = min(pats), max(pats)
+            pair_rows.append({"i": i, "j": j, "Créneau": f"S{t}", "L (min)": inst.L[d][t],
+                              "q_i": inst.q[i], "q_j": inst.q[j], "s_i": inst.s[i], "s_j": inst.s[j],
+                              "delta": dl[i, j, d, t], "w": w[i, j], "gamma": gm[i, j, d, t],
+                              "coeff. z": inst.c_W * w[i, j] - (inst.c_I + inst.c_O) * dl[i, j, d, t]})
+    return pd.DataFrame(rows), pd.DataFrame(pair_rows)
 
-_df3 = pd.DataFrame(rows)
-print(_df3.to_string(index=False))
+ILLUS_TABLES = {}
+for _tag, (_inst, _sol) in ILLUS.items():
+    ILLUS_TABLES[_tag] = illustrative_tables(_inst, _sol)
+    print(f"=== Table 1, variante {_tag} (Z* = {_sol.Z_complete:.2f}) ===")
+    print(ILLUS_TABLES[_tag][0].round(3).to_string(index=False))
+    print(ILLUS_TABLES[_tag][1].round(4).to_string(index=False) if len(ILLUS_TABLES[_tag][1])
+          else "Aucune paire double.")
+    print()
 """)
 
 code("""\
-# ── 3.4 Table des coefficients des paires à l'optimum ─────────────────────────
-pair_rows = []
-for (i,j) in _sol3.coeffs["pairs"]:
-    for (d,t) in _sol3.coeffs["slots"]:
-        zv = _sol3.z_val.get((i,j,d,t), 0) or 0
-        if zv > 0.5:
-            L = _inst3.L[d][t]
-            pair_rows.append({
-                "i": i, "j": j, "d": d, "t": t, "L": L,
-                "q_i": round(_inst3.q[i],2), "q_j": round(_inst3.q[j],2),
-                "s_i": _inst3.s[i], "s_j": _inst3.s[j],
-                "delta": round(_sol3.coeffs["delta"][i,j,d,t],4),
-                "w": round(_sol3.coeffs["w"][i,j],4),
-                "gamma": round(_sol3.coeffs["gamma"][i,j,d,t],4),
-                "coeff_z": round(_inst3.c_W*_sol3.coeffs["w"][i,j]
-                                 -((_inst3.c_I+_inst3.c_O)*_sol3.coeffs["delta"][i,j,d,t]),4),
-            })
-_df3p = pd.DataFrame(pair_rows)
-print(_df3p.to_string(index=False) if not _df3p.empty else "Aucune paire double dans la solution.")
-""")
-
-code("""\
-# ── 3.5 Export LaTeX ──────────────────────────────────────────────────────────
-os.makedirs("tables", exist_ok=True)
-_df3.to_latex("tables/table1_planning.tex", index=False, float_format="%.3f",
-              caption="Planning illustratif (n=10, D=1, 4 créneaux).", label="tab:planning")
-if not _df3p.empty:
-    _df3p.to_latex("tables/table1_pairs.tex", index=False, float_format="%.4f",
-                   caption="Coefficients des paires doubles à l'optimum.", label="tab:pairs")
+# ── 3.4 Export LaTeX ─────────────────────────────────────────────────────────
+for _tag, (_df_plan, _df_pairs) in ILLUS_TABLES.items():
+    _Z = ILLUS[_tag][1].Z_complete
+    _df_plan.to_latex(f"tables/table1_planning_{_tag}.tex", index=False, float_format="%.3f",
+                      caption=f"Planning illustratif, durées {_tag} ($Z^\\\\star$ = {_Z:.2f}).",
+                      label=f"tab:planning-{_tag}")
+    if len(_df_pairs):
+        _df_pairs.to_latex(f"tables/table1_pairs_{_tag}.tex", index=False, float_format="%.4f",
+                           caption=f"Coefficients des paires doubles à l'optimum, durées {_tag}.",
+                           label=f"tab:pairs-{_tag}")
 print("Tables LaTeX exportées dans tables/")
 """)
 
