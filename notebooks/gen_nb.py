@@ -605,220 +605,95 @@ plt.show()
 """)
 
 # ── Section 7 : Sensibilité ──────────────────────────────────────────────────
-md("## 7. Analyse de sensibilité et robustesse")
+md("## 7. Analyse de sensibilité et robustesse\n\n"
+   "Correction P3. Pour chaque perturbation, le PLNE est résolu sur l'instance perturbée "
+   "(ce que verrait l'optimiseur), puis son planning est évalué sur l'instance vraie et comparé "
+   "à l'optimum vrai (même cellule, même graine, solution du cache). Évaluation **exacte** "
+   "(coût du modèle) et **simulée** avec des nombres aléatoires communs aux deux plannings. "
+   "Les perturbations d'un même type partagent leurs tirages d'un niveau à l'autre. "
+   "La mauvaise classification va jusqu'au taux d'erreur mesuré du classifieur de groupe. "
+   "Aucune conclusion comparative n'est tirée sans test apparié significatif (Wilcoxon, 5 %).")
 
 code("""\
-# ── 7.1 Miscalibration de q ───────────────────────────────────────────────────
-EPSILONS = [-0.10, -0.05, 0.05, 0.10]
-_SENS_R = min(R, 10)
+# ── 7.1 Regret sous perturbation des entrées ─────────────────────────────────
+from ilp_campaign import sensitivity_spec, sensitivity_specs, sensitivity_table
 
-def _miscal_cell(seed, eps):
-    inst_true = generate_instance(seed, ratio=1.5, p_bar=0.20, long_share=0.15, cW_ratio=0.50)
-    # Optimiser avec q̂ = clip(q + eps)
-    q_hat = np.clip(inst_true.q + eps, 0.05, 0.99)
-    inst_hat = Instance(n=inst_true.n, D=inst_true.D, T=inst_true.T, L=inst_true.L,
-                        s=inst_true.s, q=q_hat,
-                        c_I=inst_true.c_I, c_W=inst_true.c_W, c_O=inst_true.c_O)
-    sol_hat = solve_ilp(inst_hat)
-
-    # Évaluer sous q vrai
-    rng = np.random.default_rng(seed+77777)
-    Z_sim_true = simulate_instance(inst_true, sol_hat.planning, 1000, rng).mean()
-
-    # Référence : solution optimale avec q vrai
-    sol_true = solve_ilp(inst_true)
-    rng2 = np.random.default_rng(seed+88888)
-    Z_sim_opt  = simulate_instance(inst_true, sol_true.planning, 1000, rng2).mean()
-
-    deg = 100*(Z_sim_true/Z_sim_opt - 1) if Z_sim_opt > 1e-9 else 0.0
-    return {"seed": seed, "eps": eps, "Z_miscal": Z_sim_true,
-            "Z_opt": Z_sim_opt, "deg_pct": deg}
-
-miscal_rows = []
-for eps in EPSILONS:
-    rows = joblib.Parallel(n_jobs=-1)(
-        joblib.delayed(_miscal_cell)(SEEDS[r], eps) for r in range(_SENS_R)
-    )
-    miscal_rows.extend(rows)
-
-_df_miscal = pd.DataFrame(miscal_rows)
-
-# Bruit gaussien
-def _noise_cell(seed, sigma=0.05):
-    inst_true = generate_instance(seed, ratio=1.5, p_bar=0.20, long_share=0.15, cW_ratio=0.50)
-    rng = np.random.default_rng(seed+12345)
-    q_hat = np.clip(inst_true.q + rng.normal(0, sigma, inst_true.n), 0.05, 0.99)
-    inst_hat = Instance(n=inst_true.n, D=inst_true.D, T=inst_true.T, L=inst_true.L,
-                        s=inst_true.s, q=q_hat,
-                        c_I=inst_true.c_I, c_W=inst_true.c_W, c_O=inst_true.c_O)
-    sol_hat = solve_ilp(inst_hat)
-    rng2 = np.random.default_rng(seed+22222)
-    Z_sim = simulate_instance(inst_true, sol_hat.planning, 1000, rng2).mean()
-    sol_opt = solve_ilp(inst_true)
-    rng3 = np.random.default_rng(seed+33333)
-    Z_opt = simulate_instance(inst_true, sol_opt.planning, 1000, rng3).mean()
-    return {"seed": seed, "eps": f"N(0,{sigma})", "Z_miscal": Z_sim,
-            "Z_opt": Z_opt, "deg_pct": 100*(Z_sim/Z_opt-1) if Z_opt>1e-9 else 0.0}
-
-noise_rows = joblib.Parallel(n_jobs=-1)(
-    joblib.delayed(_noise_cell)(SEEDS[r]) for r in range(_SENS_R)
-)
-_df_miscal = pd.concat([_df_miscal, pd.DataFrame(noise_rows)], ignore_index=True)
-_df_miscal.to_csv("results/sensitivity_miscal.csv", index=False)
-
-print("Dégradation % par niveau de miscalibration :")
-print(_df_miscal.groupby("eps")["deg_pct"].agg(["mean","std"]).round(2))
+SENS_SPECS = sensitivity_specs(CC, PLNE["group_error_rate"])
+_df_sens_raw = pd.DataFrame(run_lpt(functools.partial(sensitivity_spec, CTX), SENS_SPECS,
+                                    spec_cost, CC.n_workers))
+_df_sens_raw.to_csv("results/sensitivity_raw.csv", index=False)
+_df_sens = sensitivity_table(_df_sens_raw)
+_df_sens.to_csv("results/sensitivity_summary.csv", index=False)
+print(_df_sens.round(4).to_string(index=False))
 """)
 
 code("""\
-# ── 7.2 Perturbation des durées ───────────────────────────────────────────────
-DUR_DELTAS = [-0.20, -0.10, 0.10, 0.20]
-MISCLASS_RATES = [0.05, 0.10, 0.20]
-
-def _dur_cell(seed, delta_s):
-    inst = generate_instance(seed, ratio=1.5, p_bar=0.20, long_share=0.15, cW_ratio=0.50)
-    s_pert = inst.s * (1 + delta_s)
-    inst_p = Instance(n=inst.n, D=inst.D, T=inst.T, L=inst.L,
-                      s=s_pert, q=inst.q,
-                      c_I=inst.c_I, c_W=inst.c_W, c_O=inst.c_O)
-    sol = solve_ilp(inst_p)
-    # Évaluer sous durées vraies
-    rng = np.random.default_rng(seed+55)
-    Z_eval = simulate_instance(inst, sol.planning, 1000, rng).mean()  # durées vraies
-    sol_opt = solve_ilp(inst)
-    rng2 = np.random.default_rng(seed+66)
-    Z_opt = simulate_instance(inst, sol_opt.planning, 1000, rng2).mean()
-    return {"seed": seed, "perturb": f"{int(delta_s*100):+d}%",
-            "deg_pct": 100*(Z_eval/Z_opt-1) if Z_opt>1e-9 else 0.0}
-
-def _misclass_cell(seed, rate):
-    rng = np.random.default_rng(seed+111)
-    inst = generate_instance(seed, ratio=1.5, p_bar=0.20, long_share=0.15, cW_ratio=0.50)
-    swap = rng.random(inst.n) < rate
-    s_swap = np.where(swap,
-                      np.where(inst.s > (s_A+s_B)/2, s_B, s_A),  # swap A↔B
-                      inst.s)
-    inst_p = Instance(n=inst.n, D=inst.D, T=inst.T, L=inst.L,
-                      s=s_swap, q=inst.q,
-                      c_I=inst.c_I, c_W=inst.c_W, c_O=inst.c_O)
-    sol = solve_ilp(inst_p)
-    rng2 = np.random.default_rng(seed+222)
-    Z_eval = simulate_instance(inst, sol.planning, 1000, rng2).mean()
-    sol_opt = solve_ilp(inst)
-    rng3 = np.random.default_rng(seed+333)
-    Z_opt  = simulate_instance(inst, sol_opt.planning, 1000, rng3).mean()
-    return {"seed": seed, "perturb": f"misclass {int(rate*100)}%",
-            "deg_pct": 100*(Z_eval/Z_opt-1) if Z_opt>1e-9 else 0.0}
-
-dur_rows = []
-for d in DUR_DELTAS:
-    dur_rows += joblib.Parallel(n_jobs=-1)(
-        joblib.delayed(_dur_cell)(SEEDS[r], d) for r in range(_SENS_R))
-for r in MISCLASS_RATES:
-    dur_rows += joblib.Parallel(n_jobs=-1)(
-        joblib.delayed(_misclass_cell)(SEEDS[rr], r) for rr in range(_SENS_R))
-
-_df_dur = pd.DataFrame(dur_rows)
-_df_dur.to_csv("results/sensitivity_durations.csv", index=False)
-print("Dégradation %, perturbation des durées :")
-print(_df_dur.groupby("perturb")["deg_pct"].agg(["mean","std"]).round(2))
+# ── 7.2 Figure : regret exact par perturbation (moyenne et IC à 95 %) ───────
+_KIND_LABEL = {"q_shift": "Décalage de q", "q_noise": "Bruit gaussien sur q",
+               "duration": "Erreur relative sur s", "misclass": "Taux de mauvaise classification"}
+fig, axes = plt.subplots(1, 4, figsize=(16, 3.8))
+for ax, (kind, lab) in zip(axes, _KIND_LABEL.items()):
+    sub = _df_sens_raw[_df_sens_raw["kind"] == kind]
+    g = sub.groupby("level")["deg_pct"].apply(_mean_ci)
+    ax.errorbar(g.index, [v[0] for v in g], yerr=[v[1] for v in g], fmt="o-", capsize=3)
+    ax.axhline(0, color="grey", lw=0.8)
+    ax.set_xlabel(lab); ax.set_ylabel("Regret exact (% du coût optimal)"); ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("figures/sensitivity_regret.pdf", bbox_inches="tight")
+plt.savefig("figures/sensitivity_regret.png", dpi=300, bbox_inches="tight")
+plt.show()
 """)
 
 code("""\
-# ── 7.3 Sensibilité à Q̄ et déséquilibre de classes ─────────────────────────
-Q_BARS   = [1.0, 1.2, 1.5, None]
-PI_AS    = [0.05, 0.15, 0.30]
-
-def _qbar_cell(seed, Q_bar, pi_A_val):
-    inst = generate_instance(seed, ratio=1.5, p_bar=0.20, long_share=0.15,
-                             cW_ratio=0.50, pi_A_=pi_A_val, Q_bar=Q_bar)
-    sol  = solve_ilp(inst)
-    return {"seed": seed, "Q_bar": str(Q_bar), "pi_A": pi_A_val,
-            "Z_complete": sol.Z_complete, "n_served": sol.n_served,
-            "n_double": sol.n_double, "solve_time": sol.solve_time}
-
-qbar_rows = []
-for qb in Q_BARS:
-    for pa in PI_AS:
-        qbar_rows += joblib.Parallel(n_jobs=-1)(
-            joblib.delayed(_qbar_cell)(SEEDS[r], qb, pa) for r in range(min(_SENS_R, 5)))
-
-_df_qbar = pd.DataFrame(qbar_rows)
+# ── 7.3 Plafond de présence Q̄ et part du groupe A (10 premières graines) ────
+Q_BARS = [1.0, 1.2, 1.5, None]
+PI_AS = sorted({0.05, 0.15, 0.30, round(pi_A, 4)})
+QBAR_SPECS = [cell_spec(CC, "qbar", sd, Q_bar=qb, pi_A=pa)
+              for qb in Q_BARS for pa in PI_AS for sd in SEEDS[:10]]
+_df_qbar = pd.DataFrame(run_lpt(functools.partial(solve_spec, CTX), QBAR_SPECS, spec_cost, CC.n_workers))
+_df_qbar["Q_bar"] = _df_qbar["Q_bar"].map(lambda v: "aucun" if pd.isna(v) else f"{v:g}")
 _df_qbar.to_csv("results/sensitivity_qbar.csv", index=False)
-print("Effet Q̄ et π_A sur Z_complete :")
-print(_df_qbar.pivot_table(values="Z_complete", index="Q_bar",
-                            columns="pi_A", aggfunc="mean").round(3))
+print("Statuts :", _df_qbar["status"].value_counts().to_dict())
+print(_df_qbar.pivot_table(values="Z_complete", index="Q_bar", columns="pi_A", aggfunc="mean").round(3))
 """)
 
 code("""\
-# ── 7.4 Front de Pareto idle–attente (sweep c_W/c_I) ─────────────────────────
+# ── 7.4 Front idle / attente (balayage de c_W/c_I, 10 premières graines) ────
 CW_SWEEP = [0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0]
-
-def _pareto_cell(seed, cwr):
-    inst = generate_instance(seed, ratio=1.5, p_bar=0.20, long_share=0.15, cW_ratio=cwr)
-    sol  = solve_ilp(inst)
-    return {"seed": seed, "cW_ratio": cwr,
-            "E_idle": sol.E_idle, "E_wait": sol.E_wait, "E_OT": sol.E_OT}
-
-pareto_rows = []
-for cwr in CW_SWEEP:
-    pareto_rows += joblib.Parallel(n_jobs=-1)(
-        joblib.delayed(_pareto_cell)(SEEDS[r], cwr) for r in range(min(_SENS_R, 5)))
-
-_df_pareto = pd.DataFrame(pareto_rows)
+PARETO_SPECS = [cell_spec(CC, "pareto", sd, cW_ratio=v) for v in CW_SWEEP for sd in SEEDS[:10]]
+_df_pareto = pd.DataFrame(run_lpt(functools.partial(solve_spec, CTX), PARETO_SPECS, spec_cost, CC.n_workers))
+# E_wait est pondéré par c_W : on revient aux minutes d'attente pour le front
+_df_pareto["wait_min"] = _df_pareto["E_wait"] / _df_pareto["cW_ratio"]
 _df_pareto.to_csv("results/pareto_idle_wait.csv", index=False)
-
-# Figure Pareto
-grp_p = _df_pareto.groupby("cW_ratio")[["E_idle","E_wait"]].mean()
+grp_p = _df_pareto.groupby("cW_ratio")[["E_idle", "wait_min"]].mean()
 fig, ax = plt.subplots(figsize=(6, 5))
-sc = ax.scatter(grp_p["E_idle"], grp_p["E_wait"],
-                c=np.log(grp_p.index), cmap="viridis", s=80, zorder=5)
+sc = ax.scatter(grp_p["E_idle"], grp_p["wait_min"], c=np.log(grp_p.index), cmap="viridis", s=60, zorder=5)
 for cwr, row in grp_p.iterrows():
-    ax.annotate(f"cW={cwr}", (row["E_idle"], row["E_wait"]),
-                fontsize=7, textcoords="offset points", xytext=(4,4))
-ax.plot(grp_p["E_idle"], grp_p["E_wait"], "k--", alpha=0.4)
-ax.set_xlabel("E[Idle]"); ax.set_ylabel("E[Wait]")
-ax.set_title("Front de Pareto idle–attente"); ax.grid(True, alpha=0.3)
-plt.colorbar(sc, ax=ax, label="log(c_W/c_I)")
+    ax.annotate(f"{cwr:g}", (row["E_idle"], row["wait_min"]), fontsize=7,
+                textcoords="offset points", xytext=(4, 4))
+ax.plot(grp_p["E_idle"], grp_p["wait_min"], "k--", alpha=0.4)
+ax.set_xlabel("Inactivité espérée E[Idle] (min)"); ax.set_ylabel("Attente espérée E[Wait] (min)")
+ax.grid(True, alpha=0.3)
+plt.colorbar(sc, ax=ax, label="log(c_W / c_I)")
 plt.tight_layout()
 plt.savefig("figures/pareto_idle_wait.pdf", bbox_inches="tight")
-plt.savefig("figures/pareto_idle_wait.png", dpi=150, bbox_inches="tight")
+plt.savefig("figures/pareto_idle_wait.png", dpi=300, bbox_inches="tight")
 plt.show()
-print("Front de Pareto sauvegardé.")
 """)
 
 code("""\
-# ── 7.5 Tableau de synthèse % déviation + verdict de stabilité ───────────────
-_sens_summary = []
-
-def _add_sens(label, df, col="deg_pct"):
-    grp = df.groupby("perturb" if "perturb" in df.columns else "eps")[col]
-    for k, v in grp:
-        _sens_summary.append({"Source": label, "Perturbation": str(k),
-                              "Déviation Z %": round(v.mean(), 2),
-                              "Écart-type": round(v.std(), 2)})
-
-_add_sens("Miscalibration q", _df_miscal, "deg_pct")
-_add_sens("Durées/Misclassif.", _df_dur, "deg_pct")
-
-_df_sens = pd.DataFrame(_sens_summary)
-_df_sens.to_csv("results/sensitivity_summary.csv", index=False)
-
-print("=== Synthèse de robustesse ===")
-print(_df_sens.to_string(index=False))
-
-_max_dev = _df_sens["Déviation Z %"].abs().max()
-if _max_dev < 5:
-    verdict = "STABLE (déviation max < 5%)"
-elif _max_dev < 10:
-    verdict = "MODÉRÉMENT STABLE (déviation max < 10%)"
-else:
-    verdict = f"INSTABLE (déviation max = {_max_dev:.1f}%)"
-print(f"\\nVerdict : {verdict}")
-
-_df_sens.to_latex("tables/table_sensitivity.tex", index=False, float_format="%.2f",
-                  caption="Synthèse de robustesse (% déviation du coût simulé).",
-                  label="tab:sensitivity")
+# ── 7.5 Synthèse : seules les différences significatives sont qualifiées ────
+_sig = _df_sens[_df_sens["Significatif (5 %)"]]
+_nsig = _df_sens[~_df_sens["Significatif (5 %)"]]
+print(f"{len(_sig)} perturbation(s) sur {len(_df_sens)} dégradent significativement le coût (Wilcoxon, 5 %).")
+for _, r in _sig.iterrows():
+    print(f"  {r['Perturbation']} {r['Niveau']:+g} : regret {r['Regret exact (%)']:.2f} %, "
+          f"IC 95 % de ΔZ [{r['IC 95 % bas']:.2f} ; {r['IC 95 % haut']:.2f}], p = {r['p exact']:.3g}")
+if len(_nsig):
+    print("Non significatif (aucune conclusion) : " +
+          ", ".join(f"{r['Perturbation']} {r['Niveau']:+g}" for _, r in _nsig.iterrows()))
+SENS_VERDICT = (f"{len(_sig)}/{len(_df_sens)} perturbations significatives ; regret exact maximal "
+                f"{_df_sens['Regret exact (%)'].max():.2f} %")
 """)
 
 # ── RESULTS.md ────────────────────────────────────────────────────────────────
@@ -854,7 +729,7 @@ _md = f\"\"\"# RESULTS.md, Chiffres clés pour le manuscrit
 - Écart % modèle/simulé (cellule centrale) : {_df_sim[_df_sim.label=='central']['gap_pct'].mean():.2f}%
 
 ## Robustesse
-- Verdict : {verdict}
+- {SENS_VERDICT}
 
 ## Fichiers
 - results/doe_ilp.csv, results/benchmarks.csv

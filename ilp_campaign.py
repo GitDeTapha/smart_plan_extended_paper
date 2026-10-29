@@ -193,7 +193,7 @@ class CampaignConfig:
 
     @classmethod
     def smoke(cls, n_workers: Optional[int] = None) -> "CampaignConfig":
-        return cls(days=2, slots_per_day=5, R=2, time_limit=30.0, mip_gap=1e-4, M_sim=2_000,
+        return cls(days=2, slots_per_day=5, R=2, time_limit=10.0, mip_gap=1e-4, M_sim=2_000,
                    ratios=(1.0, 1.5, 2.0), p_bars=(0.03, 0.20), long_shares=(0.15, 0.50),
                    cw_ratios=(0.5, 1.0), cw_fine=(1.0, 1.25, 1.5),
                    holdout_days=4, n_workers=n_workers or physical_cores())
@@ -546,3 +546,88 @@ def paired_summary(values: Sequence[float], reference: Sequence[float]) -> dict:
     return {"n": n, "mean_diff": mean, "ci_low": mean - half, "ci_high": mean + half,
             "rel_pct": float(np.mean(100.0 * d / r)), "n_better": int((d < -1e-9).sum()),
             "p_wilcoxon": p}
+
+
+# ----------------------------------------------------------------------------
+# Sensitivity (audit P3)
+# ----------------------------------------------------------------------------
+_PERTURB_CODES = {"q_shift": 1, "q_noise": 2, "duration": 3, "misclass": 4}
+
+
+def perturbed_instance(inst: Instance, kind: str, level: float, seed: int,
+                       s_A: float, s_B: float) -> Instance:
+    """Instance seen by the optimiser when its inputs are wrong.
+
+    q_shift: q + level; q_noise: q + N(0, level); duration: s (1 + level);
+    misclass: each patient's group (s_A <-> s_B) swapped with probability level.
+    The draw depends only on (seed, kind), so every level of a perturbation uses
+    the same uniforms or normals (common random numbers across levels).
+    """
+    if kind not in _PERTURB_CODES:
+        raise ValueError(f"unknown perturbation {kind!r}")
+    rng = np.random.default_rng([int(seed), _PERTURB_CODES[kind]])
+    q, s = inst.q.copy(), inst.s.copy()
+    if kind == "q_shift":
+        q = np.clip(q + level, *Q_CLIP)
+    elif kind == "q_noise":
+        q = np.clip(q + level * rng.standard_normal(inst.n), *Q_CLIP)
+    elif kind == "duration":
+        s = s * (1.0 + level)
+    else:
+        swap = rng.random(inst.n) < level
+        s = np.where(swap, np.where(np.isclose(s, s_A), s_B, s_A), s)
+    return dataclasses.replace(inst, q=q, s=s)
+
+
+def sensitivity_spec(ctx: CampaignContext, spec: dict) -> dict:
+    """Worker: regret of optimising on a perturbed instance, measured on the true one.
+
+    The true optimum is the cached ILP of the unperturbed cell (shared with the
+    design of experiments). Both schedules are evaluated exactly with the model
+    cost of the true instance, and in the simulator with the same scenarios.
+    """
+    from data_driven_plan import draw_scenarios, simulate_instance
+    kind, level = spec["perturb"]
+    base = {k: v for k, v in spec.items() if k != "perturb"}
+    inst = ctx.instance(base)
+    opt = ctx.solve(base)
+    hat_inst = perturbed_instance(inst, kind, level, spec["seed"], ctx.s_A, ctx.s_B)
+    hat = SolutionCache(ctx.cache_root).get_or_compute(
+        ctx.key(base, "ilp_perturbed", perturb=[kind, level]),
+        lambda: solve_record(hat_inst, ctx.cc.solver_config()))
+    rng = np.random.default_rng(spec["seed"] + 1299709)
+    scen = draw_scenarios(inst, ctx.cc.M_sim, rng)
+    sim_hat = simulate_instance(inst, hat["planning"], ctx.cc.M_sim, rng, scenarios=scen)
+    sim_opt = simulate_instance(inst, opt["planning"], ctx.cc.M_sim, rng, scenarios=scen)
+    Z_hat, Z_opt = model_cost(inst, hat["planning"]), model_cost(inst, opt["planning"])
+    return {**base, "kind": kind, "level": level, "Z_hat": Z_hat, "Z_opt": Z_opt,
+            "deg_pct": 100.0 * (Z_hat / Z_opt - 1.0), "Zsim_hat": float(sim_hat.mean()),
+            "Zsim_opt": float(sim_opt.mean()),
+            "sim_diff_se": float((sim_hat - sim_opt).std(ddof=1) / np.sqrt(ctx.cc.M_sim)),
+            "status_hat": hat["status"], "status_opt": opt["status"]}
+
+
+def sensitivity_specs(cc: CampaignConfig, group_error_rate: float) -> list:
+    """Perturbations of the central cell; misclassification goes up to the
+    classifier's measured error rate (audit P3)."""
+    rates = sorted({0.05, 0.10, 0.20, round(float(group_error_rate), 4)})
+    grid = ([("q_shift", e) for e in (-0.10, -0.05, 0.05, 0.10)] + [("q_noise", 0.05)]
+            + [("duration", e) for e in (-0.20, -0.10, 0.10, 0.20)]
+            + [("misclass", r) for r in rates])
+    return [{**cell_spec(cc, "central", seed), "perturb": [k, lv]} for (k, lv) in grid for seed in cc.seeds]
+
+
+def sensitivity_table(df) -> "pd.DataFrame":
+    """Mean regret per perturbation with 95 % CI and paired tests (exact and simulated)."""
+    import pandas as pd
+    rows = []
+    for (kind, level), g in df.groupby(["kind", "level"], sort=True):
+        ex = paired_summary(g["Z_hat"], g["Z_opt"])
+        sim = paired_summary(g["Zsim_hat"], g["Zsim_opt"])
+        rows.append({"Perturbation": kind, "Niveau": level, "n": ex["n"],
+                     "Regret exact (%)": ex["rel_pct"], "ΔZ exact": ex["mean_diff"],
+                     "IC 95 % bas": ex["ci_low"], "IC 95 % haut": ex["ci_high"],
+                     "p exact": ex["p_wilcoxon"], "ΔZ simulé": sim["mean_diff"],
+                     "p simulé": sim["p_wilcoxon"],
+                     "Significatif (5 %)": bool(ex["p_wilcoxon"] < 0.05) if ex["n"] > 1 else False})
+    return pd.DataFrame(rows)
