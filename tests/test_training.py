@@ -15,10 +15,11 @@ def data(n=6000, prior=0.05, seed=0):
     return X, y
 
 
-SMALL = dict(n_candidates=3, halving_factor=2, min_resources=1000, adaboost_max_estimators=15,
+SMALL = dict(halving_iterations=2, last_candidates=2, min_resources=500, adaboost_max_estimators=15,
              n_jobs=1, verbose=0,
              param_grids={"RandomForest": {"n_estimators": [20], "max_depth": [3, 5]},
-                          "XGBoost": {"n_estimators": [20], "max_depth": [2, 3]},
+                          "XGBoost": {"n_estimators": [10, 20], "max_depth": [2, 3, 4],
+                                      "learning_rate": [0.1, 0.3]},     # 12 combinations: halving path
                           "ANN": {"hidden_layer_sizes": [(8,)], "batch_size": [256], "alpha": [1e-4]}},
              base_params={"ANN": {"max_iter": 30}})
 

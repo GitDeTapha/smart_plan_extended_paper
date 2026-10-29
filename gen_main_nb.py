@@ -409,16 +409,19 @@ code("""\\
 # ── 4.0 Training settings ───────────────────────────────────────────────────
 TRAIN_CFG_NOSHOW = TrainingConfig(
     models=["RandomForest", "XGBoost", "AdaBoost", "ANN"],
-    search="halving", n_candidates=12, halving_factor=3,
-    min_resources=500_000,        # fit rows of the first halving iteration
+    search="halving",
+    halving_iterations=3,         # successive halving: 3 iterations ...
+    last_candidates=2,            # ... ending with 2 finalists compared on all of fit
+    min_resources=500_000,        # fit rows of the first iteration (audit 1.3)
     max_resources=None,           # None: all of fit at the last iteration
+    memory_safety=0.6,            # search processes capped to 60 % of the available memory
     smote_sampling_strategy=0.1, smote_k_neighbors=5,
     adaboost_max_estimators=400, adaboost_learning_rates=(0.5, 1.0),
     threshold_metric="youden", n_jobs=N_JOBS, verbose=1, random_state=RANDOM_STATE,
 )
 if SMOKE:   # minimal budgets: the smoke run checks that the code runs, not the results
     TRAIN_CFG_NOSHOW = TRAIN_CFG_NOSHOW.replace(
-        n_candidates=4, min_resources=20_000, adaboost_max_estimators=40,
+        min_resources=20_000, adaboost_max_estimators=40,
         param_grids={"RandomForest": {"n_estimators": [100], "max_depth": [8, 12]},
                      "XGBoost": {"n_estimators": [100]}},
         base_params={"ANN": {"max_iter": 20}})
