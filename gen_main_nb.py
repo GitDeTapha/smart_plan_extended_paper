@@ -551,20 +551,30 @@ md("## 6. Deployment\n\n"
    "as-is by section 7.")
 
 code("""\
-# ── 6.1 Serialise the artifacts ───────────────────────────────────────────────
+# ── 6.1 Group threshold: predicted share of A = observed share (calib half B) ─
+GROUP_THRESHOLD = share_matching_threshold(cal_grp.p_calib_eval[best_group_name],
+                                           target_share=float(cal_grp.y_calib_eval.mean()))
+print(f"Threshold on calibrated p_A: {GROUP_THRESHOLD:.4f} (Youden: {cal_grp.thresholds[best_group_name]:.4f}); "
+      f"observed share of A on calib {cal_grp.y_calib_eval.mean():.4f}")
+""")
+
+code("""\
+# ── 6.2 Serialise the artifacts ─────────────────────────────────────────────
 save_artifacts(
     calibrated_noshow_model, cluster_tree, best_group_model,
     scaler, cat_encodings, feature_cols, name_prefix="final",
+    inference={"group_threshold": GROUP_THRESHOLD, "duration_groups": DURATION_GROUPS,
+               "run_id": RUN_ID, "noshow_model_name": best_noshow_name,
+               "group_model_name": best_group_name},
 )
 """)
 
 code("""\
-# ── 6.2 predict_patient demonstration on a test-set sample ──────────────────
-demo_scores = predict_patient(
-    X_test.head(10), calibrated_noshow_model, best_group_model,
-    positive_group_label="A", reference_group_label="B",
-)
-demo_scores["NoShow_actual"] = test_df["NoShow"].head(10).values
+# ── 6.3 predict_patient on a few test rows ──────────────────────────────────
+demo_scores = predict_patient(X_test_np[:10], calibrated_noshow_model, best_group_model,
+                              threshold_A=GROUP_THRESHOLD, s_A=service_time_by_group["A"],
+                              s_B=service_time_by_group["B"], index=test_df.index[:10])
+demo_scores["NoShow_actual"] = y_test_ns[:10]
 display(demo_scores)
 """)
 
@@ -594,9 +604,11 @@ print("Artifacts loaded:", list(artifacts.keys()))
 
 code("""\
 # ── 7.2 Inference on the holdout patients (never trained on) ────────────────
+_inf = artifacts["inference"]
 scored_inference = predict_patient(
-    X_inference, artifacts["noshow_model"], artifacts["group_classifier"],
-    positive_group_label="A", reference_group_label="B",
+    X_inf_np, artifacts["noshow_model"], artifacts["group_classifier"],
+    threshold_A=_inf["group_threshold"], s_A=_inf["duration_groups"].s_by_group["A"],
+    s_B=_inf["duration_groups"].s_by_group["B"], index=df_inference.index,
 )
 scored_inference["NoShow_actual"] = df_inference["NoShow"].values
 scored_inference["group_label_actual"] = df_sample.loc[df_inference.index, "group_label"].values
@@ -605,8 +617,8 @@ print("Predictions on patients never seen during training:")
 display(scored_inference.head(10))
 print(f"\\nMean predicted show-up rate (q_i): {scored_inference['q_i'].mean():.3f}"
       f"   |   observed (1-NoShow): {(1 - scored_inference['NoShow_actual']).mean():.3f}")
-print(f"Predicted group distribution:\\n{scored_inference['group'].value_counts()}")
-print(f"Actual group distribution   :\\n{scored_inference['group_label_actual'].value_counts()}")
+print(f"Share of group A, predicted / actual: {(scored_inference['group'] == 'A').mean():.4f} / "
+      f"{(scored_inference['group_label_actual'] == 'A').mean():.4f}")
 """)
 
 code("""\
@@ -642,7 +654,7 @@ s_B_real = service_time_by_group["B"]
 
 real_instance = build_instance_from_patients(
     demo_patients, T=T_demo, L=L_demo, s_A=s_A_real, s_B=s_B_real,
-    c_I=1.0, c_W=0.5, c_O=C_O_BASE, group_col="group", q_col="q_i", positive_group="A",
+    c_I=1.0, c_W=0.5, c_O=C_O_BASE, duration_mode="class",   # "expected": s = p_A s_A + (1 - p_A) s_B
 )
 print(f"Real instance: n={real_instance.n} patients, {sum(T_demo)} slots "
       f"(max capacity {2*sum(T_demo)} seats), s_A={s_A_real:.1f} min, s_B={s_B_real:.1f} min")

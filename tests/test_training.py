@@ -60,3 +60,28 @@ def test_share_matching_threshold():
     p = np.linspace(0, 1, 1001)
     t = share_matching_threshold(p, 0.35)
     assert np.mean(p >= t) == pytest.approx(0.35, abs=2e-3)
+
+
+def test_predict_patient_and_duration_modes():
+    import pandas as pd
+    from data_driven_plan import build_instance_from_patients, predict_patient
+
+    class Const:
+        def __init__(self, p):
+            self.p = np.asarray(p)
+
+        def predict_proba(self, X):
+            return np.c_[1 - self.p, self.p]
+
+    X = np.zeros((3, 2))
+    out = predict_patient(X, Const([0.1, 0.0, 0.2]), Const([0.9, 0.3, 0.5]), threshold_A=0.5,
+                          s_A=36.0, s_B=7.0)
+    assert list(out["group"]) == ["A", "B", "A"]
+    assert out["s_expected"].tolist() == pytest.approx([0.9 * 36 + 0.1 * 7, 0.3 * 36 + 0.7 * 7, 21.5])
+    kw = dict(T=[2], L=[[30.0, 60.0]], s_A=36.0, s_B=7.0, c_I=1.0, c_W=0.5, c_O=0.5)
+    cls = build_instance_from_patients(out, duration_mode="class", **kw)
+    exp = build_instance_from_patients(out, duration_mode="expected", **kw)
+    assert cls.s.tolist() == [36.0, 7.0, 36.0] and exp.s.tolist() == pytest.approx(out["s_expected"].tolist())
+    assert cls.q.max() == pytest.approx(0.999)          # q = 1.0 clipped explicitly
+    with pytest.raises(ValueError):
+        build_instance_from_patients(out, duration_mode="mean", **kw)

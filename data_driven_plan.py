@@ -2000,41 +2000,33 @@ def get_group_labels_for_split(df_sample: pd.DataFrame, X_train: pd.DataFrame, X
 # ============================================================================
 
 def predict_patient(
-    features_df: pd.DataFrame, noshow_model, group_classifier,
-    positive_group_label: str = "A", reference_group_label: str = "B",
+    features: np.ndarray, noshow_model, group_model, threshold_A: float,
+    s_A: float, s_B: float, index: Optional[pd.Index] = None,
 ) -> pd.DataFrame:
-    """Single inference entry point: (features) -> (q_i, group).
+    """Single inference entry point: features -> (q_i, p_A, group, s_expected).
 
-    Uses the group classifier trained on the FEATURES (`group_classifier`,
-    section 4b), not the service_time -> group tree from
-    `learn_decision_tree_cutoffs` (which requires the realised service time to
-    be known already, unavailable before a new patient's consultation). The
-    tree remains useful for the interpretable cutoff analysis, but not for
-    production inference.
-
-    Args:
-        features_df: already encoded/standardised features (same columns as in
-            training), for both calibrated models.
-        noshow_model: calibrated no-show model (predict_proba returns P(NoShow)
-            in column 1).
-        group_classifier: group classifier trained by `train_binary_classifiers`
-            (predict_proba returns P(group == positive_group_label) in column 1).
-        positive_group_label: label of the group encoded as 1 by `train_binary_classifiers`.
-        reference_group_label: label of the group encoded as 0.
+    Both models are the CALIBRATED ones of section 5. The group is predicted
+    from the features (the service-time tree needs the realised duration,
+    unknown before the visit). The threshold on p_A is the one chosen on calib
+    so that the predicted share of group A matches the observed share (audit
+    rec. 12: at 0.5 the run of 26/09 predicted 42 % of long patients for 15 %).
 
     Returns:
-        DataFrame indexed like `features_df`, with columns `q_i` (show-up
-        probability = 1 - P(NoShow)) and `group` (predicted label).
+        DataFrame with q_i = 1 - P(no-show), p_A = P(group A), group (A if
+        p_A >= threshold_A) and s_expected = p_A s_A + (1 - p_A) s_B, the
+        expected duration under the calibrated group probability.
     """
-    p_noshow = noshow_model.predict_proba(features_df)[:, 1]
-    p_group_positive = group_classifier.predict_proba(features_df)[:, 1]
-    group = np.where(p_group_positive >= 0.5, positive_group_label, reference_group_label)
-    return pd.DataFrame({"q_i": 1.0 - p_noshow, "group": group}, index=features_df.index)
+    p_noshow = noshow_model.predict_proba(features)[:, 1]
+    p_A = group_model.predict_proba(features)[:, 1]
+    return pd.DataFrame({"q_i": 1.0 - p_noshow, "p_A": p_A,
+                         "group": np.where(p_A >= threshold_A, "A", "B"),
+                         "s_expected": p_A * s_A + (1.0 - p_A) * s_B}, index=index)
 
 
 def save_artifacts(
     noshow_model, cluster_tree, group_classifier, scaler: StandardScaler,
     cat_encodings: dict, feature_cols: list[str], name_prefix: str = "final",
+    inference: Optional[dict] = None,
 ) -> None:
     """Serialise the three inference artifacts and the preprocessing objects.
 
@@ -2054,6 +2046,8 @@ def save_artifacts(
     joblib.dump(scaler, f"{MODELS_DIR}/{name_prefix}_scaler.joblib")
     joblib.dump({"cat_encodings": cat_encodings, "feature_cols": feature_cols},
                 f"{MODELS_DIR}/{name_prefix}_preprocessing.joblib")
+    if inference is not None:   # threshold on p_A, duration groups, run id
+        joblib.dump(inference, f"{MODELS_DIR}/{name_prefix}_inference.joblib")
     print(f"Artifacts saved to {MODELS_DIR}/ with prefix '{name_prefix}_'.")
 
 
@@ -2074,6 +2068,7 @@ def load_artifacts(name_prefix: str = "final") -> dict:
         "scaler": joblib.load(f"{MODELS_DIR}/{name_prefix}_scaler.joblib"),
         "cat_encodings": prep["cat_encodings"],
         "feature_cols": prep["feature_cols"],
+        "inference": joblib.load(f"{MODELS_DIR}/{name_prefix}_inference.joblib"),
     }
 
 
@@ -2755,30 +2750,45 @@ def evaluate_planning_exact(inst: "Instance", planning: dict, day_dynamics: bool
             "Z": inst.c_I * E_idle + inst.c_W * E_wait + inst.c_O * E_OT}
 
 
+#: Bounds applied to predicted q_i before they enter an Instance, which needs
+#: q in (0, 1): isotonic calibration can return exactly 0 or 1. Same bounds as the
+#: campaign generator (ilp_campaign.Q_CLIP).
+Q_BOUNDS = (0.01, 0.999)
+
+
 def build_instance_from_patients(
     df_scored: pd.DataFrame, T: list[int], L: list[list[float]],
     s_A: float, s_B: float, c_I: float, c_W: float, c_O: float,
-    group_col: str = "group", q_col: str = "q_i", positive_group: str = "A",
+    duration_mode: str = "class", group_col: str = "group", q_col: str = "q_i",
+    positive_group: str = "A",
 ) -> Instance:
-    """Build an ILP Instance from ACTUALLY predicted patients (never seen during
-    training), bridging from `predict_patient`.
+    """Build an ILP Instance from patients scored by `predict_patient`.
 
     Args:
-        df_scored: DataFrame returned by `predict_patient` (columns `q_col`,
-            `group_col`), one patient per row.
-        T: number of slots per day, e.g. [4] for a single 4-slot day.
-        L: duration (minutes) of each slot, e.g. [[30.,30.,60.,60.]].
-        s_A: representative service duration of group A (long).
-        s_B: representative service duration of group B (short).
-        c_I, c_W, c_O: unit idle/wait/overtime costs.
-        group_col: column of `df_scored` holding the predicted group.
-        q_col: column of `df_scored` holding the predicted show-up probability.
-        positive_group: value of `group_col` denoting the "long" group (s_A).
+        df_scored: one patient per row, with `q_col`, `group_col` and, for
+            duration_mode="expected", `s_expected`.
+        T, L: slots per day and their lengths (minutes).
+        s_A, s_B: durations of the two groups (from plne_parameters.json).
+        c_I, c_W, c_O: unit costs, all explicit.
+        duration_mode: "class" gives each patient the duration of its
+            predicted group (the manuscript's model); "expected" uses
+            s_expected = p_A s_A + (1 - p_A) s_B (audit rec. 12).
 
     Returns:
-        Instance ready for `solve_ilp`.
+        Instance ready for `solve_ilp`. q is clipped to Q_BOUNDS; the number of
+        clipped values is printed.
     """
-    n = len(df_scored)
-    s = np.where(df_scored[group_col].to_numpy() == positive_group, s_A, s_B)
-    q = np.clip(df_scored[q_col].to_numpy(dtype=float), 0.01, 0.99)
-    return Instance(n=n, D=len(T), T=T, L=L, s=s, q=q, c_I=c_I, c_W=c_W, c_O=c_O)
+    if duration_mode == "class":
+        s = np.where(df_scored[group_col].to_numpy() == positive_group, s_A, s_B)
+    elif duration_mode == "expected":
+        s = df_scored["s_expected"].to_numpy(dtype=float)
+    else:
+        raise ValueError(f"duration_mode={duration_mode!r}, expected 'class' or 'expected'")
+    q_raw = df_scored[q_col].to_numpy(dtype=float)
+    if not np.all(np.isfinite(q_raw)) or q_raw.min() < 0 or q_raw.max() > 1:
+        raise ValueError("predicted q_i must be probabilities")
+    q = np.clip(q_raw, *Q_BOUNDS)
+    n_clipped = int((q != q_raw).sum())
+    if n_clipped:
+        print(f"build_instance_from_patients: {n_clipped} q_i clipped to {Q_BOUNDS}")
+    return Instance(n=len(df_scored), D=len(T), T=T, L=L, s=s, q=q, c_I=c_I, c_W=c_W, c_O=c_O)
