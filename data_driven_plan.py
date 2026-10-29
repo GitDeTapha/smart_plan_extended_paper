@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import inspect
 import os
 import time
 import warnings
@@ -49,20 +50,12 @@ try:
 except ImportError:  # pragma: no cover
     display = print
 
-try:
-    from xgboost import XGBClassifier
-    XGB_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    from sklearn.ensemble import HistGradientBoostingClassifier as XGBClassifier
-    XGB_AVAILABLE = False
-
-try:
-    from imblearn.over_sampling import SMOTE
-    from imblearn.pipeline import Pipeline as ImbPipeline
-    SMOTE_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    SMOTE_AVAILABLE = False
-    ImbPipeline = None
+# xgboost and imbalanced-learn are hard requirements: the published study (Fall et al.)
+# uses these libraries, and a silent substitute (HistGradientBoosting, no SMOTE) would
+# change the models being reported without saying so.
+from xgboost import XGBClassifier
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
 
 import pyomo.environ as pyo
 
@@ -88,7 +81,7 @@ PREPROCESSED_PATH = os.path.join(DATA_DIR, "preprocessed", "preprocessed_data.pa
 INFERENCE_DIR = os.path.join(DATA_DIR, "inference")
 
 # ----------------------------------------------------------------------------
-# Figure typography — single source of truth
+# Figure typography, single source of truth
 # ----------------------------------------------------------------------------
 # Every figure is meant for a journal submission, so sizes are set once here and
 # never hard-coded inside a plotting function: annotations that used to be fixed
@@ -154,7 +147,7 @@ def _savefig(name: str, prefix: str = "") -> None:
     plt.savefig(f"{FIGURES_DIR}/{stem}.png", dpi=300, bbox_inches="tight")
 
 
-print(f"Native XGBoost: {XGB_AVAILABLE} | SMOTE available: {SMOTE_AVAILABLE}")
+print(f"xgboost {__import__('xgboost').__version__} | imbalanced-learn {__import__('imblearn').__version__}")
 
 
 # ============================================================================
@@ -196,7 +189,7 @@ def save_dataframe(df: pd.DataFrame, path: str) -> None:
     """Save a DataFrame as CSV, creating the parent directory if needed.
 
     Intended for small exports meant to be read as-is (summary tables,
-    aggregated results) — use `save_preprocessed_data` (Parquet) to checkpoint
+    aggregated results), use `save_preprocessed_data` (Parquet) to checkpoint
     the large preprocessed DataFrame.
 
     Args:
@@ -299,7 +292,7 @@ def make_master_split(
         random_state: seed for reproducibility.
 
     Returns:
-        (df_sample, train_df, test_df, df_inference) — three disjoint DataFrames
+        (df_sample, train_df, test_df, df_inference), three disjoint DataFrames
         (train/test/inference), df_sample being their union.
     """
     if abs((train_size + test_size + inference_size) - 1.0) > 1e-9:
@@ -363,12 +356,12 @@ def prepare_features(
     """Encoding and standardisation shared by both ML pipelines.
 
     The scaler and categorical encodings are fitted on the training set ONLY,
-    then applied to test and inference — no leakage between sets. The targets
+    then applied to test and inference, no leakage between sets. The targets
     (NoShow, service_time, group_label) are excluded from the features and
     extracted separately by each pipeline. `discontinued` is excluded too:
     derived from the same source column `disp` as `NoShow`
     (`decompose_disp_column`), it is not available before the appointment.
-    `completed` is no longer produced at all by `decompose_disp_column` — it
+    `completed` is no longer produced at all by `decompose_disp_column`, it
     was what made the target reconstructible (NoShow ~ 1 - completed -
     discontinued) and caused massive leakage (ROC-AUC = 1.0 for every model,
     including families as different as a random forest and an MLP); it is kept
@@ -395,8 +388,8 @@ def prepare_features(
         onehot_max_cardinality: categorical columns with at most this many
             levels are one-hot encoded; the others keep an integer code. A tree
             splits an integer code space freely and recovers the groups, but a
-            neural network reads it as an ordered quantity — zip code 437 close
-            to 438 and far from 900 — which is meaningless. One-hot fixes that,
+            neural network reads it as an ordered quantity, zip code 437 close
+            to 438 and far from 900, which is meaningless. One-hot fixes that,
             at the cost of one column per level, so it is worth it only while
             the cardinality stays small: `zip` alone would add 919 columns.
 
@@ -736,7 +729,7 @@ def drop_missing_rows(data: pd.DataFrame, columns: Sequence[str], missing_sentin
 
 def filter_dts_dtc_consistency(data: pd.DataFrame, dts_col: str = "dts", dtc_col: str = "dtc", noshow_col: str = "NoShow") -> pd.DataFrame:
     """Remove records whose service end time (`dtc`) precedes its start time
-    (`dts`) — a data-entry inconsistency that would invalidate the service-time
+    (`dts`), a data-entry inconsistency that would invalidate the service-time
     computation.
 
     For the rare NoShow=1 rows with dts>dtc, the service end time is meaningless
@@ -836,7 +829,7 @@ def add_patient_history_features(
 
 
 # ============================================================================
-# 4. Generic binary modelling — shared by the no-show AND A/B group pipelines
+# 4. Generic binary modelling, shared by the no-show AND A/B group pipelines
 # ============================================================================
 #
 # Class encoding convention:
@@ -846,9 +839,9 @@ def add_patient_history_features(
 # ----------------------------------------------------------------------------
 # 4.0 Exposed settings
 # ----------------------------------------------------------------------------
-# Everything that drives training is declared here in the open — parameter
+# Everything that drives training is declared here in the open, parameter
 # grids, fixed hyperparameters, search strategy, subsample sizes, class
-# rebalancing, decision threshold — and is overridden from the notebook through
+# rebalancing, decision threshold, and is overridden from the notebook through
 # `TrainingConfig`, without editing this module:
 #
 #     cfg = TrainingConfig(models=["XGBoost"], search="random", n_iter=30)
@@ -860,7 +853,7 @@ def add_patient_history_features(
 SUPPORTED_MODELS: tuple[str, ...] = ("RandomForest", "XGBoost", "AdaBoost", "ANN")
 
 #: Grids explored by the hyperparameter search. Overridable per model through
-#: `TrainingConfig(param_grids={...})` — an override replaces the grid of that
+#: `TrainingConfig(param_grids={...})`, an override replaces the grid of that
 #: model only, the others keep their default.
 DEFAULT_PARAM_GRIDS: dict[str, dict] = {
     # Depth is capped and a minimum leaf size imposed: left unconstrained, the
@@ -880,12 +873,6 @@ DEFAULT_PARAM_GRIDS: dict[str, dict] = {
         "colsample_bytree": [0.6, 0.8],
         "min_child_weight": [5, 20, 50],
         "reg_lambda": [1.0, 10.0],
-    } if XGB_AVAILABLE else {
-        # HistGradientBoostingClassifier fallback (xgboost missing): different
-        # argument names.
-        "max_iter": [200],
-        "max_depth": [4, 6],
-        "learning_rate": [0.05, 0.1],
     },
     "AdaBoost": {
         "n_estimators": [100, 300],
@@ -907,7 +894,7 @@ DEFAULT_PARAM_GRIDS: dict[str, dict] = {
 #: makes it possible to switch a specific behaviour off.
 DEFAULT_BASE_PARAMS: dict[str, dict] = {
     "RandomForest": {},
-    "XGBoost": {"eval_metric": "logloss", "verbosity": 0} if XGB_AVAILABLE else {},
+    "XGBoost": {"eval_metric": "logloss", "verbosity": 0},
     "AdaBoost": {},
     "ANN": {"solver": "adam", "max_iter": 300, "early_stopping": True,
             "validation_fraction": 0.1, "n_iter_no_change": 25,
@@ -958,7 +945,7 @@ class TrainingConfig:
     Attributes:
         models: families to train, among `SUPPORTED_MODELS`. Shortening the
             list (e.g. `["XGBoost"]`) speeds up tuning iterations considerably.
-        search: hyperparameter search strategy — "grid" (GridSearchCV,
+        search: hyperparameter search strategy, "grid" (GridSearchCV,
             exhaustive), "random" (RandomizedSearchCV, `n_iter` draws: allows
             much wider grids at constant budget), or "none" (no search, direct
             fit with `base_params`).
@@ -1020,11 +1007,11 @@ class TrainingConfig:
     def __post_init__(self) -> None:
         unknown = [m for m in self.models if m not in SUPPORTED_MODELS]
         if unknown:
-            raise ValueError(f"Unknown models {unknown} — expected among {list(SUPPORTED_MODELS)}")
+            raise ValueError(f"Unknown models {unknown}, expected among {list(SUPPORTED_MODELS)}")
         if self.search not in SEARCH_STRATEGIES:
-            raise ValueError(f"search='{self.search}' is invalid — expected among {list(SEARCH_STRATEGIES)}")
+            raise ValueError(f"search='{self.search}' is invalid, expected among {list(SEARCH_STRATEGIES)}")
         if self.threshold_metric not in THRESHOLD_METRICS:
-            raise ValueError(f"threshold_metric='{self.threshold_metric}' is invalid — "
+            raise ValueError(f"threshold_metric='{self.threshold_metric}' is invalid, "
                              f"expected among {list(THRESHOLD_METRICS)}")
         self.models = tuple(self.models)
 
@@ -1075,8 +1062,8 @@ class TrainingConfig:
             ("Threshold sweep", f"{self.threshold_range[0]} -> {self.threshold_range[1]} step {self.threshold_range[2]}"),
             ("n_jobs / seed", f"{self.n_jobs} / {self.random_state}"),
         ]
-        rows += [(f"Grid — {m}", str(self.grid_for(m))) for m in self.models]
-        rows += [(f"Fixed — {m}", str(self.base_for(m))) for m in self.models if self.base_for(m)]
+        rows += [(f"Grid: {m}", str(self.grid_for(m))) for m in self.models]
+        rows += [(f"Fixed: {m}", str(self.base_for(m))) for m in self.models if self.base_for(m)]
         return pd.DataFrame(rows, columns=["Setting", "Value"])
 
 
@@ -1139,20 +1126,15 @@ def _make_estimator(name: str, cfg: TrainingConfig, spw: float, params: Optional
             kwargs["class_weight"] = "balanced"
         estimator_cls = RandomForestClassifier
     elif name == "XGBoost":
-        if XGB_AVAILABLE:
-            kwargs["n_jobs"] = model_n_jobs
-            if cfg.balance_classes:
-                kwargs["scale_pos_weight"] = spw
-        elif cfg.balance_classes:
-            kwargs["class_weight"] = "balanced"
+        kwargs["n_jobs"] = model_n_jobs
+        if cfg.balance_classes:
+            kwargs["scale_pos_weight"] = spw
         estimator_cls = XGBClassifier
     elif name == "AdaBoost":
-        try:
-            import inspect as _inspect
-            if "algorithm" in _inspect.signature(AdaBoostClassifier.__init__).parameters:
-                kwargs["algorithm"] = "SAMME"
-        except Exception:
-            pass
+        # SAMME is the only algorithm left in scikit-learn >= 1.6; older versions need it
+        # stated explicitly. Checked by signature, not by catching an exception.
+        if "algorithm" in inspect.signature(AdaBoostClassifier.__init__).parameters:
+            kwargs["algorithm"] = "SAMME"
         estimator_cls = AdaBoostClassifier
     elif name == "ANN":
         estimator_cls = MLPClassifier
@@ -1161,7 +1143,7 @@ def _make_estimator(name: str, cfg: TrainingConfig, spw: float, params: Optional
 
     kwargs.update(cfg.base_for(name))
 
-    if name in SMOTE_BALANCED_MODELS and cfg.balance_classes and SMOTE_AVAILABLE:
+    if name in SMOTE_BALANCED_MODELS and cfg.balance_classes:
         # These two families cannot be rebalanced by weighting. MLPClassifier
         # accepts neither class_weight nor sample_weight. AdaBoostClassifier
         # exposes no class_weight either, and weighting its base learner breaks
@@ -1181,7 +1163,7 @@ def _make_estimator(name: str, cfg: TrainingConfig, spw: float, params: Optional
     if params:
         # Grid keys addressing a pipeline step need the step prefix; accept them
         # written either way so callers need not know about the wrapper.
-        if ImbPipeline is not None and isinstance(estimator, ImbPipeline):
+        if isinstance(estimator, ImbPipeline):
             params = {(k if "__" in k else f"{PIPE_STEP}__{k}"): v for k, v in params.items()}
         estimator.set_params(**params)
     return estimator
@@ -1199,7 +1181,7 @@ def _search_hyperparams(name: str, cfg: TrainingConfig, spw: float,
         ys: matching binary target.
 
     Returns:
-        (best_params, cv_score, n_candidates_evaluated) — ({}, nan, 0) when no
+        (best_params, cv_score, n_candidates_evaluated), ({}, nan, 0) when no
         search is performed.
     """
     grid = cfg.grid_for(name)
@@ -1209,7 +1191,7 @@ def _search_hyperparams(name: str, cfg: TrainingConfig, spw: float,
     # n_jobs=1 on the model: the search is what parallelises (over folds and
     # candidates); doing both oversubscribes the cores.
     base = _make_estimator(name, cfg, spw, n_jobs=1)
-    if ImbPipeline is not None and isinstance(base, ImbPipeline):
+    if isinstance(base, ImbPipeline):
         grid = {(k if "__" in k else f"{PIPE_STEP}__{k}"): v for k, v in grid.items()}
     if cfg.search == "random":
         n_cand = min(cfg.n_iter, _n_candidates(grid))
@@ -1267,7 +1249,7 @@ def train_binary_classifiers(
             (e.g. `models=["XGBoost"], search="random", n_iter=40`).
 
     Returns:
-        (models, y_train_bin, y_test_bin, X_fit, y_fit) — `models` is a
+        (models, y_train_bin, y_test_bin, X_fit, y_fit), `models` is a
         `ModelSet` (dict {name: model}) carrying `search_report`, `best_params`
         and `config`; `X_fit`/`y_fit` are the bounded subsample actually used
         for the fit, to be reused when comparing train vs test performance (see
@@ -1308,7 +1290,7 @@ def train_binary_classifiers(
     # validation fold while its neighbours stayed in the training fold. The CV
     # score then measured memorisation of synthetic data (0.99 ROC-AUC against
     # 0.75 on the test set) and the search selected whichever model memorised
-    # best — a RandomForest with unlimited depth. Rebalancing now happens
+    # best, a RandomForest with unlimited depth. Rebalancing now happens
     # strictly inside each fold: the ANN carries SMOTE in its own pipeline, the
     # other families use class weights, which need no resampling at all.
     log(f"Class rebalancing: {'class weights (ANN: SMOTE inside its pipeline)' if cfg.balance_classes else 'disabled'}")
@@ -1325,7 +1307,7 @@ def train_binary_classifiers(
             log(f"{name} best params: {best_params}  | CV {cfg.scoring}: {cv_score:.4f}  "
                 f"({n_cand} candidates, {t_search:.1f}s)")
         else:
-            log(f"{name}: no search (search='{cfg.search}') — direct fit with the fixed parameters")
+            log(f"{name}: no search (search='{cfg.search}'), direct fit with the fixed parameters")
 
         # Per-model fit size: the parallel families take the whole training
         # set, the sequential ones (AdaBoost, MLP) need a ceiling or they never
@@ -1404,7 +1386,7 @@ def train_single_model(
 
     model = _make_estimator(name, cfg, spw, params=params)
     if cfg.verbose:
-        print(f"Training {alias or name} on {len(X_fit):,} rows — parameters: {params or cfg.base_for(name)}")
+        print(f"Training {alias or name} on {len(X_fit):,} rows, parameters: {params or cfg.base_for(name)}")
     t0 = time.time()
     model.fit(X_fit, y_fit)
     if cfg.verbose:
@@ -1423,7 +1405,7 @@ def record_training_run(label: str, results_df: pd.DataFrame,
     """Record the results of one training run, to compare successive settings.
 
     Args:
-        label: run name (e.g. "no-show — baseline", "no-show — random search AP").
+        label: run name (e.g. "no-show: baseline", "no-show: random search AP").
         results_df: output of `evaluate_binary_classification_models`.
         config: configuration used (its key settings are stored alongside).
         notes: free-form comment.
@@ -1453,7 +1435,7 @@ def training_history_table(sort_by: str = AUC_COL) -> pd.DataFrame:
         DataFrame (run x model) of the metrics of each run.
     """
     if not TRAINING_RUNS:
-        print("No run recorded — call record_training_run(...) after each evaluation.")
+        print("No run recorded: call record_training_run(...) after each evaluation.")
         return pd.DataFrame()
     hist = pd.DataFrame(TRAINING_RUNS)
     if sort_by in hist.columns:
@@ -1591,7 +1573,7 @@ def compute_classification_metrics(
         })
 
     results_df = pd.DataFrame(rows)
-    print(f"\n{'='*70}\n  RESULTS — {positive_name} vs {reference_name}"
+    print(f"\n{'='*70}\n  RESULTS, {positive_name} vs {reference_name}"
           f"   (threshold optimised on: {t_metric})\n{'='*70}")
     display(results_df.set_index("Model"))
     return results_df, cache, model_names, palette
@@ -1711,8 +1693,8 @@ def plot_precision_recall(cache: dict, y_te: np.ndarray, model_names: list[str],
         ax.plot(rc, pr, lw=2.2, color=color, label=f"{name}  AP = {ap:.{METRIC_DECIMALS}f}")
     baseline = float(y_te.mean())
     ax.axhline(baseline, linestyle="--", color="gray", lw=1.2, alpha=0.7, label=f"Baseline (prevalence = {baseline:.3f})")
-    ax.set_xlabel(f"Recall — {positive_name}")
-    ax.set_ylabel(f"Precision — {positive_name}")
+    ax.set_xlabel(f"Recall, {positive_name}")
+    ax.set_ylabel(f"Precision, {positive_name}")
     ax.legend(loc="upper right")
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1.05)
@@ -1757,7 +1739,7 @@ def plot_feature_importances(
                 scoring="roc_auc", n_repeats=5, random_state=random_state, n_jobs=-1)
             importances[name] = ("Permutation (ROC-AUC drop)", pd.Series(result.importances_mean, index=feature_cols))
         else:
-            print(f"{name}: no '.feature_importances_' and no X_eval/y_eval provided — skipped.")
+            print(f"{name}: no '.feature_importances_' and no X_eval/y_eval provided, skipped.")
 
     if not importances:
         print("No variable importance available.")
@@ -1789,7 +1771,7 @@ def plot_train_test_comparison(
     model_names: list[str], palette: np.ndarray, prefix: str = "",
 ) -> pd.DataFrame:
     """Compare AUC and F1-score (threshold 0.5) between the data seen during
-    training (X_train/y_train — the `X_fit`/`y_fit` subsample actually used by
+    training (X_train/y_train, the `X_fit`/`y_fit` subsample actually used by
     `train_binary_classifiers`, NOT the whole `train_df`) and the unseen test
     set, to detect overfitting or data leakage.
 
@@ -1797,7 +1779,7 @@ def plot_train_test_comparison(
     robustness: combined with models from very different families (trees,
     boosting, neural network) all converging to near-perfect scores, it is the
     signature of data leakage (a feature encodes the target almost directly)
-    rather than of genuine learning — true overfitting would instead show a
+    rather than of genuine learning, true overfitting would instead show a
     large train/test gap.
 
     Args:
@@ -1829,7 +1811,7 @@ def plot_train_test_comparison(
             f"{F1_COL} gap (train-test)": round(f1_tr - f1_te, METRIC_DECIMALS),
         })
     comparison_df = pd.DataFrame(rows)
-    print(f"\n{'='*70}\n  TRAIN vs TEST — overfitting / leakage check\n{'='*70}")
+    print(f"\n{'='*70}\n  TRAIN vs TEST, overfitting / leakage check\n{'='*70}")
     display(comparison_df.set_index("Model"))
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 5), constrained_layout=True)
@@ -1874,7 +1856,7 @@ def evaluate_binary_classification_models(
         positive_name: label of the class of interest.
         reference_name: label of the reference class.
         feature_cols: feature columns.
-        X_train: features seen during training (X_fit), optional — when given
+        X_train: features seen during training (X_fit), optional, when given
             together with y_tr, adds a train vs test comparison (overfitting /
             leakage check, see `plot_train_test_comparison`).
         y_tr: matching binary training target (y_fit).
@@ -1887,7 +1869,7 @@ def evaluate_binary_classification_models(
         fixed_threshold: threshold imposed when `threshold_metric="fixed"`.
         plots: figures to produce, among `ALL_EVAL_PLOTS`. Shortening the list
             (e.g. `plots=["metrics"]`, or `plots=[]`) speeds up tuning
-            iterations markedly — the ANN permutation importance and the
+            iterations markedly, the ANN permutation importance and the
             train/test comparison are the most expensive items.
         perm_sample: subsample size for permutation importance.
         eval_sample: when given, evaluate on a random subsample of that size
@@ -1906,7 +1888,7 @@ def evaluate_binary_classification_models(
     plots = tuple(plots)
     unknown = [p for p in plots if p not in ALL_EVAL_PLOTS]
     if unknown:
-        raise ValueError(f"Unknown figures {unknown} — expected among {list(ALL_EVAL_PLOTS)}")
+        raise ValueError(f"Unknown figures {unknown}, expected among {list(ALL_EVAL_PLOTS)}")
 
     results_df, cache, model_names, palette = compute_classification_metrics(
         models_dict, X_test, y_te, positive_name, reference_name,
@@ -1978,7 +1960,7 @@ def calibrate_and_select(
     calib_fraction: float = 0.5, random_state: int = RANDOM_STATE,
 ) -> tuple[object, pd.DataFrame, pd.DataFrame, np.ndarray]:
     """Recalibrate an already trained model with Platt scaling (sigmoid) and
-    isotonic regression, and keep whichever minimises the Brier score — needed
+    isotonic regression, and keep whichever minimises the Brier score, needed
     because the ILP requires calibrated q_i, not merely discriminating ones.
 
     The test set is split into a disjoint calibration subset (where the
@@ -1998,7 +1980,7 @@ def calibrate_and_select(
         random_state: seed.
 
     Returns:
-        (best_calibrated_or_original_model, comparison_df, X_eval, y_eval) —
+        (best_calibrated_or_original_model, comparison_df, X_eval, y_eval),
         X_eval/y_eval are the evaluation subset (disjoint from the calibration
         fit), to be reused when plotting the calibration curves.
     """
@@ -2181,7 +2163,7 @@ def get_group_labels_for_split(df_sample: pd.DataFrame, X_train: pd.DataFrame, X
 
 
 # ============================================================================
-# 7. Deployment — unified inference and serialisation
+# 7. Deployment, unified inference and serialisation
 # ============================================================================
 
 def predict_patient(
@@ -2193,7 +2175,7 @@ def predict_patient(
     Uses the group classifier trained on the FEATURES (`group_classifier`,
     section 4b), not the service_time -> group tree from
     `learn_decision_tree_cutoffs` (which requires the realised service time to
-    be known already — unavailable before a new patient's consultation). The
+    be known already, unavailable before a new patient's consultation). The
     tree remains useful for the interpretable cutoff analysis, but not for
     production inference.
 
@@ -2263,7 +2245,7 @@ def load_artifacts(name_prefix: str = "final") -> dict:
 
 
 # ============================================================================
-# 8. ILP core — shared with notebooks/gen_nb.py (01_ilp_validation.ipynb)
+# 8. ILP core, shared with notebooks/gen_nb.py (01_ilp_validation.ipynb)
 # ============================================================================
 #
 # Both the numerical-validation notebook generator and this pipeline import
@@ -2280,7 +2262,7 @@ def init_solver() -> str:
     solver = pyo.SolverFactory("appsi_highs")
     if solver.available():
         return "appsi_highs"
-    print("HiGHS unavailable — falling back to CBC")
+    print("HiGHS unavailable, falling back to CBC")
     return "cbc"
 
 
@@ -2442,7 +2424,7 @@ def solve_ilp(inst: Instance, cfg: Optional[Config] = None) -> Solution:
 
     for key, v in z_val.items():
         if v is not None and abs(v - round(v)) > 1e-6:
-            raise ValueError(f"z{key}={v:.6f} is fractional — Proposition 1 violated!")
+            raise ValueError(f"z{key}={v:.6f} is fractional, Proposition 1 violated!")
 
     planning = {}
     for (d, t) in slots:

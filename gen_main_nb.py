@@ -44,12 +44,12 @@ def code(src):
 # ═══════════════════════════════════════════════════════════════════════════
 # Title
 # ═══════════════════════════════════════════════════════════════════════════
-md("# data_driven_plan — Cluster-Predict-Schedule pipeline\n\n"
+md("# data_driven_plan, Cluster-Predict-Schedule pipeline\n\n"
    "Data-driven outpatient appointment scheduling: no-show and service-time "
    "group prediction, feeding a stochastic overbooking ILP "
    "(at most k = 2 patients per slot).\n\n"
    "A single CRISP-DM pipeline. All utility functions live in "
-   "`data_driven_plan.py` — this notebook holds only the orchestration, the "
+   "`data_driven_plan.py`, this notebook holds only the orchestration, the "
    "narrative and the outputs.\n\n"
    "**Previously validated results, reproduced identically:** K=2 "
    "(service_time clustering, bootstrapped silhouette), cutoff ~38.5 min "
@@ -75,7 +75,6 @@ print(f"NumPy    : {np.__version__}")
 print(f"Pandas   : {pd.__version__}")
 print(f"Platform : {platform.processor()}")
 print(f"ILP solver : {SOLVER_NAME}")
-print(f"Native XGBoost: {XGB_AVAILABLE} | SMOTE available: {SMOTE_AVAILABLE}")
 """)
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -136,13 +135,13 @@ print(data["NoShow"].value_counts(normalize=True).rename("proportion"))
 """)
 
 md("The observed no-show rate (~3%) is far more imbalanced than the initial "
-   "85/15 assumption — which drives the choice of imbalance strategy (SMOTE + "
+   "85/15 assumption, which drives the choice of imbalance strategy (SMOTE + "
    "class weighting + optimal threshold, section 4a) and makes calibration "
    "(section 5) more important than discrimination alone.")
 
 md("### 2.3 Exploring the numeric and temporal variables\n\n"
    "`dta` (waiting time before the appointment) and `dts`/`dtc` (service "
-   "start/end) are explored before cleaning — their raw values contain "
+   "start/end) are explored before cleaning, their raw values contain "
    "inconsistencies (dts > dtc) handled in Data Preparation.")
 
 code("""\
@@ -159,12 +158,12 @@ print(missing_pct[missing_pct > 0].sort_values(ascending=False))
 
 md("`AdministrativeFlag` exceeds 55% missing values: reliable imputation is "
    "illusory at that rate, so the column is dropped rather than imputed "
-   "(section 3). `zip`/`state` are missing for a marginal share of rows — "
+   "(section 3). `zip`/`state` are missing for a marginal share of rows, "
    "listwise deletion is preferred to imputation, with no material impact on a "
    "dataset of this size.")
 
 code("""\
-# ── 2.3 (cont.) Outlier diagnostic (IQR) — visualisation only ────────────────
+# ── 2.3 (cont.) Outlier diagnostic (IQR), visualisation only ────────────────
 visualize_outliers(data, prefix="eda")
 """)
 
@@ -178,7 +177,7 @@ _ = analyze_temporal_patterns(data, "activitydatetime", prefix="eda")
 # ═══════════════════════════════════════════════════════════════════════════
 md("## 3. Data Preparation\n\n"
    "### 3.1 Cleaning\n\n"
-   "**Temporal filtering:** data prior to 2016-08-30 is excluded — it predates "
+   "**Temporal filtering:** data prior to 2016-08-30 is excluded, it predates "
    "a major operational reorganisation (launch of the Veteran Choice Program) "
    "that durably changed waiting times and therefore no-show rates; including "
    "it would bias learning towards an obsolete operating regime.")
@@ -198,7 +197,7 @@ print(f"Shape after missing-value handling: {data.shape}")
 """)
 
 md("**dts/dtc consistency:** a record whose service end time precedes its "
-   "start time (`dtc < dts`) reflects a data-entry error — `service_time` "
+   "start time (`dtc < dts`) reflects a data-entry error, `service_time` "
    "would not be interpretable there. Those rows are removed, including the "
    "rare `NoShow=1` cases with `dts>dtc` (the patient's absence makes `dtc` "
    "meaningless).")
@@ -213,7 +212,7 @@ print(f"Shape after dts/dtc consistency + deduplication: {data.shape}")
 
 md("### 3.2 Transformation\n\n"
    "**Stop-code filtering:** only clinic codes that have recorded at least one "
-   "no-show are kept — a stop code with no no-show history carries no "
+   "no-show are kept, a stop code with no no-show history carries no "
    "discriminating signal for this task and dilutes the training sample.")
 
 code("""\
@@ -253,7 +252,7 @@ md("### 3.2bis Fast resume point (optional)\n\n"
    "continue normally from section 3.3. On a full run from the raw data, leave "
    "it commented out (the `data` already in memory is identical).\n\n"
    "**Parquet rather than CSV:** it preserves the optimised dtypes (category, "
-   "uint32, float32...) — a CSV round-trip would restore them as "
+   "uint32, float32...), a CSV round-trip would restore them as "
    "object/int64/float64, multiplying the memory footprint of a dataset of "
    "this size.")
 
@@ -267,7 +266,7 @@ md("### 3.3 Single partition\n\n"
    "One split, stratified jointly on `NoShow` (strong imbalance) and on "
    "`service_time` quantiles, guarantees that BOTH modelling pipelines "
    "(no-show and service time) inherit a representative train/test split, with "
-   "no leakage between them or with the ILP holdout — reserved exclusively for "
+   "no leakage between them or with the ILP holdout, reserved exclusively for "
    "patients never seen during training (section 7).\n\n"
    "**The full set of rows is used** (no subsampling at this stage): the split "
    "yields exactly 70% train / 20% test / 10% inference holdout of the total. "
@@ -286,7 +285,7 @@ df_sample, train_df, test_df, df_inference = make_master_split(
 
 md("**Leakage warning:** `discontinued` (section 2.2) is derived from the same "
    "source column `disp` as `NoShow`, and is not known before the appointment "
-   "in any case — it is therefore excluded from the features, like the targets "
+   "in any case, it is therefore excluded from the features, like the targets "
    "themselves. `completed`, which made the target reconstructible "
    "(NoShow ≈ 1 − completed − discontinued), is no longer produced at all "
    "since section 2.2; it is nevertheless still listed below as a safeguard, "
@@ -294,7 +293,7 @@ md("**Leakage warning:** `discontinued` (section 2.2) is derived from the same "
    "preprocessed by an earlier run.\n\n"
    "**Real-world availability warning:** `dts` (actual service start) and "
    "`dta` (waiting time before the appointment) are known only once the visit "
-   "is under way or finished — at the moment the prediction must actually be "
+   "is under way or finished, at the moment the prediction must actually be "
    "used (before the appointment, to decide on overbooking), they do not yet "
    "exist. `dtc` is already dropped after `service_time` is computed "
    "(section 3.1); `dts`/`dta` are therefore excluded from the features too, "
@@ -320,11 +319,11 @@ md("## 4. Modeling\n\n"
    "Two parallel sub-pipelines, on the SAME split and the SAME features "
    "(section 3.3): no-show prediction (4a) and service-time group assignment "
    "(4b). Both reuse the single function `train_binary_classifiers` "
-   "(RandomForest, XGBoost, AdaBoost, ANN — SMOTE + class weighting + optimal "
+   "(RandomForest, XGBoost, AdaBoost, ANN, SMOTE + class weighting + optimal "
    "threshold).\n\n"
    "`train_df` (70% of the full dataset, potentially tens of millions of rows) "
    "acts as a reservoir, but the final model fit runs on a bounded subsample "
-   "`fit_sample` drawn from `train_df` — AdaBoost and the scikit-learn MLP "
+   "`fit_sample` drawn from `train_df`, AdaBoost and the scikit-learn MLP "
    "(sequential, non-distributed implementations) would be impractical on the "
    "full training set. The tuning subsample (`search_sample`) is itself drawn "
    "from that fit subsample.\n\n"
@@ -347,14 +346,14 @@ md("### 4.0 Training control panel\n\n"
    "| `use_smote` / `smote_params` | synthetic oversampling of the tuning subset | `{\"sampling_strategy\": 0.3}` avoids the overcorrection of full SMOTE |\n"
    "| `balance_classes` / `scale_pos_weight` | class weighting | three imbalance mechanisms stack up: switching one off can improve precision |\n"
    "| `param_grids` / `base_params` | grids explored / fixed hyperparameters | `DEFAULT_PARAM_GRIDS` is the starting point, printed below |\n"
-   "| `threshold_metric` | decision-threshold criterion | `f1_positive` or `youden` favour no-show recall — **without retraining** |\n\n"
+   "| `threshold_metric` | decision-threshold criterion | `f1_positive` or `youden` favour no-show recall, **without retraining** |\n\n"
    "Reported metrics are fixed: **AUC, accuracy, precision, recall, F1-score**, "
    "the last three macro-averaged over both classes.\n\n"
    "**On rebalancing.** SMOTE is no longer applied to the tuning subset before "
    "the cross-validation: interpolated copies of a minority point ended up in "
    "the validation fold while its neighbours stayed in the training fold, so "
    "the CV score measured memorisation of synthetic data (0.99 ROC-AUC against "
-   "0.75 on the test set) and the search kept whichever model memorised best — "
+   "0.75 on the test set) and the search kept whichever model memorised best, "
    "a forest of unlimited depth. Rebalancing now happens strictly inside each "
    "fold: class weights for the tree families, SMOTE inside the ANN pipeline.\n\n"
    "**On the ANN.** `MLPClassifier` accepts neither `class_weight` nor "
@@ -367,7 +366,7 @@ md("### 4.0 Training control panel\n\n"
    "stay in their own cells.")
 
 code("""\
-# ── 4.0 Training settings — no-show ───────────────────────────────────────────
+# ── 4.0 Training settings, no-show ───────────────────────────────────────────
 # Edit here, rerun 4a, compare with training_history_table() (4c).
 TRAIN_CFG_NOSHOW = TrainingConfig(
     models=["RandomForest", "XGBoost", "AdaBoost", "ANN"],  # families to train
@@ -415,7 +414,7 @@ md("**Ready-made variants.** Uncomment ONE line (or write another on the same "
    "the reference configuration `TRAIN_CFG_NOSHOW` stays intact.")
 
 code("""\
-# ── 4.0 (variants) Tuning recipes — uncomment the one to test ────────────────
+# ── 4.0 (variants) Tuning recipes, uncomment the one to test ────────────────
 # Fast iteration (one family, reduced grid, less data):
 # TRAIN_CFG_NOSHOW = TRAIN_CFG_NOSHOW.replace(
 #     models=["XGBoost"], search_sample=20_000, fit_sample=200_000, cv=2)
@@ -510,11 +509,11 @@ code("""\
 # ── 4a. Record the run (to compare successive settings) ─────────────────────
 # Rename the label for each run: it is the lookup key in the comparison table
 # of section 4c.
-record_training_run("no-show — reference config", results_noshow, TRAIN_CFG_NOSHOW,
+record_training_run("no-show: reference config", results_noshow, TRAIN_CFG_NOSHOW,
                     notes="grid / roc_auc / SMOTE / f1_macro threshold")
 """)
 
-md("### 4b. Service time — clustering then classification\n\n"
+md("### 4b. Service time, clustering then classification\n\n"
    "**K-means (K=2):** validated by the elbow method (SAE) and the silhouette "
    "coefficient on a 200k-row sample, confirmed by bootstrap (silhouette "
    "stability across resamples).\n\n"
@@ -566,11 +565,11 @@ cluster_tree, primary_cutoff = learn_decision_tree_cutoffs(
 md("**Group classifier.** Same training function, hence the same levers: "
    "`TRAIN_CFG_GROUP` starts from the no-show configuration and changes only "
    "what needs changing. The A/B target being far less imbalanced than "
-   "no-show, SMOTE and class weighting matter less here — that is the setting "
+   "no-show, SMOTE and class weighting matter less here, that is the setting "
    "to test first.")
 
 code("""\
-# ── 4b. Training settings — A/B group classifier ─────────────────────────────
+# ── 4b. Training settings, A/B group classifier ─────────────────────────────
 TRAIN_CFG_GROUP = TRAIN_CFG_NOSHOW.replace(
     # e.g. models=["XGBoost", "RandomForest"], use_smote=False, scoring="f1_macro"
 )
@@ -596,7 +595,7 @@ save_model_bundle(
 )
 """)
 
-md("**Fast resume point (optional):** same logic as in 4a — to skip retraining "
+md("**Fast resume point (optional):** same logic as in 4a, to skip retraining "
    "when resuming, do NOT run the training cell above: uncomment and run this "
    "one instead.")
 
@@ -616,28 +615,28 @@ results_group = evaluate_binary_classification_models(
     feature_cols=feature_cols, X_train=X_fit_grp, y_tr=y_fit_grp, prefix="servicetime",
     config=TRAIN_CFG_GROUP, plots=ALL_EVAL_PLOTS, eval_sample=None,
 )
-record_training_run("A/B group — reference config", results_group, TRAIN_CFG_GROUP)
+record_training_run("A/B group: reference config", results_group, TRAIN_CFG_GROUP)
 """)
 
-md("### 4c. Tuning loop — comparing runs\n\n"
+md("### 4c. Tuning loop, comparing runs\n\n"
    "Three ways to improve the results, from fastest to heaviest:\n\n"
-   "1. **Change the decision threshold alone** — no retraining: rerun the "
+   "1. **Change the decision threshold alone**, no retraining: rerun the "
    "evaluation with `threshold_metric=\"f1_positive\"`.\n"
-   "2. **Retrain a single family** with imposed hyperparameters — "
+   "2. **Retrain a single family** with imposed hyperparameters, "
    "`train_single_model(...)`, a few minutes, and the model joins the dict "
    "under an alias so it can be compared with the others.\n"
-   "3. **Rerun a full campaign** — edit `TRAIN_CFG_NOSHOW` (4.0) and rerun 4a.\n\n"
+   "3. **Rerun a full campaign**, edit `TRAIN_CFG_NOSHOW` (4.0) and rerun 4a.\n\n"
    "In all three cases `record_training_run(...)` archives the result and "
    "`training_history_table()` puts the runs side by side. The history is "
    "saved at the end of the section so it can be picked up across sessions.")
 
 code("""\
-# ── 4c. (1) Effect of the decision threshold alone — no retraining ──────────
+# ── 4c. (1) Effect of the decision threshold alone, no retraining ──────────
 # Compares the recall/precision trade-offs reachable without touching the model.
 for _metric in ["f1_macro", "f1_positive", "balanced_accuracy", "youden"]:
     _res = compute_classification_metrics(
         noshow_models, X_test, y_test_ns, "NoShow", "Attended", threshold_metric=_metric)[0]
-    record_training_run(f"no-show — {_metric} threshold", _res, TRAIN_CFG_NOSHOW,
+    record_training_run(f"no-show: {_metric} threshold", _res, TRAIN_CFG_NOSHOW,
                         notes="same models, threshold only")
 """)
 
@@ -655,7 +654,7 @@ code("""\
 #     noshow_models, X_test, y_test_ns, positive_name="NoShow", reference_name="Attended",
 #     feature_cols=feature_cols, prefix="noshow", config=TRAIN_CFG_NOSHOW, plots=["metrics"],
 # )
-# record_training_run("no-show — hand-tuned XGBoost_v2", results_noshow, TRAIN_CFG_NOSHOW)
+# record_training_run("no-show: hand-tuned XGBoost_v2", results_noshow, TRAIN_CFG_NOSHOW)
 """)
 
 code("""\
@@ -759,11 +758,11 @@ md("## 7. Solving the ILP (outside CRISP-DM)\n\n"
    "here to demonstrate the end-to-end bridge: serialised artifacts → "
    "`predict_patient` → real ILP instance → `solve_ilp`.\n\n"
    "`Instance`/`Config`/`Solution`/`compute_coefficients`/`solve_ilp` are "
-   "imported from `data_driven_plan.py` — the **same** model core as "
+   "imported from `data_driven_plan.py`, the **same** model core as "
    "`01_ilp_validation.ipynb` (regenerated by `notebooks/gen_nb.py`), which "
    "carries the full experimental campaign (illustrative example, design of "
    "experiments, benchmarks B1-B4, out-of-sample simulation, sensitivity "
-   "analysis). This section does not duplicate it: it adds the missing step — "
+   "analysis). This section does not duplicate it: it adds the missing step, "
    "building an instance from **real patients never used in training**, rather "
    "than from synthetic patients drawn from distributions calibrated on "
    "aggregate statistics.")
@@ -838,20 +837,20 @@ code("""\
 recap = pd.DataFrame([
     {"Item": "Split", "Value": f"{len(df_sample):,} rows (full dataset) | "
      f"train={len(train_df):,} test={len(test_df):,} inference={len(df_inference):,}"},
-    {"Item": "No-show — best model", "Value": best_noshow_name},
-    {"Item": "No-show — AUC (test)",
+    {"Item": "No-show: best model", "Value": best_noshow_name},
+    {"Item": "No-show: AUC (test)",
      "Value": f"{results_noshow.set_index('Model').loc[best_noshow_name, 'AUC']:.4f}"},
-    {"Item": "No-show — Brier (calibrated)",
+    {"Item": "No-show: Brier (calibrated)",
      "Value": f"{calib_comparison.set_index('Method').loc[calib_comparison.iloc[0]['Method'], 'Brier']:.4f}"},
-    {"Item": "service_time clustering — selected K", "Value": str(best_k)},
-    {"Item": "Clustering — bootstrapped silhouette", "Value": f"mean={mu_sil:.4f}, sd={sd_sil:.4f}"},
+    {"Item": "service_time clustering: selected K", "Value": str(best_k)},
+    {"Item": "Clustering: bootstrapped silhouette", "Value": f"mean={mu_sil:.4f}, sd={sd_sil:.4f}"},
     {"Item": "Cutoff (decision tree)", "Value": f"{primary_cutoff:.1f} min"},
-    {"Item": "Group — best classifier", "Value": best_group_name},
-    {"Item": "Group — AUC (test)",
+    {"Item": "Group: best classifier", "Value": best_group_name},
+    {"Item": "Group: AUC (test)",
      "Value": f"{results_group.set_index('Model').loc[best_group_name, 'AUC']:.4f}"},
-    {"Item": "ILP — real instance (n patients)", "Value": str(real_instance.n)},
-    {"Item": "ILP — Z_complete", "Value": f"{real_solution.Z_complete:.4f}"},
-    {"Item": "ILP — solve time", "Value": f"{real_solution.solve_time:.3f} s"},
+    {"Item": "ILP: real instance (n patients)", "Value": str(real_instance.n)},
+    {"Item": "ILP: Z_complete", "Value": f"{real_solution.Z_complete:.4f}"},
+    {"Item": "ILP: solve time", "Value": f"{real_solution.solve_time:.3f} s"},
 ])
 display(recap)
 save_dataframe(recap, "results/recap_data_driven_plan.csv")
