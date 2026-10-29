@@ -106,6 +106,7 @@ BLAS_THREADS    = None          # BLAS threads of this process; None: N_JOBS (se
 SMOKE_PATIENT_FRACTION = 0.01   # SMOKE: share of patients kept, by hashed identifier
 PATIENT_FRACTION = None         # pilot run without SMOKE budgets (e.g. 0.10); None: all patients
 MIN_FREE_DISK_GB = None         # None: estimated from the share of patients (about 70 GB for a full run)
+MMAP_MATRICES   = True          # False on a network volume (RunPod): matrices read into memory
 """)
 
 code("""\
@@ -124,7 +125,7 @@ BLAS_THREADS = N_JOBS if BLAS_THREADS is None else int(BLAS_THREADS)
 threadpool_limits(limits=BLAS_THREADS, user_api="blas")
 FRACTION = SMOKE_PATIENT_FRACTION if SMOKE else PATIENT_FRACTION
 FULL_RUN = FRACTION is None   # only a full run may write the versioned plne_parameters.json
-RUN = StageRunner(RUN_ID, target=STAGE)
+RUN = StageRunner(RUN_ID, target=STAGE, mmap=MMAP_MATRICES)
 for k, v in {**DECISIONS, "RUN_ID": RUN_ID, "STAGE": STAGE, "N_JOBS": N_JOBS,
              "BLAS_THREADS": BLAS_THREADS, "PATIENT_FRACTION": FRACTION,
              "available CPUs": available_cpus(), "available memory (GB)": round(available_memory() / 2**30, 1)}.items():

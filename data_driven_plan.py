@@ -339,10 +339,15 @@ class StageRunner:
     of every stage.
     """
 
-    def __init__(self, run_id: str, target: str = "all", root: str = MODELS_DIR, status_dir: str = "runs"):
+    def __init__(self, run_id: str, target: str = "all", root: str = MODELS_DIR, status_dir: str = "runs",
+                 mmap: bool = True):
         if target != "all" and target not in STAGES:
             raise ValueError(f"STAGE={target!r}, expected 'all' or one of {STAGES}")
         self.run_id, self.target = run_id, target
+        # mmap=False reads the matrices sequentially into memory: on a network volume
+        # backed by object storage (RunPod geesefs) a random 4 KB read through mmap took
+        # 53 ms, while sequential reads ran at 170 MB/s
+        self.mmap = mmap
         self.dir = os.path.join(root, f"run_{run_id}")
         self.status_path = os.path.join(status_dir, run_id, "STATUS.md")
         self.cfg, self.hash, self._t0 = {}, {}, {}
@@ -410,7 +415,7 @@ class StageRunner:
         out = joblib.load(os.path.join(d, "artifacts.joblib"))
         for f in os.listdir(d):
             if f.endswith(".npy"):
-                out[f[:-4]] = np.load(os.path.join(d, f), mmap_mode="r")
+                out[f[:-4]] = np.load(os.path.join(d, f), mmap_mode="r" if self.mmap else None)
         return out
 
     def path(self, stage: str, name: str) -> str:
@@ -1633,9 +1638,26 @@ def _adaboost_staged(cfg, X_fit, y_fit, X_valid, y_valid, prior, ratio):
     return best[1], float(best[0]), pd.DataFrame(rows)
 
 
+def read_npy_rows(path: str, n_rows: int) -> np.ndarray:
+    """The first n_rows of a C-ordered 2-D .npy file, read sequentially (one read call
+    stream, no memory map), into an in-memory array."""
+    with open(path, "rb") as fh:
+        version = np.lib.format.read_magic(fh)
+        reader = {(1, 0): np.lib.format.read_array_header_1_0,
+                  (2, 0): np.lib.format.read_array_header_2_0}.get(version)
+        if reader is None:
+            raise ValueError(f"{path}: unsupported .npy format version {version}")
+        shape, fortran, dtype = reader(fh)
+        if fortran or len(shape) != 2:
+            raise ValueError(f"{path}: expected a C-ordered 2-D array")
+        n = min(n_rows, shape[0])
+        out = np.fromfile(fh, dtype=dtype, count=n * shape[1]).reshape(n, shape[1])
+    return out
+
+
 def _tune_adaboost_from_files(xa_path: str, y_path: str, n_fit: int, n_fv: int, cfg: TrainingConfig):
     """AdaBoost tuning in its own process: matrices are memory-mapped, not copied."""
-    XA = np.load(xa_path, mmap_mode="r")
+    XA = read_npy_rows(xa_path, n_fv)      # sequential read: no random access to the volume
     y = np.load(y_path).astype(int)
     prior = float(y[:n_fit].mean())
     t0 = time.time()
@@ -1669,11 +1691,22 @@ def tune_binary_classifiers(X_fv: np.ndarray, y_fv: np.ndarray, n_fit: int,
     out = {"best": {}, "criterion": {}, "tables": {}, "time": {}, "prior": prior}
     future = None
     if adaboost_files is not None and "AdaBoost" in cfg.models and cfg.search != "none":
+        # AdaBoost's process holds the fit rows, SMOTE's output and the weights (about
+        # 2.2 x the float32 fit rows); the halving search of the other families needs its
+        # own share (search_jobs). Run them together only when both fit in the memory budget.
+        ada_need = 2.2 * n_fit * X_fv.shape[1] * 4
+        search_need = 2.5 * len(y_fv) * X_fv.shape[1] * 4
+        parallel = cfg.memory_safety * available_memory() >= ada_need + search_need
+        log(f"AdaBoost: {'separate process in parallel' if parallel else 'sequential (memory)'}; "
+            f"needs about {ada_need / 2**30:.0f} + {search_need / 2**30:.0f} GB, "
+            f"budget {cfg.memory_safety * available_memory() / 2**30:.0f} GB")
+        if not parallel:
+            adaboost_files = None
+    if adaboost_files is not None and "AdaBoost" in cfg.models and cfg.search != "none":
         import concurrent.futures
         import multiprocessing
         pool = concurrent.futures.ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"))
         future = pool.submit(_tune_adaboost_from_files, *adaboost_files, n_fit, len(y_fv), cfg)
-        log("AdaBoost: tuned in a separate process")
     for name in cfg.models:
         if name == "AdaBoost" and future is not None:
             continue
