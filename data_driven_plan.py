@@ -293,95 +293,122 @@ def inspect_dataframe(df: pd.DataFrame, target_col: str) -> None:
     plt.show()
 
 
+@dataclass
+class MasterSplit:
+    """Disjoint partitions of the working data (audit rec. 13).
+
+    `train` (70 %) is the union of `fit` (tuning and fitting), `valid` (model
+    selection inside a family: hyperparameters, early stopping, boosting
+    iterations) and `calib` (probability calibration, choice of the calibration
+    method and of the model, decision thresholds). `test` (20 %) is used for the
+    final metrics only, `inference` (10 %) is the ILP holdout.
+    """
+    data: pd.DataFrame
+    train: pd.DataFrame
+    fit: pd.DataFrame
+    valid: pd.DataFrame
+    calib: pd.DataFrame
+    test: pd.DataFrame
+    inference: pd.DataFrame
+    mode: str
+
+    def sizes(self) -> pd.DataFrame:
+        parts = {"fit": self.fit, "valid": self.valid, "calib": self.calib,
+                 "test": self.test, "inference": self.inference}
+        total = sum(len(d) for d in parts.values())
+        return pd.DataFrame([{"Partition": k, "Rows": len(d), "Share": len(d) / total,
+                              "NoShow rate": d["NoShow"].mean()} for k, d in parts.items()])
+
+
+def _uniform_from_id(ids: pd.Series, key: str) -> np.ndarray:
+    """Deterministic U(0, 1) per identifier: 64-bit hash of (id, key) / 2^64."""
+    h = pd.util.hash_pandas_object(ids.astype("int64"), index=False, hash_key=key.ljust(16, "0")[:16])
+    return h.to_numpy(dtype=np.uint64) / float(2 ** 64)
+
+
 def make_master_split(
     df: pd.DataFrame,
     train_size: float = 0.70,
     test_size: float = 0.20,
     inference_size: float = 0.10,
-    sample_size: Optional[int] = None,
+    inner_sizes: tuple = (0.80, 0.10, 0.10),
+    split_mode: str = "stratified",
+    patient_col: str = "patientsid",
     noshow_col: str = "NoShow",
     service_time_col: str = "service_time",
     n_quantile_bins: int = 10,
     random_state: int = RANDOM_STATE,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> MasterSplit:
     """Single leak-proof partition, shared by both ML pipelines.
 
-    By default the whole DataFrame is partitioned (no row discarded) into three
-    disjoint sets whose sizes match train_size/test_size/inference_size of the
-    total EXACTLY: an inference holdout (never seen by the models, reserved for
-    the ILP), a train set (training + cross-validation) and a test set (final
-    evaluation). Stratification combines the no-show target (strongly
-    imbalanced, ~3%) with quantile bins of service time, so that BOTH pipelines
-    (no-show and service time) inherit a representative split without either
-    seeing the other's data.
+    The whole DataFrame is partitioned (no row discarded) into train / test /
+    inference holdout (70 / 20 / 10 % by default), then train into fit / valid
+    / calib (80 / 10 / 10 % of train by default, audit rec. 13: the decision
+    threshold and the calibration were previously fitted on the test set).
 
-    Args:
-        df: full preprocessed DataFrame.
-        train_size: fraction of the total assigned to training.
-        test_size: fraction of the total assigned to testing.
-        inference_size: fraction of the total reserved for the ILP holdout.
-        sample_size: if set, a random subsample of this size is drawn from df
-            before splitting (useful during development/debugging). Left at
-            None, the whole of df is used.
-        noshow_col: name of the binary no-show target column.
-        service_time_col: name of the continuous service-time target column.
-        n_quantile_bins: number of service_time quantile bins used in the
-            combined stratification key.
-        random_state: seed for reproducibility.
+    split_mode="stratified" (default, as in run_20260926_2002): row-level split
+    stratified jointly on the no-show target and on service-time quantile bins,
+    with the same seeds as before for train / test / inference.
+    split_mode="patient_group" (ablation): every visit of a patient falls in the
+    same partition, assigned from a hash of the patient identifier; proportions
+    then hold in expectation only and stratification is not enforced.
 
     Returns:
-        (df_sample, train_df, test_df, df_inference), three disjoint DataFrames
-        (train/test/inference), df_sample being their union.
+        MasterSplit; the indices of the partitions are subsets of `data.index`.
     """
     if abs((train_size + test_size + inference_size) - 1.0) > 1e-9:
-        raise ValueError(
-            f"train_size + test_size + inference_size must equal 1.0 "
-            f"(got {train_size} + {test_size} + {inference_size} = "
-            f"{train_size + test_size + inference_size})")
+        raise ValueError(f"train_size + test_size + inference_size must equal 1.0 (got "
+                         f"{train_size + test_size + inference_size})")
+    if abs(sum(inner_sizes) - 1.0) > 1e-9 or len(inner_sizes) != 3:
+        raise ValueError(f"inner_sizes (fit, valid, calib) must sum to 1.0, got {inner_sizes}")
+    if split_mode not in ("stratified", "patient_group"):
+        raise ValueError(f"split_mode={split_mode!r}")
 
-    full_n = len(df)
-    if sample_size is not None and sample_size < full_n:
-        df_s = df.sample(n=sample_size, random_state=random_state).reset_index(drop=True)
-        print(f"Working sample: {sample_size:,} / {full_n:,} rows (~{sample_size/full_n:.1%})")
-    else:
-        # reset_index() without inplace already builds a new DataFrame: a prior
-        # .copy() would needlessly duplicate the 40M+ rows in memory at the
-        # most memory-constrained point of the pipeline.
-        df_s = df.reset_index(drop=True)
-        print(f"Full dataset used as working sample: {full_n:,} rows")
-
+    df_s = df.reset_index(drop=True)
+    print(f"Working data: {len(df_s):,} rows, split mode {split_mode}")
     st_bin = pd.qcut(df_s[service_time_col], q=n_quantile_bins, duplicates="drop").astype(str)
     strat_key = df_s[noshow_col].astype(str) + "_" + st_bin
 
-    df_inf, df_mod = train_test_split(
-        df_s, test_size=(1.0 - inference_size), random_state=random_state, stratify=strat_key)
-    strat_mod = strat_key.loc[df_mod.index]
-    # test_size/train_size are fractions of the TOTAL df_s; convert them into a
-    # fraction of the post-holdout remainder df_mod to hit the target
-    # proportions exactly, instead of a cascading approximation (e.g. 72/18
-    # instead of 70/20).
-    test_frac_of_remainder = test_size / (train_size + test_size)
-    train_df, test_df = train_test_split(
-        df_mod, test_size=test_frac_of_remainder, random_state=random_state, stratify=strat_mod)
+    if split_mode == "stratified":
+        df_inf, df_mod = train_test_split(
+            df_s, test_size=(1.0 - inference_size), random_state=random_state, stratify=strat_key)
+        train_df, test_df = train_test_split(
+            df_mod, test_size=test_size / (train_size + test_size), random_state=random_state,
+            stratify=strat_key.loc[df_mod.index])
+        fit_frac, valid_frac, calib_frac = inner_sizes
+        fit_df, rest = train_test_split(train_df, train_size=fit_frac, random_state=random_state,
+                                        stratify=strat_key.loc[train_df.index])
+        valid_df, calib_df = train_test_split(rest, test_size=calib_frac / (valid_frac + calib_frac),
+                                              random_state=random_state,
+                                              stratify=strat_key.loc[rest.index])
+    else:
+        if patient_col not in df_s.columns:
+            raise ValueError(f"split_mode='patient_group' needs the column {patient_col!r}, absent "
+                             f"(a preprocessed file from an earlier run drops it)")
+        u = _uniform_from_id(df_s[patient_col], f"split{random_state}")
+        v = _uniform_from_id(df_s[patient_col], f"inner{random_state}")
+        part = np.where(u < inference_size, "inference",
+                        np.where(u < inference_size + test_size, "test", "train"))
+        inner = np.where(v < inner_sizes[0], "fit", np.where(v < inner_sizes[0] + inner_sizes[1], "valid", "calib"))
+        df_inf, test_df = df_s[part == "inference"], df_s[part == "test"]
+        train_df = df_s[part == "train"]
+        tr_inner = inner[part == "train"]
+        fit_df, valid_df, calib_df = (train_df[tr_inner == k] for k in ("fit", "valid", "calib"))
+        shared = set(train_df[patient_col]) & (set(test_df[patient_col]) | set(df_inf[patient_col]))
+        if shared:
+            raise AssertionError(f"{len(shared)} patients in both train and test/inference")
 
-    n_inf, n_tr, n_te = len(df_inf), len(train_df), len(test_df)
-    total = n_inf + n_tr + n_te
-    print(f"  Inference holdout : {n_inf:>8,}  ({n_inf/total:.1%})  -- never seen by the models")
-    print(f"  Train             : {n_tr:>8,}  ({n_tr/total:.1%})")
-    print(f"  Test              : {n_te:>8,}  ({n_te/total:.1%})")
-    for name, d in [("Inference", df_inf), ("Train", train_df), ("Test", test_df)]:
-        rate = d[noshow_col].mean()
-        print(f"  NoShow rate ({name:9s}) : {rate:.4f}  |  median service_time: {d[service_time_col].median():.1f} min")
+    split = MasterSplit(data=df_s, train=train_df, fit=fit_df, valid=valid_df, calib=calib_df,
+                        test=test_df, inference=df_inf, mode=split_mode)
+    print(split.sizes().to_string(index=False, float_format=lambda v: f"{v:.4f}"))
 
     ensure_output_dirs()
     inf_path = f"{INFERENCE_DIR}/inference_set_raw.csv"
     df_inf.to_csv(inf_path, index=False)
-    print(f"  Inference holdout saved -> {inf_path}  (seed={random_state}, stratified NoShow x service_time)")
+    print(f"  Inference holdout saved -> {inf_path}")
+    return split
 
-    # Indices of train_df/test_df/df_inf are deliberately KEPT (subsets of the
-    # df_s index, not reset) so rows can later be aligned with df_s via .loc[]
-    # (e.g. get_group_labels_for_split).
-    return df_s, train_df, test_df, df_inf
+
 def prepare_features(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -438,7 +465,7 @@ def prepare_features(
         categorical_cols = ["stopcode", "sta3n", "non_va", "state", "zip"]
     if excluded_cols is None:
         excluded_cols = {"service_time", "NoShow", "group_label", "cluster",
-                          "completed", "discontinued", "dts", "dta"}
+                          "completed", "discontinued", "dts", "dta", "patientsid"}
 
     cat_cols = [c for c in categorical_cols if c in train_df.columns]
     dfs = [train_df, test_df] + ([inference_df] if inference_df is not None else [])

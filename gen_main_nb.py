@@ -261,7 +261,9 @@ print(data[["days_between_visits", "prior_noShow_rate", "prior_service_time_avg"
 
 code("""\
 # ── 3.2 Final feature selection + checkpoint ─────────────────────────────────
-data = data.drop(columns=["activitydatetime", "patientsid"])
+# patientsid is kept until the split (SPLIT_MODE="patient_group" needs it) and
+# excluded from the features by prepare_features.
+data = data.drop(columns=["activitydatetime"])
 print(f"Final preprocessed shape: {data.shape}")
 print(f"Columns: {data.columns.tolist()}")
 save_preprocessed_data(data, PREPROCESSED_PATH)
@@ -288,24 +290,27 @@ code("""\
 """)
 
 md("### 3.3 Single partition\n\n"
-   "One split, stratified jointly on `NoShow` (strong imbalance) and on "
-   "`service_time` quantiles, guarantees that BOTH modelling pipelines "
-   "(no-show and service time) inherit a representative train/test split, with "
-   "no leakage between them or with the ILP holdout, reserved exclusively for "
-   "patients never seen during training (section 7).\n\n"
-   "**The full set of rows is used** (no subsampling at this stage): the split "
-   "yields exactly 70% train / 20% test / 10% inference holdout of the total. "
-   "Subsampling to 800k rows, consistent with the already validated clustering "
-   "(K=2, bootstrapped silhouette), happens later, when the models are trained "
-   "(section 4), to keep AdaBoost/ANN tractable.")
+   "One split of the full data: train 70 % / test 20 % / ILP holdout 10 %, stratified "
+   "jointly on `NoShow` and on `service_time` deciles (same seeds as run_20260926_2002, "
+   "so test and holdout are unchanged). The training part is then split into **fit** "
+   "(80 %), **valid** (10 %) and **calib** (10 %), stratified the same way (audit rec. 13):\n\n"
+   "- fit: fitting and hyperparameter search;\n"
+   "- valid: model choice inside a family (successive halving, boosting iterations);\n"
+   "- calib: probability calibration, choice of the calibration method, of the model and of "
+   "the decision thresholds;\n"
+   "- test: final metrics only, nothing is fitted or chosen on it;\n"
+   "- holdout: never seen by the models, it feeds the ILP.\n\n"
+   "`SPLIT_MODE = \"patient_group\"` (ablation) keeps every visit of a patient in the same "
+   "partition, from a hash of `patientsid`.")
 
 code("""\
-# ── 3.3 Single split (train / test / ILP holdout) ────────────────────────────
-df_sample, train_df, test_df, df_inference = make_master_split(
-    data, train_size=0.70, test_size=0.20, inference_size=0.10,
-    noshow_col="NoShow", service_time_col="service_time",
+# ── 3.3 Single split (fit / valid / calib / test / ILP holdout) ──────────────
+SPLIT = make_master_split(
+    data, train_size=0.70, test_size=0.20, inference_size=0.10, inner_sizes=(0.80, 0.10, 0.10),
+    split_mode=SPLIT_MODE, noshow_col="NoShow", service_time_col="service_time",
     n_quantile_bins=10, random_state=RANDOM_STATE,
 )
+df_sample, train_df, test_df, df_inference = SPLIT.data, SPLIT.train, SPLIT.test, SPLIT.inference
 """)
 
 md("**Leakage warning:** `discontinued` (section 2.2) is derived from the same "
@@ -331,10 +336,14 @@ X_train, X_test, X_inference, feature_cols, scaler, cat_encodings = prepare_feat
     categorical_cols=["stopcode", "sta3n", "non_va", "state", "zip"],
     onehot_max_cardinality=150,   # one-hot below this, integer code above
     excluded_cols={"service_time", "NoShow", "group_label", "cluster",
-                   "discontinued", "dts", "dta",
+                   "discontinued", "dts", "dta", "patientsid",
                    "completed"},  # safeguard: no longer produced, except in an older Parquet
     random_state=RANDOM_STATE,
 )
+# Views of the training matrix on the three inner partitions (same rows, no copy of logic)
+X_fit, X_valid, X_calib = (X_train.loc[SPLIT.fit.index], X_train.loc[SPLIT.valid.index],
+                           X_train.loc[SPLIT.calib.index])
+print(f"X_fit {X_fit.shape} | X_valid {X_valid.shape} | X_calib {X_calib.shape}")
 """)
 
 # ═══════════════════════════════════════════════════════════════════════════
