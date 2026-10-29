@@ -29,6 +29,7 @@ SLOT_LENGTHS    = (30, 60)      # B4 : assertion s_A <= max(SLOT_LENGTHS), sinon
 SPLIT_MODE      = "stratified"  # "patient_group" en ablation
 RANDOM_STATE    = 0
 SMOKE           = False         # True : 1 % des données, budgets minimaux
+PLNE_PARAMS_PATH = "data/inference/plne_parameters.json"  # exporté par data_driven_plan.ipynb
 """)
 
 code("""\
@@ -75,89 +76,35 @@ print(f"Platform: {platform.processor()}")
 print(f"Solveur : {SOLVER_NAME} ✓ (détecté par data_driven_plan.init_solver)")
 """)
 
-# ── Section 0.2 : données réelles ──────────────────────────────────────────────
-md("## 0.2 Données réelles, centroïdes K-médians\n\n"
-   "Si `data/preprocessed/preprocessed_data.parquet` est accessible, on calcule "
-   "les centroïdes K-médians (k=2) sur `service_time` (échantillon 50 k lignes, "
-   "lu par batch Parquet, ni la colonne entière ni le fichier complet ne sont "
-   "chargés). Sinon : s_A=50, s_B=20.")
+# ── Section 0.2 : paramètres issus du pipeline ───────────────────────────────
+md("## 0.2 Paramètres issus du pipeline de prédiction\n\n"
+   "Les durées $s_A$, $s_B$, la part du groupe long $\\pi_A$ et le taux de no-show sont lus "
+   "**uniquement** dans `plne_parameters.json`, exporté par `data_driven_plan.ipynb` "
+   "(K-médianes exactes ajustées sur l'apprentissage seul, provenance incluse). "
+   "Aucun recalcul ici, aucune valeur par défaut : un champ absent ou hors domaine arrête "
+   "le notebook (audit B4). Contrôles : $0{,}05 < \\pi_A < 0{,}5$, $s_A > s_B > 0$, "
+   "$s_A \\le \\max$(`SLOT_LENGTHS`).")
 
 code("""\
-# ── 0.2 Centroïdes K-médians sur service_time ─────────────────────────────────
-import pyarrow.parquet as pq
+# ── 0.2 Lecture et contrôle de plne_parameters.json ──────────────────────────
+from data_driven_plan import load_plne_parameters
 
-_PREP_PATH = "data/preprocessed/preprocessed_data.parquet"
-_INF_PATH  = "data/inference/inference_for_plne.csv"
+PLNE = load_plne_parameters(PLNE_PARAMS_PATH, SLOT_LENGTHS)
+s_A, s_B = float(PLNE["s_A"]), float(PLNE["s_B"])
+pi_A = float(PLNE["pi_A_actual"])
+L_SHORT, L_LONG = (float(v) for v in sorted(SLOT_LENGTHS))
+if PLNE["duration_method"] != DURATION_METHOD or PLNE["duration_stat"] != DURATION_STAT:
+    raise ValueError(f"plne_parameters.json built with {PLNE['duration_method']}/{PLNE['duration_stat']}, "
+                     f"notebook expects {DURATION_METHOD}/{DURATION_STAT}")
 
-def _kmedians_1d(vals, k=2, n_init=10, rng=None):
-    \"\"\"K-médians 1-D exact via tri.\"\"\"
-    rng = rng or np.random.default_rng(0)
-    vals = np.sort(vals)
-    best_cost, best_c = np.inf, None
-    for _ in range(n_init):
-        c = np.sort(rng.choice(vals, k, replace=False))
-        for _ in range(100):
-            labels = np.argmin(np.abs(vals[:,None] - c[None,:]), axis=1)
-            new_c = np.array([np.median(vals[labels==j]) for j in range(k)])
-            if np.allclose(new_c, c): break
-            c = new_c
-        cost = sum(np.min(np.abs(vals[:,None]-c[None,:]),axis=1))
-        if cost < best_cost:
-            best_cost, best_c = cost, c
-    return np.sort(best_c)
-
-_USE_REAL_DATA = False
-s_A_default, s_B_default = 50.0, 20.0
-_pi_A_default = 0.15   # fraction groupe A
-
-try:
-    _pf = pq.ParquetFile(_PREP_PATH)
-    _batch = next(_pf.iter_batches(batch_size=50_000, columns=["service_time"]))
-    _df_prep = _batch.to_pandas()
-    _st = _df_prep["service_time"].dropna().values.astype(float)
-    _st = _st[(_st > 0) & (_st < 300)]
-    _c = _kmedians_1d(_st, k=2)
-    s_B_real, s_A_real = float(_c[0]), float(_c[1])
-    print(f"K-médians (preprocessed) : s_B={s_B_real:.1f} min, s_A={s_A_real:.1f} min")
-    _USE_REAL_DATA = True
-except Exception as _e:
-    print(f"preprocessed non lu ({_e}), utilisation des valeurs synthétiques")
-    s_A_real, s_B_real = s_A_default, s_B_default
-
-# Paramètres issus du dernier run complet du pipeline (data_driven_plan.ipynb),
-# exportés dans plne_parameters.json : s_A/s_B viennent du clustering K=2 sur
-# les 40,1 M de lignes, le taux de no-show et la part du groupe A du holdout
-# d'inférence scoré par les modèles retenus. À défaut, repli sur le CSV
-# d'inférence, puis sur les valeurs synthétiques.
-_PARAM_PATH = "data/inference/plne_parameters.json"
-try:
-    import json as _json
-    with open(_PARAM_PATH) as _fp:
-        _P = _json.load(_fp)
-    _ns_rate = _P["noshow_rate"]
-    _pi_A_real = _P["pi_A_predicted"]
-    s_A_real, s_B_real = _P["s_A"], _P["s_B"]
-    print(f"Paramètres repris du run {_P['source_run']}")
-    print(f"  s_A={s_A_real:.1f} min, s_B={s_B_real:.1f} min (clustering K=2)")
-    print(f"  Taux de no-show : {_ns_rate:.3f}  →  q̄ ≈ {1-_ns_rate:.3f}")
-    print(f"  Part groupe A prédite : {_pi_A_real:.3f}  (part réelle : {_P['pi_A_actual']:.3f})")
-    _USE_REAL_DATA = True
-except Exception as _e2:
-    print(f"plne_parameters.json non lu ({_e2}), repli sur le CSV d'inférence")
-    try:
-        _df_inf = pd.read_csv(_INF_PATH)
-        _ns_rate = _df_inf["NoShow"].mean()
-        _pi_A_real = (_df_inf["predicted_group"] == "A").mean()
-        _USE_REAL_DATA = True
-    except Exception as _e3:
-        print(f"inference non lu ({_e3})")
-        _ns_rate = 0.20
-        _pi_A_real = _pi_A_default
-
-s_A = s_A_real if _USE_REAL_DATA else s_A_default
-s_B = s_B_real if _USE_REAL_DATA else s_B_default
-pi_A = _pi_A_real if _USE_REAL_DATA else _pi_A_default
-print(f"\\nParamètres retenus : s_A={s_A:.1f}, s_B={s_B:.1f}, π_A={pi_A:.2f}")
+print(f"Source           : {PLNE['source_run']} (commit {PLNE['git_commit']}, {PLNE['created']})")
+print(f"Méthode          : {PLNE['duration_method']} / {PLNE['duration_stat']}, coupure {PLNE['cutoff_minutes']:.1f} min")
+print(f"s_A, s_B         : {s_A:.2f} min, {s_B:.2f} min   (créneaux {L_SHORT:g} et {L_LONG:g} min)")
+print(f"pi_A réel / prédit : {pi_A:.4f} / {PLNE['pi_A_predicted']:.4f}")
+print(f"Taux de no-show  : {PLNE['noshow_rate']:.4f}")
+print(f"Erreur du classifieur de groupe (holdout) : {PLNE['group_error_rate']:.4f}")
+if PLNE["smoke"]:
+    print("ATTENTION : paramètres d'un smoke test (1 % des patients), pas de résultats publiables.")
 """)
 
 # ── Section 1 : Modèle ────────────────────────────────────────────────────────
@@ -433,7 +380,6 @@ md("## 4. Générateur d'instances et plan d'expériences\n\n"
 
 code("""\
 # ── 4.1 Générateur ────────────────────────────────────────────────────────────
-L_SHORT, L_LONG = 30.0, 60.0
 S_TOTAL, D_DOE, SLOTS_PER_DAY = 20, 4, 5  # ⚠ réduit (40,5,8)→(20,4,5) budget 45 min
 
 def generate_instance(seed, ratio=1.5, p_bar=0.20, long_share=0.15,

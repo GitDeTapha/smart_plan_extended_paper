@@ -17,6 +17,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import inspect
+import json
 import os
 import time
 import warnings
@@ -179,8 +180,8 @@ def validate_decisions(DURATION_METHOD: str, DURATION_STAT: str, C_O_BASE: float
     if C_O_BASE < 0:
         raise ValueError(f"C_O_BASE must be non-negative, got {C_O_BASE}")
     slots = tuple(float(v) for v in SLOT_LENGTHS)
-    if not slots or min(slots) <= 0:
-        raise ValueError(f"SLOT_LENGTHS must be positive, got {SLOT_LENGTHS}")
+    if len(slots) != 2 or min(slots) <= 0 or slots[0] == slots[1]:
+        raise ValueError(f"SLOT_LENGTHS must be two distinct positive lengths (short, long), got {SLOT_LENGTHS}")
     if not isinstance(RANDOM_STATE, (int, np.integer)):
         raise ValueError(f"RANDOM_STATE must be an integer, got {RANDOM_STATE!r}")
     return {**given, "C_O_BASE": float(C_O_BASE), "SLOT_LENGTHS": slots,
@@ -2389,6 +2390,58 @@ def solve_model(m, cfg: "Config", warm_start: Optional[dict] = None) -> SolveRep
     return SolveReport(status=tc.name, objective=float(incumbent),
                        best_bound=float(bound) if bound is not None else float("nan"),
                        gap=relative_gap(incumbent, bound), solve_time=elapsed, options=options)
+
+
+#: Fields of `plne_parameters.json`, the only channel from the prediction pipeline
+#: to the ILP campaign (audit 2.3). Schema 2 replaces the hand-extracted file of
+#: run_20260926_2002, which carried no method, no provenance and K-means centroids.
+PLNE_PARAMETER_FIELDS = {
+    "schema_version": int, "duration_method": str, "duration_stat": str,
+    "cutoff_minutes": float, "s_A": float, "s_B": float,
+    "pi_A_actual": float, "pi_A_predicted": float, "noshow_rate": float,
+    "group_error_rate": float, "n_train": int, "n_holdout": int,
+    "created": str, "git_commit": str, "source_run": str, "smoke": bool,
+}
+PLNE_SCHEMA_VERSION = 2
+
+
+def check_plne_parameters(P: dict, slot_lengths: Sequence[float]) -> dict:
+    """Validate the ILP parameters exported by the pipeline (audit B4 and 2.3).
+
+    Raises:
+        ValueError: a field is missing or has the wrong type, or a value lies
+            outside its admissible range: 0.05 < pi_A < 0.5, s_A > s_B > 0, and
+            s_A <= max(slot_lengths) (a long patient must fit in the longest slot,
+            otherwise the campaign leaves the domain of the model, audit B4).
+    """
+    missing = [k for k in PLNE_PARAMETER_FIELDS if k not in P]
+    if missing:
+        raise ValueError(f"plne_parameters: missing fields {missing} (schema {PLNE_SCHEMA_VERSION} "
+                         f"expected; rerun the export stage of data_driven_plan.ipynb)")
+    for key, typ in PLNE_PARAMETER_FIELDS.items():
+        ok = isinstance(P[key], (int, float)) and not isinstance(P[key], bool) if typ is float \
+            else isinstance(P[key], typ)
+        if not ok:
+            raise ValueError(f"plne_parameters: {key}={P[key]!r} is not of type {typ.__name__}")
+    if P["schema_version"] != PLNE_SCHEMA_VERSION:
+        raise ValueError(f"plne_parameters: schema {P['schema_version']}, expected {PLNE_SCHEMA_VERSION}")
+    if not 0.05 < P["pi_A_actual"] < 0.5:
+        raise ValueError(f"pi_A = {P['pi_A_actual']:.4f} outside (0.05, 0.5)")
+    if not P["s_A"] > P["s_B"] > 0:
+        raise ValueError(f"expected s_A > s_B > 0, got s_A={P['s_A']}, s_B={P['s_B']}")
+    if P["s_A"] > max(slot_lengths):
+        raise ValueError(f"s_A = {P['s_A']:.2f} min exceeds the longest slot {max(slot_lengths)} min "
+                         f"(audit B4): change SLOT_LENGTHS or the duration method, do not run")
+    for key in ("noshow_rate", "group_error_rate", "pi_A_predicted"):
+        if not 0.0 <= P[key] <= 1.0:
+            raise ValueError(f"plne_parameters: {key}={P[key]} is not a proportion")
+    return P
+
+
+def load_plne_parameters(path: str, slot_lengths: Sequence[float]) -> dict:
+    """Read and validate `plne_parameters.json` (see `check_plne_parameters`)."""
+    with open(path, encoding="utf-8") as fh:
+        return check_plne_parameters(json.load(fh), slot_lengths)
 
 
 @dataclass
