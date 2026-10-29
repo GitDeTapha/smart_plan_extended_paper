@@ -2253,20 +2253,105 @@ def load_artifacts(name_prefix: str = "final") -> dict:
 # EXACTLY the same model.
 # ============================================================================
 
+# The MIP solver is HiGHS, driven through Pyomo's appsi interface. That interface
+# exposes what the legacy SolverFactory wrapper did not: the termination status,
+# the incumbent objective and the best bound. The previous code read a
+# non-existent `res.solver.mip_gap`, caught the AttributeError and reported a gap
+# of 0 for every instance, optimal or not (audit B1). There is no fallback solver:
+# a run without HiGHS must fail, not switch silently to another algorithm.
+from pyomo.contrib.appsi.solvers import Highs as _AppsiHighs
+from pyomo.contrib.appsi.base import TerminationCondition as _TC
+
+SOLVER_NAME = "appsi_highs"
+if not _AppsiHighs().available():  # pragma: no cover - environment check
+    raise ImportError("HiGHS is not available through pyomo.contrib.appsi (pip install highspy)")
+
+#: Termination conditions after which the incumbent may be loaded: a feasible
+#: solution exists, but only `optimal` carries a proof of optimality.
+_FEASIBLE_STOPS = {_TC.optimal, _TC.maxTimeLimit, _TC.maxIterations,
+                   _TC.objectiveLimit, _TC.interrupted}
+
+
 def init_solver() -> str:
-    """Detect the available MIP solver (HiGHS through Pyomo, CBC fallback).
+    """Name of the MIP solver used throughout (kept for backward compatibility)."""
+    return SOLVER_NAME
+
+
+@dataclass
+class SolveReport:
+    """Outcome of one MIP solve, as read from the solver (never inferred)."""
+    status: str            # appsi termination condition name, e.g. "optimal", "maxTimeLimit"
+    objective: float       # incumbent objective value (solver's objective, minimised)
+    best_bound: float      # best proven lower bound on that objective
+    gap: float             # |objective - best_bound| / max(|objective|, 1e-9)
+    solve_time: float      # wall-clock seconds of the call: Pyomo-to-HiGHS translation + solve
+    options: dict          # solver options actually applied, plus HiGHS' own measurements
+
+    @property
+    def proven_optimal(self) -> bool:
+        return self.status == "optimal"
+
+
+def relative_gap(objective: float, bound: float) -> float:
+    """Relative MIP gap |objective - bound| / max(|objective|, 1e-9).
+
+    Same convention as HiGHS' mip_rel_gap. Infinite when no bound is known.
+    """
+    if bound is None or not np.isfinite(bound) or objective is None or not np.isfinite(objective):
+        return float("inf")
+    return abs(objective - bound) / max(abs(objective), 1e-9)
+
+
+def solve_model(m, cfg: "Config", warm_start: Optional[dict] = None) -> SolveReport:
+    """Solve a Pyomo MIP with HiGHS and load the solution only once it is known to exist.
+
+    Args:
+        m: Pyomo model with a single minimised objective.
+        cfg: solver options (`time_limit`, `mip_gap`, `threads`).
+        warm_start: optional {Var component data: value}; values are set on the
+            model and HiGHS is asked to start from them.
 
     Returns:
-        Name of the selected solver ('appsi_highs' or 'cbc').
+        SolveReport read from the solver.
+
+    Raises:
+        RuntimeError: no feasible solution (infeasible, unbounded, error, or the
+            time limit was reached before any incumbent was found).
     """
-    solver = pyo.SolverFactory("appsi_highs")
-    if solver.available():
-        return "appsi_highs"
-    print("HiGHS unavailable, falling back to CBC")
-    return "cbc"
+    opt = _AppsiHighs()
+    opt.config.load_solution = False
+    opt.config.time_limit = float(cfg.time_limit)
+    opt.config.mip_gap = float(cfg.mip_gap)
+    opt.highs_options = {"threads": int(cfg.threads)}
+    if warm_start:
+        for var, val in warm_start.items():
+            var.set_value(val)
+        opt.config.warmstart = True
+    options = {"time_limit": cfg.time_limit, "mip_rel_gap": cfg.mip_gap, "threads": cfg.threads,
+               "warm_start": bool(warm_start)}
 
+    t0 = time.perf_counter()
+    res = opt.solve(m)
+    elapsed = time.perf_counter() - t0
 
-SOLVER_NAME = init_solver()
+    tc = res.termination_condition
+    incumbent = res.best_feasible_objective
+    if tc not in _FEASIBLE_STOPS or incumbent is None or not np.isfinite(incumbent):
+        raise RuntimeError(f"HiGHS returned no feasible solution (termination: {tc.name}, "
+                           f"incumbent: {incumbent}, options: {options})")
+    res.solution_loader.load_vars()
+    bound = res.best_objective_bound
+    # HiGHS' own figures, read from the underlying highspy model. The wall-clock
+    # time above also counts the translation of the Pyomo model, which dominates on
+    # large instances (about 8 s for 40 patients), so the time limit does not bound
+    # it. Recording both keeps the reported solve times honest.
+    highs = getattr(opt, "_solver_model", None)
+    options["highs_internals"] = highs is not None
+    options["highs_run_time"] = float(highs.getRunTime()) if highs is not None else float("nan")
+    options["highs_mip_gap"] = float(highs.getInfo().mip_gap) if highs is not None else float("nan")
+    return SolveReport(status=tc.name, objective=float(incumbent),
+                       best_bound=float(bound) if bound is not None else float("nan"),
+                       gap=relative_gap(incumbent, bound), solve_time=elapsed, options=options)
 
 
 @dataclass
@@ -2294,12 +2379,14 @@ class Instance:
 
 @dataclass
 class Config:
-    """Solver options for the ILP."""
+    """Solver options for the ILP. Every field is logged in `Solution.options`."""
     z_binary: bool = False
     pruning: bool = False
     pruning_thr: float = 1e-4
     time_limit: float = 120.0
     mip_gap: float = 1e-6
+    threads: int = 1               # one HiGHS thread; parallelism is across instances
+    require_optimal: bool = False  # raise instead of returning an unproven incumbent
 
 
 @dataclass
@@ -2312,12 +2399,20 @@ class Solution:
     Z_reduced: float
     Z_complete: float
     solve_time: float
-    gap: float
+    gap: float              # relative gap on the solver objective (reduced cost)
     n_served: int
     n_double: int
     x_val: dict
     z_val: dict
     coeffs: dict
+    status: str = ""        # termination condition read from HiGHS
+    best_bound: float = float("nan")    # best bound on the reduced objective
+    gap_complete: float = float("nan")  # gap relative to the complete cost Z_complete
+    options: dict = field(default_factory=dict)
+
+    @property
+    def proven_optimal(self) -> bool:
+        return self.status == "optimal"
 
 
 def compute_coefficients(inst: Instance) -> dict:
@@ -2410,21 +2505,20 @@ def solve_ilp(inst: Instance, cfg: Optional[Config] = None) -> Solution:
         for (d, t) in slots:
             m.C5.add(sum(inst.q[i] * m.x[i, d, t] for i in I) <= inst.Q_bar)
 
-    solver = pyo.SolverFactory(SOLVER_NAME)
-    solver.options["time_limit"] = cfg.time_limit
-    if SOLVER_NAME == "appsi_highs":
-        solver.options["mip_rel_gap"] = cfg.mip_gap
-
-    t0 = time.perf_counter()
-    res = solver.solve(m, tee=False)
-    solve_time = time.perf_counter() - t0
+    report = solve_model(m, cfg)
+    if cfg.require_optimal and not report.proven_optimal:
+        raise RuntimeError(f"Optimality not proven: status {report.status}, gap {report.gap:.3e}")
 
     x_val = {(i, d, t): pyo.value(m.x[i, d, t]) for (i, d, t) in x_idx}
     z_val = {(i, j, d, t): pyo.value(m.z[i, j, d, t]) for (i, j, d, t) in z_idx}
 
-    for key, v in z_val.items():
-        if v is not None and abs(v - round(v)) > 1e-6:
-            raise ValueError(f"z{key}={v:.6f} is fractional, Proposition 1 violated!")
+    # Proposition 1 guarantees integral z at the optimum only. A proven optimum
+    # with a fractional z is a contradiction and stops the run; an unproven
+    # incumbent may carry fractional z, which is why the cost below is recomputed
+    # from x alone (z = x_i * x_j).
+    n_fractional = sum(1 for v in z_val.values() if v is not None and abs(v - round(v)) > 1e-6)
+    if report.proven_optimal and n_fractional:
+        raise ValueError(f"{n_fractional} fractional z at a proven optimum: Proposition 1 violated")
 
     planning = {}
     for (d, t) in slots:
@@ -2451,19 +2545,33 @@ def solve_ilp(inst: Instance, cfg: Optional[Config] = None) -> Solution:
         if (d, t) not in planning:
             E_idle += inst.c_I * inst.L[d][t]
 
-    Z_reduced = pyo.value(m.obj)
-    Z_complete = Z_reduced + inst.c_I * coeffs["total_L"]
-    try:
-        gap = float(res.solver.mip_gap)
-    except Exception:
-        gap = 0.0
+    # Exact expected cost of the returned schedule, and its reduced form (the
+    # constant c_I * sum(L) removed), which is what the solver minimises.
+    const = inst.c_I * coeffs["total_L"]
+    Z_complete = E_idle + E_wait + E_OT
+    Z_reduced = Z_complete - const
+    tol = 1e-6 * max(1.0, abs(report.objective))
+    if report.proven_optimal and abs(Z_reduced - report.objective) > tol:
+        raise ValueError(f"Recomputed objective {Z_reduced:.6f} differs from the proven optimum "
+                         f"{report.objective:.6f}: model and evaluation disagree")
+    if Z_reduced > report.objective + tol:
+        raise ValueError(f"Recomputed objective {Z_reduced:.6f} exceeds the solver incumbent "
+                         f"{report.objective:.6f}, impossible with non-negative z coefficients")
+
+    gap = relative_gap(Z_reduced, report.best_bound)
+    lower_complete = report.best_bound + const
+    gap_complete = (Z_complete - lower_complete) / max(abs(Z_complete), 1e-9)
 
     n_served = sum(len(v) for v in planning.values())
     n_double = sum(1 for v in planning.values() if len(v) == 2)
 
+    options = {**report.options, "z_binary": cfg.z_binary, "pruning": cfg.pruning,
+               "fractional_z": n_fractional}
     return Solution(planning=planning, E_idle=E_idle, E_wait=E_wait, E_OT=E_OT,
-                    Z_reduced=Z_reduced, Z_complete=Z_complete, solve_time=solve_time, gap=gap,
-                    n_served=n_served, n_double=n_double, x_val=x_val, z_val=z_val, coeffs=coeffs)
+                    Z_reduced=Z_reduced, Z_complete=Z_complete, solve_time=report.solve_time, gap=gap,
+                    n_served=n_served, n_double=n_double, x_val=x_val, z_val=z_val, coeffs=coeffs,
+                    status=report.status, best_bound=report.best_bound, gap_complete=gap_complete,
+                    options=options)
 
 
 def build_instance_from_patients(
