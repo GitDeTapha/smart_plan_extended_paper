@@ -10,8 +10,9 @@ from ilp_campaign import (CampaignConfig, SolutionCache, greedy_b3, model_cost, 
 
 def test_production_and_smoke_sizes():
     prod, smoke = CampaignConfig.production(n_workers=1), CampaignConfig.smoke(n_workers=1)
-    assert (prod.S, prod.R) == (40, 30)
-    assert (smoke.S, smoke.R) == (10, 2)
+    assert (prod.S, prod.R, prod.days) == (8, 30, 1)       # one clinic day (decision of 29/10)
+    assert (smoke.S, smoke.R) == (5, 2)
+    assert prod.mip_gap == 1e-6 and prod.time_limit == 600.0
     assert prod.solver_config().threads == 1
     assert prod.cw_fine[0] == 1.0 and prod.cw_fine[-1] == 1.5 and len(prod.cw_fine) == 11
 

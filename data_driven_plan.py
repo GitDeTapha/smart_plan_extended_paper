@@ -149,6 +149,75 @@ def _savefig(name: str, prefix: str = "") -> None:
     plt.savefig(f"{FIGURES_DIR}/{stem}.png", dpi=300, bbox_inches="tight")
 
 
+def available_cpus(cgroup_root: str = "/sys/fs/cgroup") -> int:
+    """CPUs this process may actually use: the affinity mask, capped by the cgroup CPU
+    quota of a container (RunPod: 16 vCPU while the host reports 24 cores / 48 threads).
+
+    os.cpu_count() and psutil report the host; using them in a container
+    oversubscribes the allotted CPUs. A missing cgroup file means no quota.
+    """
+    n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    j = os.path.join
+    quotas = [(j(cgroup_root, "cpu.max"), None),                       # cgroup v2: "<quota> <period>"
+              (j(cgroup_root, "cpu", "cpu.cfs_quota_us"), j(cgroup_root, "cpu", "cpu.cfs_period_us"))]  # v1
+    for path, period_path in quotas:
+        if not os.path.exists(path):
+            continue
+        with open(path) as fh:
+            parts = fh.read().split()
+        if period_path is None:
+            quota, period = parts[0], parts[1]
+        else:
+            with open(period_path) as fh:
+                quota, period = parts[0], fh.read().strip()
+        if quota not in ("max", "-1"):
+            n = min(n, max(1, int(int(quota) // int(period))))
+    return int(n)
+
+
+def available_memory(cgroup_root: str = "/sys/fs/cgroup") -> int:
+    """Bytes this process may still allocate: the free memory of the machine, capped
+    by the cgroup memory limit of a container minus what the container already uses
+    (psutil reads /proc/meminfo, which shows the host inside a container)."""
+    import psutil
+    avail = int(psutil.virtual_memory().available)
+    j = os.path.join
+    for limit_path, usage_path in ((j(cgroup_root, "memory.max"), j(cgroup_root, "memory.current")),
+                                   (j(cgroup_root, "memory", "memory.limit_in_bytes"),
+                                    j(cgroup_root, "memory", "memory.usage_in_bytes"))):
+        if not (os.path.exists(limit_path) and os.path.exists(usage_path)):
+            continue
+        with open(limit_path) as fh:
+            limit = fh.read().strip()
+        with open(usage_path) as fh:
+            usage = int(fh.read().strip())
+        if limit != "max" and int(limit) < 2 ** 60:
+            avail = min(avail, int(limit) - usage)
+    return max(avail, 0)
+
+
+def check_free_disk(path: str, need_gb: float) -> float:
+    """Stop before a stage writes artifacts the disk cannot hold (the RunPod container
+    disk is 5 GB; the artifacts of a full run take about 70 GB). Returns the free GB."""
+    import shutil
+    os.makedirs(path, exist_ok=True)
+    free_gb = shutil.disk_usage(path).free / 2 ** 30
+    if free_gb < need_gb:
+        raise RuntimeError(f"{free_gb:.1f} GB free under {os.path.abspath(path)}, {need_gb:.0f} GB needed: "
+                           f"run from a volume with enough space (e.g. /workspace on RunPod)")
+    print(f"Disk: {free_gb:.1f} GB free under {os.path.abspath(path)} ({need_gb:.0f} GB needed)")
+    return free_gb
+
+
+def resolve_n_jobs(n_jobs: int) -> int:
+    """n_jobs as an explicit count: -1 means every available CPU (see `available_cpus`)."""
+    if n_jobs == -1:
+        return available_cpus()
+    if n_jobs < 1:
+        raise ValueError(f"n_jobs must be -1 or positive, got {n_jobs}")
+    return min(int(n_jobs), available_cpus())
+
+
 def latex_table(df: pd.DataFrame, path: str, caption: str, label: str,
                 decimals: int = 3, index: bool = False) -> str:
     """Write a booktabs LaTeX table with escaped headers and cells (audit rec. 14).
@@ -318,6 +387,9 @@ class StageRunner:
     def finish(self, stage: str, **artifacts) -> None:
         d = os.path.join(self.dir, stage)
         os.makedirs(d, exist_ok=True)
+        big = sum(v.nbytes for v in artifacts.values() if isinstance(v, np.ndarray) and v.ndim == 2)
+        if big:
+            check_free_disk(d, 1.1 * big / 2 ** 30 + 1)
         small = {}
         for k, v in artifacts.items():
             if isinstance(v, np.ndarray) and v.ndim == 2:
@@ -1192,6 +1264,56 @@ class BalancedFit(ClassifierMixin, BaseEstimator):
         return self.estimator_.feature_importances_
 
 
+class CachedSMOTE(SMOTE):
+    """SMOTE whose synthetic rows are memoised on disk (pod readiness).
+
+    SMOTE is deterministic given (X, y, parameters, random_state), and the same
+    resampling is requested many times: by the four families refitted on fit +
+    valid, by every candidate of a halving iteration (they share the subsample),
+    by AdaBoost. Its nearest-neighbour search grows with the square of the
+    minority size (about 40 s for 40,000 minority rows in 200 dimensions), so at
+    full scale one call takes hours. The cache key is a BLAKE2b hash of the exact
+    bytes of X and y and of the parameters; on a hit the stored synthetic rows
+    are appended to X exactly as SMOTE appends them, so the output is identical
+    bit for bit (tests/test_pod_resources.py). cache_dir=None disables the cache.
+    """
+    _parameter_constraints = {**SMOTE._parameter_constraints, "cache_dir": [str, None]}
+
+    def __init__(self, *, sampling_strategy="auto", random_state=None, k_neighbors=5, cache_dir=None):
+        super().__init__(sampling_strategy=sampling_strategy, random_state=random_state,
+                         k_neighbors=k_neighbors)
+        self.cache_dir = cache_dir
+
+    def _key(self, X, y) -> str:
+        import hashlib
+        h = hashlib.blake2b(digest_size=20)
+        X = np.ascontiguousarray(X)
+        h.update(str((X.shape, X.dtype.str, self.sampling_strategy, self.random_state,
+                      self.k_neighbors)).encode())
+        h.update(memoryview(X).cast("B"))
+        h.update(np.ascontiguousarray(np.asarray(y)).tobytes())
+        return h.hexdigest()
+
+    def fit_resample(self, X, y, **params):
+        if self.cache_dir is None:
+            return super().fit_resample(X, y, **params)
+        X = np.asarray(X)
+        y = np.asarray(y)
+        path = os.path.join(self.cache_dir, f"smote_{self._key(X, y)}.npz")
+        if os.path.exists(path):
+            with np.load(path) as z:
+                X_new, y_new = z["X_new"], z["y_new"]
+        else:
+            X_res, y_res = super().fit_resample(X, y, **params)
+            X_new, y_new = X_res[len(X):], y_res[len(y):]
+            os.makedirs(self.cache_dir, exist_ok=True)
+            tmp = path + f".{os.getpid()}.tmp.npz"
+            np.savez(tmp, X_new=X_new, y_new=y_new)
+            os.replace(tmp, path)          # atomic: concurrent workers never read a partial file
+            return X_res, y_res
+        return np.vstack([X, X_new.astype(X.dtype, copy=False)]), np.concatenate([y, y_new.astype(y.dtype, copy=False)])
+
+
 def prior_correct(p: np.ndarray, prior: float, train_prior: float = 0.5) -> np.ndarray:
     """Bayes correction of probabilities learnt under a class prior `train_prior`
     back to the true prior `prior` (Saerens et al., 2002). Balanced weighting
@@ -1222,11 +1344,15 @@ class TrainingConfig:
         models: families to train, among `SUPPORTED_MODELS`.
         search: "halving" (HalvingRandomSearchCV on the predefined fit / valid
             split, resource = training rows) or "none" (base parameters).
-        n_candidates: candidates drawn at the first halving iteration.
-        halving_factor: factor of successive halving (candidates kept 1/factor,
-            rows multiplied by factor at each iteration).
-        min_resources: training rows of the first iteration (audit 1.3: 500,000).
-        max_resources: training rows of the last iteration; None = all of fit.
+        halving_iterations: iterations of successive halving (k).
+        last_candidates: candidates compared at the last iteration, on all of fit.
+        min_resources: fit rows of the first iteration (audit 1.3: 500,000).
+        max_resources: fit rows of the last iteration; None = all of fit.
+            The number of candidates and the halving factor follow from these
+            four values (`halving_schedule`): every iteration then costs about
+            last_candidates full fits, the budget split of successive halving.
+        memory_safety: share of the available memory the parallel search may use;
+            the number of search processes is capped accordingly (`search_jobs`).
         smote_sampling_strategy: minority / majority ratio reached by SMOTE
             (<= 0.1, audit 1.4); SMOTE is skipped when the ratio already exceeds it.
         smote_k_neighbors: neighbours used by SMOTE.
@@ -1238,12 +1364,14 @@ class TrainingConfig:
     """
     models: Sequence[str] = SUPPORTED_MODELS
     search: str = "halving"
-    n_candidates: int = 12
-    halving_factor: int = 3
+    halving_iterations: int = 3
+    last_candidates: int = 2
     min_resources: int = 500_000
     max_resources: Optional[int] = None
+    memory_safety: float = 0.6
     smote_sampling_strategy: float = 0.1
     smote_k_neighbors: int = 5
+    smote_cache_dir: Optional[str] = None   # memoised SMOTE output (identical results, see CachedSMOTE)
     adaboost_max_estimators: int = 400
     adaboost_learning_rates: tuple = (0.5, 1.0)
     param_grids: dict = field(default_factory=dict)
@@ -1264,6 +1392,7 @@ class TrainingConfig:
             raise ValueError(f"threshold_metric={self.threshold_metric!r}, expected among {list(THRESHOLD_METRICS)}")
         if not 0 < self.smote_sampling_strategy <= 0.1:
             raise ValueError("smote_sampling_strategy must lie in (0, 0.1] (audit 1.4)")
+        self.n_jobs = resolve_n_jobs(self.n_jobs)   # explicit count: -1 would mean the host's CPUs
         self.models = tuple(self.models)
 
     def grid_for(self, name: str) -> dict:
@@ -1289,8 +1418,10 @@ class TrainingConfig:
     def summary(self) -> pd.DataFrame:
         rows = [
             ("Models trained", ", ".join(self.models)),
-            ("Search", f"{self.search}: {self.n_candidates} candidates, factor {self.halving_factor}, "
-                       f"rows {self.min_resources:,} -> {'all of fit' if self.max_resources is None else f'{self.max_resources:,}'}"),
+            ("Search", f"{self.search}: {self.halving_iterations} iterations, {self.last_candidates} candidates "
+                       f"at the last one, fit rows {self.min_resources:,} -> "
+                       f"{'all of fit' if self.max_resources is None else f'{self.max_resources:,}'}"),
+            ("Search processes", f"capped so that they use at most {self.memory_safety:.0%} of the available memory"),
             ("Search criterion", "log-loss of prior-corrected probabilities on valid"),
             ("Final fit", "fit + valid, best parameters"),
             ("Imbalance", f"SMOTE(sampling_strategy={self.smote_sampling_strategy}, k={self.smote_k_neighbors}) "
@@ -1353,8 +1484,9 @@ def make_estimator(name: str, cfg: TrainingConfig, minority_ratio: float,
         raise ValueError(f"Unknown model: {name}")
     steps = []
     if minority_ratio < cfg.smote_sampling_strategy:
-        steps.append(("smote", SMOTE(sampling_strategy=cfg.smote_sampling_strategy,
-                                     k_neighbors=cfg.smote_k_neighbors, random_state=rs)))
+        steps.append(("smote", CachedSMOTE(sampling_strategy=cfg.smote_sampling_strategy,
+                                           k_neighbors=cfg.smote_k_neighbors, random_state=rs,
+                                           cache_dir=cfg.smote_cache_dir)))
     steps.append((PIPE_STEP, clf))
     pipe = ImbPipeline(steps)
     if params:
@@ -1362,28 +1494,123 @@ def make_estimator(name: str, cfg: TrainingConfig, minority_ratio: float,
     return pipe
 
 
+def halving_schedule(n_grid: int, n_rows: int, frac_fit: float, cfg: "TrainingConfig") -> dict:
+    """Explicit successive-halving schedule (audit 1.3: from 500,000 rows to all of fit).
+
+    With k iterations and L candidates at the last one, the factor f and the
+    number of candidates n follow: rows grow from r_min to r_max = all rows and
+    candidates shrink from n to L by the same factor f per iteration, so
+    f^(k-1) = r_max / r_min = n / L and every iteration trains about L full fits
+    (the equal-budget split of successive halving). When the grid holds fewer
+    than L r_max / r_min combinations, n is the grid size and r_min grows
+    accordingly. Rows are those of fit + valid (the resource of the search); the
+    fit share of every subsample stays frac_fit.
+
+    Returns the parameters for HalvingRandomSearchCV and the schedule it will
+    follow, recomputed with scikit-learn's own formulas.
+    """
+    import math
+    k, L = cfg.halving_iterations, cfg.last_candidates
+    if k < 2 or L < 1:
+        raise ValueError("halving_iterations must be >= 2 and last_candidates >= 1")
+    r_max = n_rows if cfg.max_resources is None else min(n_rows, int(cfg.max_resources / frac_fit))
+    r_min_target = min(int(cfg.min_resources / frac_fit), r_max)
+    # Rows grow by the integer ratio q from first to last iteration. scikit-learn counts
+    # iterations with floor(log(r_max // r_min, f)) and caps the last rows at r_max:
+    # with r_min = r_max // q and f^(k-1) a hair below q, it runs k iterations and the
+    # last one trains on all rows but fewer than q (rounding, < 0.001 % at full scale).
+    q = int(min(r_max / r_min_target, n_grid / L))
+    if q < 2:
+        raise ValueError(f"grid of {n_grid} combinations or rows {r_max:,} too small for "
+                         f"{k} halving iterations ending with {L} candidates")
+    r_min = r_max // q
+    f = q ** (1.0 / (k - 1)) * (1 - 1e-12)
+
+    def cascade(n):
+        out = [n]
+        for _ in range(k - 1):
+            out.append(math.ceil(out[-1] / f))
+        return out
+
+    # largest number of candidates whose successive ceil(n / f) ends with L finalists
+    n_cand = min(n_grid, math.ceil(L * q))
+    while n_cand > L and cascade(n_cand)[-1] > L:
+        n_cand -= 1
+    n_req = 1 + math.floor(math.log(n_cand, f))
+    n_pos = 1 + math.floor(math.log(r_max // r_min, f))
+    n_it = min(n_req, n_pos)
+    rows = [min(int(f ** i * r_min), r_max) for i in range(n_it)]
+    cands = cascade(n_cand)[:n_it]
+    if n_it != k or cands[-1] != L or r_max - rows[-1] > q:
+        raise RuntimeError(f"halving schedule could not be built: {n_it} iterations, rows {rows}, "
+                           f"candidates {cands}")
+    return {"n_candidates": n_cand, "factor": f, "min_resources": r_min, "max_resources": r_max,
+            "iterations": n_it, "rows": rows, "fit_rows": [round(r * frac_fit) for r in rows],
+            "candidates": cands}
+
+
+def search_jobs(cfg: "TrainingConfig", n_rows: int, n_features: int) -> tuple[int, int]:
+    """(processes, threads per model) of the parallel search, from the memory.
+
+    A search process holds, at the last iteration, a copy of the rows it trains
+    and scores on plus SMOTE's output and the model's own copy (XGBoost's
+    DMatrix, the MLP's batches): about 2.5 times the float32 rows of fit +
+    valid. The processes are capped so that together they use at most
+    `memory_safety` of the available memory (`available_memory`), and the
+    remaining CPUs go to the models' threads. Neither number changes a result.
+    """
+    per_process = 2.5 * n_rows * n_features * 4
+    budget = cfg.memory_safety * available_memory()
+    jobs = int(max(1, min(cfg.n_jobs, budget // per_process)))
+    return jobs, max(1, cfg.n_jobs // jobs)
+
+
+def _grid_size(grid: dict) -> int:
+    n = 1
+    for v in grid.values():
+        n *= len(v)
+    return n
+
+
 def _halving_search(name, cfg, X_fv, y_fv, n_fit, prior, ratio):
-    """HalvingRandomSearchCV on the predefined split (fit rows train, valid rows score)."""
+    """HalvingRandomSearchCV on the predefined split (fit rows train, valid rows score),
+    following `halving_schedule`; the schedule actually run is checked against it."""
     from sklearn.experimental import enable_halving_search_cv  # noqa: F401
     from sklearn.model_selection import HalvingRandomSearchCV, PredefinedSplit
     grid = cfg.grid_for(name)
     fold = np.r_[np.full(n_fit, -1), np.zeros(len(y_fv) - n_fit, dtype=int)]
     frac_fit = n_fit / len(y_fv)
-    # resource = rows of X_fv; with a predefined split the fit share of every
-    # subsample stays frac_fit, so these bounds are expressed in fit rows.
-    min_res = int(min(cfg.min_resources, n_fit) / frac_fit)
-    max_res = len(y_fv) if cfg.max_resources is None else int(min(cfg.max_resources, n_fit) / frac_fit)
+    jobs, threads = search_jobs(cfg, len(y_fv), X_fv.shape[1])
+    if _grid_size(grid) <= cfg.last_candidates:
+        # nothing to eliminate: every combination is compared on all of fit
+        from sklearn.model_selection import GridSearchCV
+        search = GridSearchCV(make_estimator(name, cfg, ratio, n_jobs=threads), _prefixed(name, grid),
+                              cv=PredefinedSplit(fold), scoring=_corrected_log_loss_scorer(prior),
+                              refit=False, n_jobs=jobs, error_score="raise")
+        search.fit(X_fv, y_fv)
+        res = pd.DataFrame(search.cv_results_)
+        table = res[["params", "mean_test_score"]].rename(columns={"mean_test_score": "-log-loss (valid)"})
+        best = {k.split("__")[-1]: v for k, v in search.best_params_.items()}
+        return best, float(-search.best_score_), table
+    sched = halving_schedule(_grid_size(grid), len(y_fv), frac_fit, cfg)
+    print(f"{name}: {sched['iterations']} iterations, candidates {sched['candidates']}, "
+          f"fit rows {sched['fit_rows']}, factor {sched['factor']:.3f}; "
+          f"{jobs} search processes x {threads} threads")
     search = HalvingRandomSearchCV(
-        make_estimator(name, cfg, ratio, n_jobs=1), _prefixed(name, grid),
-        n_candidates=cfg.n_candidates, factor=cfg.halving_factor, resource="n_samples",
-        min_resources=min(min_res, max_res), max_resources=max_res, cv=PredefinedSplit(fold),
-        scoring=_corrected_log_loss_scorer(prior), refit=False, random_state=cfg.random_state,
-        n_jobs=cfg.n_jobs, error_score="raise")
+        make_estimator(name, cfg, ratio, n_jobs=threads), _prefixed(name, grid),
+        n_candidates=sched["n_candidates"], factor=sched["factor"], resource="n_samples",
+        min_resources=sched["min_resources"], max_resources=sched["max_resources"],
+        cv=PredefinedSplit(fold), scoring=_corrected_log_loss_scorer(prior), refit=False,
+        random_state=cfg.random_state, n_jobs=jobs, error_score="raise")
     search.fit(X_fv, y_fv)
+    if list(search.n_resources_) != sched["rows"] or list(search.n_candidates_) != sched["candidates"]:
+        raise RuntimeError(f"{name}: schedule run {search.n_resources_} / {search.n_candidates_} "
+                           f"differs from the planned {sched['rows']} / {sched['candidates']}")
     res = pd.DataFrame(search.cv_results_)
     table = res[["iter", "n_resources", "params", "mean_test_score"]].copy()
     table["n_resources"] = (table["n_resources"] * frac_fit).round().astype(int)
     table = table.rename(columns={"n_resources": "fit rows", "mean_test_score": "-log-loss (valid)"})
+    table.attrs.update(schedule=sched, search_jobs=jobs, model_threads=threads)
     best = {k.split("__")[-1]: v for k, v in search.best_params_.items()}
     return best, float(-search.best_score_), table
 

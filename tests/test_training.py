@@ -15,10 +15,11 @@ def data(n=6000, prior=0.05, seed=0):
     return X, y
 
 
-SMALL = dict(n_candidates=3, halving_factor=2, min_resources=1000, adaboost_max_estimators=15,
+SMALL = dict(halving_iterations=2, last_candidates=2, min_resources=500, adaboost_max_estimators=15,
              n_jobs=1, verbose=0,
              param_grids={"RandomForest": {"n_estimators": [20], "max_depth": [3, 5]},
-                          "XGBoost": {"n_estimators": [20], "max_depth": [2, 3]},
+                          "XGBoost": {"n_estimators": [10, 20], "max_depth": [2, 3, 4],
+                                      "learning_rate": [0.1, 0.3]},     # 12 combinations: halving path
                           "ANN": {"hidden_layer_sizes": [(8,)], "batch_size": [256], "alpha": [1e-4]}},
              base_params={"ANN": {"max_iter": 30}})
 
@@ -98,3 +99,14 @@ def test_adaboost_tuned_in_a_separate_process(tmp_path):
     same = tune_binary_classifiers(X[:2500], y[:2500], 2000, cfg)
     assert sub["best"]["AdaBoost"] == same["best"]["AdaBoost"]
     assert sub["criterion"]["AdaBoost"] == pytest.approx(same["criterion"]["AdaBoost"])
+
+
+def test_smote_cache_leaves_the_search_unchanged(tmp_path):
+    from data_driven_plan import tune_binary_classifiers
+    X, y = data(3000, prior=0.01)   # positive share about 3 %: SMOTE applies
+    cfg = TrainingConfig(**{**SMALL, "models": ["XGBoost", "AdaBoost"]})
+    plain = tune_binary_classifiers(X[:2500], y[:2500], 2000, cfg)
+    cached = tune_binary_classifiers(X[:2500], y[:2500], 2000, cfg.replace(smote_cache_dir=str(tmp_path)))
+    assert plain["best"] == cached["best"]
+    assert plain["criterion"] == pytest.approx(cached["criterion"])
+    assert list(tmp_path.glob("smote_*.npz"))

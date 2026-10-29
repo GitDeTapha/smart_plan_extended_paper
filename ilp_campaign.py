@@ -17,7 +17,7 @@ import joblib
 import numpy as np
 import psutil
 
-from data_driven_plan import Config, Instance, evaluate_planning_exact, solve_ilp
+from data_driven_plan import Config, Instance, available_cpus, evaluate_planning_exact, solve_ilp
 
 # ----------------------------------------------------------------------------
 # Attendance probabilities q_i (audit P2)
@@ -136,19 +136,26 @@ def load_holdout_scores(path: str) -> "pd.DataFrame":
 # Campaign configuration (rec. 6)
 # ----------------------------------------------------------------------------
 def physical_cores() -> int:
-    """Number of physical cores; raises rather than guessing when it is unknown."""
-    n = psutil.cpu_count(logical=False)
-    if not n:
-        raise RuntimeError("number of physical cores unknown: set n_workers explicitly")
-    return int(n)
+    """Processes of the campaign: one per physical core actually available (rec. 6).
+
+    In a container the allotted CPUs are hardware threads; their number divided by
+    the threads per core of the host (psutil, logical / physical) gives the cores
+    available. One single-threaded HiGHS per core keeps two solves off the same core,
+    so the reported solve times are not inflated by contention between siblings.
+    """
+    logical, physical = psutil.cpu_count(logical=True), psutil.cpu_count(logical=False)
+    if not logical or not physical:
+        raise RuntimeError("number of cores unknown: set n_workers explicitly")
+    threads_per_core = max(1, logical // physical)
+    return max(1, available_cpus() // threads_per_core)
 
 
 @dataclass(frozen=True)
 class CampaignConfig:
     """Sizes, budgets and grids of the ILP campaign; every field is logged.
 
-    `production()` follows the original plan (S = 40 slots, R = 30 seeds);
-    `smoke()` checks that the notebook runs end to end (S = 10, R = 2).
+    `production()`: one clinic day of S = 8 slots, R = 30 seeds, 600 s per ILP;
+    `smoke()` checks that the notebook runs end to end (S = 5, R = 2).
     """
     days: int
     slots_per_day: int
@@ -185,7 +192,12 @@ class CampaignConfig:
 
     @classmethod
     def production(cls, n_workers: Optional[int] = None) -> "CampaignConfig":
-        return cls(days=5, slots_per_day=8, R=30, time_limit=1800.0, mip_gap=1e-4, M_sim=10_000,
+        # One clinic day of 8 slots (authors' decision of 29/10): the instance a clinic
+        # schedules in practice, solved to proven optimality in seconds on a laptop,
+        # whereas 5 days x 8 slots (60 patients) kept gaps of 11 to 12 % after 1,800 s
+        # (and 65 % at p_bar = 0.03 after 60 s), the incumbent unchanged between 600 and
+        # 1,800 s. The 600 s limit is a safeguard; every status and gap is reported.
+        return cls(days=1, slots_per_day=8, R=30, time_limit=600.0, mip_gap=1e-6, M_sim=10_000,
                    ratios=(1.0, 1.25, 1.5, 1.75, 2.0), p_bars=(0.03, 0.10, 0.20, 0.30),
                    long_shares=(0.15, 0.25, 0.50), cw_ratios=(0.1, 0.25, 0.5, 1.0, 2.0),
                    cw_fine=tuple(round(1.0 + 0.05 * k, 2) for k in range(11)),
@@ -193,7 +205,7 @@ class CampaignConfig:
 
     @classmethod
     def smoke(cls, n_workers: Optional[int] = None) -> "CampaignConfig":
-        return cls(days=2, slots_per_day=5, R=2, time_limit=10.0, mip_gap=1e-4, M_sim=2_000,
+        return cls(days=1, slots_per_day=5, R=2, time_limit=10.0, mip_gap=1e-4, M_sim=2_000,
                    ratios=(1.0, 1.5, 2.0), p_bars=(0.03, 0.20), long_shares=(0.15, 0.50),
                    cw_ratios=(0.5, 1.0), cw_fine=(1.0, 1.25, 1.5),
                    holdout_days=4, n_workers=n_workers or physical_cores())
@@ -268,15 +280,23 @@ class SolutionCache:
 
 
 def solve_record(inst: Instance, cfg: Config, warm_start: bool = True) -> dict:
-    """Solve the ILP (warm-started from B3) and keep what the campaign reports."""
+    """Solve the ILP (warm-started from B3) and keep what the campaign reports.
+
+    peak_rss_mb is the peak resident memory of the solving process so far (an
+    upper bound of this solve's peak): the evidence that the optimisation runs
+    on modest hardware.
+    """
+    import resource
     start = greedy_b3(inst) if warm_start else None
     sol = solve_ilp(inst, cfg, warm_start=start)
+    peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     return {"planning": sol.planning, "status": sol.status, "gap": sol.gap,
             "gap_complete": sol.gap_complete, "best_bound": sol.best_bound,
             "Z_complete": sol.Z_complete, "E_idle": sol.E_idle, "E_wait": sol.E_wait,
             "E_OT": sol.E_OT, "n_served": sol.n_served, "n_double": sol.n_double,
             "solve_time": sol.solve_time, "highs_run_time": sol.options.get("highs_run_time"),
-            "warm_start_cost": model_cost(inst, start) if start is not None else float("nan")}
+            "warm_start_cost": model_cost(inst, start) if start is not None else float("nan"),
+            "peak_rss_mb": peak_mb}
 
 
 def run_lpt(fn: Callable, tasks: Sequence, cost: Callable, n_workers: int) -> list:

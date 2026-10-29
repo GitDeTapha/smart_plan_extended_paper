@@ -75,7 +75,17 @@ print(f"Python  : {sys.version.split()[0]}")
 print(f"NumPy   : {np.__version__}")
 print(f"Pandas  : {pd.__version__}")
 import pyomo; print(f"Pyomo   : {pyomo.__version__}")
-print(f"Platform: {platform.processor()}")
+import psutil
+def _cpu_model():
+    try:
+        with open("/proc/cpuinfo") as fh:
+            return next(l.split(":", 1)[1].strip() for l in fh if l.startswith("model name"))
+    except (OSError, StopIteration):
+        return platform.processor() or "unknown"
+CPU_MODEL = _cpu_model()
+print(f"Platform: {CPU_MODEL} | {platform.platform()}")
+print(f"CPU     : {psutil.cpu_count(logical=False)} cœurs physiques, {psutil.cpu_count()} logiques")
+print(f"RAM     : {psutil.virtual_memory().total / 2**30:.1f} Go")
 print(f"Solveur : {SOLVER_NAME} ✓ (détecté par data_driven_plan.init_solver)")
 """)
 
@@ -370,8 +380,11 @@ print(_obj_tex)
 # ── Section 4 : Générateur + DOE ─────────────────────────────────────────────
 md("## 4. Générateur d'instances et plan d'expériences\n\n"
    "Tailles, budgets et grilles viennent de `ilp_campaign.CampaignConfig` : production "
-   "(S = 40 créneaux, 5 jours × 8, R = 30 graines, 1 800 s et gap cible 1e-4 par PLNE) ou "
-   "smoke (S = 10, R = 2), modifiables par `CAMPAIGN_OVERRIDES`. Plan OFAT autour de la "
+   "(une journée de S = 8 créneaux, R = 30 graines, gap cible 1e-6, limite de sécurité 600 s) "
+   "ou smoke (S = 5, R = 2), modifiables par `CAMPAIGN_OVERRIDES`. Une journée est l'instance "
+   "qu'un service planifie réellement ; elle est résolue à l'optimum prouvé en quelques secondes "
+   "sur un ordinateur portable, alors que 5 jours × 8 créneaux (60 patients) gardaient un gap de "
+   "11 à 12 % après 1 800 s, sans amélioration de la solution entre 600 et 1 800 s. Plan OFAT autour de la "
    "cellule centrale (n/S = 1,5 ; p̄ = 0,20 ; part de créneaux longs 0,15 ; c_W/c_I = 0,50). "
    "Chaque PLNE est résolu une fois (cache disque), démarré à chaud depuis le glouton B3, "
    "avec un fil HiGHS par processus et un processus par cœur physique, les instances les "
@@ -457,6 +470,9 @@ code("""\
 print("Statuts HiGHS :", _df_doe["status"].value_counts().to_dict())
 _unproven = _df_doe[_df_doe["status"] != "optimal"]
 print(f"Optimalité prouvée : {100*(1-len(_unproven)/len(_df_doe)):.1f} % des PLNE")
+print(f"Temps de résolution (s) : médiane {_df_doe['solve_time'].median():.1f}, "
+      f"95e centile {_df_doe['solve_time'].quantile(0.95):.1f}, max {_df_doe['solve_time'].max():.1f}")
+print(f"Mémoire résidente maximale d'un processus de résolution : {_df_doe['peak_rss_mb'].max():.0f} Mo")
 if len(_unproven):
     print("Gap (coût complet) des solutions non prouvées : "
           f"médiane {_unproven['gap_complete'].median():.2e}, max {_unproven['gap_complete'].max():.2e}")
@@ -803,6 +819,9 @@ gap cible {CC.mip_gap:g}. Smoke : {SMOKE}.
 
 ## Plan d'expériences
 - Optimalité prouvée : {100*(_df_doe['status'] == 'optimal').mean():.1f} % des PLNE
+- Résolution : médiane {_df_doe['solve_time'].median():.1f} s, max {_df_doe['solve_time'].max():.1f} s,
+  mémoire max {_df_doe['peak_rss_mb'].max():.0f} Mo par processus ({CPU_MODEL},
+  {psutil.virtual_memory().total / 2**30:.0f} Go de RAM)
 - Cellule centrale : Z = {_central['Z_complete'].mean():.3f} ± {_central['Z_complete'].std():.3f}
 
 ## Benchmarks (coût exact du modèle, Delta Z vs PLNE, IC 95 %)

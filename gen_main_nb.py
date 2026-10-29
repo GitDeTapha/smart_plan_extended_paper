@@ -101,9 +101,11 @@ RANDOM_STATE    = 0
 SMOKE           = False         # True: 1% of the patients, minimal budgets
 RUN_ID          = None          # None: timestamp; artifacts in models/run_<RUN_ID>/, results/run_<RUN_ID>/
 STAGE           = "all"         # "prep" | "durations" | "tune" | "fit" | "calibrate" | "evaluate" | "export" | "all"
-N_JOBS          = -1            # processes / threads of the searches and of RF, XGBoost (nthread)
-BLAS_THREADS    = 1             # BLAS / OpenMP threads per process (the parallelism is in N_JOBS)
+N_JOBS          = -1            # CPUs used (-1: all CPUs allotted to the container)
+BLAS_THREADS    = None          # BLAS threads of this process; None: N_JOBS (search workers are set by joblib)
 SMOKE_PATIENT_FRACTION = 0.01   # SMOKE: share of patients kept, by hashed identifier
+PATIENT_FRACTION = None         # pilot run without SMOKE budgets (e.g. 0.10); None: all patients
+MIN_FREE_DISK_GB = None         # None: estimated from the share of patients (about 70 GB for a full run)
 """)
 
 code("""\
@@ -117,14 +119,23 @@ RUN_RESULTS_DIR = os.path.join(RESULTS_DIR, f"run_{RUN_ID}")
 os.makedirs(RUN_RESULTS_DIR, exist_ok=True)
 from threadpoolctl import threadpool_limits
 # BLAS only: XGBoost's OpenMP threads are set by n_jobs, a global OpenMP cap would override them
+N_JOBS = resolve_n_jobs(N_JOBS)
+BLAS_THREADS = N_JOBS if BLAS_THREADS is None else int(BLAS_THREADS)
 threadpool_limits(limits=BLAS_THREADS, user_api="blas")
+FRACTION = SMOKE_PATIENT_FRACTION if SMOKE else PATIENT_FRACTION
+FULL_RUN = FRACTION is None   # only a full run may write the versioned plne_parameters.json
 RUN = StageRunner(RUN_ID, target=STAGE)
 for k, v in {**DECISIONS, "RUN_ID": RUN_ID, "STAGE": STAGE, "N_JOBS": N_JOBS,
-             "BLAS_THREADS": BLAS_THREADS}.items():
+             "BLAS_THREADS": BLAS_THREADS, "PATIENT_FRACTION": FRACTION,
+             "available CPUs": available_cpus(), "available memory (GB)": round(available_memory() / 2**30, 1)}.items():
     print(f"{k:<16} {v}")
 print(f"Status file: {RUN.status_path}")
 RUN.configure("prep", decisions=DECISIONS, data=RAW_PARQUET_DIR,
-              patient_fraction=SMOKE_PATIENT_FRACTION if SMOKE else None)
+              patient_fraction=FRACTION)
+# Artifacts: about 70 GB for all patients (float32 matrices ~31 GB, models and their calibrated
+# copies, SMOTE cache). The container disk of the pod is 5 GB: run from the volume.
+_need_gb = MIN_FREE_DISK_GB if MIN_FREE_DISK_GB is not None else 70 * (FRACTION or 1.0) + 2
+check_free_disk(RUN.dir, _need_gb)
 """)
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -159,7 +170,7 @@ code_stage("prep", """\
 # Paths come from the module and follow SMART_PLAN_DATA (default: ./data), so
 # this notebook runs unchanged wherever the dataset lives.
 print(f"Data root: {DATA_DIR}")
-data = load_raw_data(RAW_PARQUET_DIR, patient_fraction=SMOKE_PATIENT_FRACTION if SMOKE else None,
+data = load_raw_data(RAW_PARQUET_DIR, patient_fraction=FRACTION,
                      key=f"smoke{RANDOM_STATE}")
 print(f"Raw shape: {data.shape}")
 data.info(memory_usage="deep")
@@ -409,16 +420,20 @@ code("""\\
 # ── 4.0 Training settings ───────────────────────────────────────────────────
 TRAIN_CFG_NOSHOW = TrainingConfig(
     models=["RandomForest", "XGBoost", "AdaBoost", "ANN"],
-    search="halving", n_candidates=12, halving_factor=3,
-    min_resources=500_000,        # fit rows of the first halving iteration
+    search="halving",
+    halving_iterations=3,         # successive halving: 3 iterations ...
+    last_candidates=2,            # ... ending with 2 finalists compared on all of fit
+    min_resources=500_000,        # fit rows of the first iteration (audit 1.3)
     max_resources=None,           # None: all of fit at the last iteration
+    memory_safety=0.6,            # search processes capped to 60 % of the available memory
     smote_sampling_strategy=0.1, smote_k_neighbors=5,
     adaboost_max_estimators=400, adaboost_learning_rates=(0.5, 1.0),
     threshold_metric="youden", n_jobs=N_JOBS, verbose=1, random_state=RANDOM_STATE,
+    smote_cache_dir=os.path.join(RUN.dir, "smote_cache"),   # memoised SMOTE (identical results)
 )
 if SMOKE:   # minimal budgets: the smoke run checks that the code runs, not the results
     TRAIN_CFG_NOSHOW = TRAIN_CFG_NOSHOW.replace(
-        n_candidates=4, min_resources=20_000, adaboost_max_estimators=40,
+        min_resources=20_000, adaboost_max_estimators=40,
         param_grids={"RandomForest": {"n_estimators": [100], "max_depth": [8, 12]},
                      "XGBoost": {"n_estimators": [100]}},
         base_params={"ANN": {"max_iter": 20}})
@@ -627,10 +642,10 @@ HOLDOUT_SCORES = pd.DataFrame({"q_i": scored_inference["q_i"], "group_pred": sco
                                "group_actual": grp_inf_actual, "no_show": y_inf_ns})
 # ── 7.2 Export the ILP parameters (run directory; versioned file for a full run)
 _paths = [os.path.join(RUN_RESULTS_DIR, "plne_parameters.json")]
-if not SMOKE:
+if FULL_RUN:
     _paths.append(os.path.join(INFERENCE_DIR, "plne_parameters.json"))
 PLNE_PARAMS = export_plne_parameters(_paths, DURATION_GROUPS, HOLDOUT_SCORES, n_train=len(y_ns),
-                                     source_run=f"run_{RUN_ID}", smoke=SMOKE, slot_lengths=SLOT_LENGTHS)
+                                     source_run=f"run_{RUN_ID}", smoke=not FULL_RUN, slot_lengths=SLOT_LENGTHS)
 export_holdout_scores(os.path.join(RUN_RESULTS_DIR, "holdout_scores.parquet"), HOLDOUT_SCORES)
 # ── 7.3 One real ILP day from holdout patients ──────────────────────────────
 _day = scored_inference.sample(n=min(30, len(scored_inference)), random_state=RANDOM_STATE)
