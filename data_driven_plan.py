@@ -2707,6 +2707,178 @@ def solve_ilp(inst: Instance, cfg: Optional[Config] = None) -> Solution:
                     options=options)
 
 
+def eval_slot_exact(pats: Sequence[int], q: np.ndarray, s: np.ndarray, L: float,
+                    spt: bool = True) -> tuple:
+    """Expected (idle, wait, overtime) of one slot, in minutes, by enumerating the
+    2^k show/no-show scenarios of its k patients, served in SPT order (or in the
+    order given when spt=False, used to test the SPT dominance).
+
+    This is the slot-separable evaluation the ILP coefficients encode: every slot
+    starts on time and nothing carries over to the next one. Unweighted by costs.
+    """
+    pats = list(pats)
+    k = len(pats)
+    e_idle = e_wait = e_ot = 0.0
+    for mask in range(1 << k):
+        prob = 1.0
+        present = []
+        for b, i in enumerate(pats):
+            if mask >> b & 1:
+                prob *= q[i]
+                present.append(i)
+            else:
+                prob *= 1.0 - q[i]
+        clock = wait = 0.0
+        for i in (sorted(present, key=lambda i: s[i]) if spt else present):
+            wait += clock
+            clock += s[i]
+        e_idle += prob * max(0.0, L - clock)
+        e_wait += prob * wait
+        e_ot += prob * max(0.0, clock - L)
+    return e_idle, e_wait, e_ot
+
+
+#: Largest number of patients of one day enumerated by `eval_day_exact` (2^n scenarios).
+MAX_EXACT_DAY_PATIENTS = 22
+
+
+def eval_day_exact(slot_patients: Sequence[Sequence[int]], q: np.ndarray, s: np.ndarray,
+                   L_slots: Sequence[float]) -> tuple:
+    """Expected (idle, wait, overtime) of one day, in minutes, under the dynamics of
+    the Lindley simulator, computed exactly by enumerating the 2^n show patterns.
+
+    Patients arrive at the nominal start of their slot and are served in SPT order
+    within it; a late slot delays the next ones. Idle time is counted before each
+    slot start and after the last patient up to the end of the day (terminal idle,
+    audit P1). Durations are deterministic, so the enumeration is exact.
+
+    Raises:
+        ValueError: if the day has more than MAX_EXACT_DAY_PATIENTS patients.
+    """
+    slots = [sorted(p, key=lambda i: s[i]) for p in slot_patients]
+    pats = [i for p in slots for i in p]
+    if len(pats) > MAX_EXACT_DAY_PATIENTS:
+        raise ValueError(f"{len(pats)} patients: 2^n enumeration capped at {MAX_EXACT_DAY_PATIENTS}")
+    starts = np.concatenate([[0.0], np.cumsum(L_slots[:-1])])
+    day_end = float(sum(L_slots))
+    e_idle = e_wait = e_ot = 0.0
+    for mask in range(1 << len(pats)):
+        show = {i: bool(mask >> b & 1) for b, i in enumerate(pats)}
+        prob = float(np.prod([q[i] if show[i] else 1.0 - q[i] for i in pats]))
+        prev_end = idle = wait = 0.0
+        for t, slot in enumerate(slots):
+            idle += max(0.0, starts[t] - prev_end)
+            clock = max(prev_end, starts[t])
+            for i in slot:
+                if show[i]:
+                    wait += clock - starts[t]
+                    clock += s[i]
+            prev_end = clock
+        idle += max(0.0, day_end - prev_end)
+        e_idle += prob * idle
+        e_wait += prob * wait
+        e_ot += prob * max(0.0, prev_end - day_end)
+    return e_idle, e_wait, e_ot
+
+
+def _lognormal_params(mean: float, cv: float) -> tuple:
+    """(mu, sigma) of the lognormal law with the given mean and coefficient of variation."""
+    sigma2 = np.log(1.0 + cv ** 2)
+    return np.log(mean) - sigma2 / 2.0, np.sqrt(sigma2)
+
+
+def simulate_day(slot_patients: Sequence[Sequence[int]], q: np.ndarray, s: np.ndarray,
+                 L_slots: Sequence[float], M: int, rng: np.random.Generator,
+                 cv: float = 0.0, shows: Optional[np.ndarray] = None,
+                 durations: Optional[np.ndarray] = None) -> tuple:
+    """Vectorised Lindley simulation of one day over M scenarios.
+
+    Same dynamics as `eval_day_exact`, terminal idle included (audit P1). For
+    common random numbers across schedules (audit P3), pass `shows` (bool, shape
+    (M, n)) and `durations` (shape (M, n)) drawn once per instance; they are then
+    indexed by patient, so two schedules of the same patients face the same draws.
+
+    Returns:
+        (idle, wait, ot), three arrays of shape (M,), in minutes.
+    """
+    starts = np.concatenate([[0.0], np.cumsum(L_slots[:-1])])
+    day_end = float(sum(L_slots))
+    idle = np.zeros(M)
+    wait = np.zeros(M)
+    prev_end = np.zeros(M)
+    for t, slot in enumerate(slot_patients):
+        idle += np.maximum(0.0, starts[t] - prev_end)
+        clock = np.maximum(prev_end, starts[t])
+        for i in sorted(slot, key=lambda i: s[i]):
+            show = shows[:, i] if shows is not None else rng.random(M) < q[i]
+            if durations is not None:
+                dur = durations[:, i]
+            elif cv > 0:
+                mu, sig = _lognormal_params(float(s[i]), cv)
+                dur = rng.lognormal(mu, sig, M)
+            else:
+                dur = np.full(M, float(s[i]))
+            wait += show * (clock - starts[t])
+            clock = clock + show * dur
+        prev_end = clock
+    idle += np.maximum(0.0, day_end - prev_end)
+    ot = np.maximum(0.0, prev_end - day_end)
+    return idle, wait, ot
+
+
+def draw_scenarios(inst: "Instance", M: int, rng: np.random.Generator, cv: float = 0.0) -> tuple:
+    """Show indicators and durations of every patient for M scenarios (common random numbers)."""
+    shows = rng.random((M, inst.n)) < inst.q[None, :]
+    if cv > 0:
+        mu, sig = zip(*(_lognormal_params(float(v), cv) for v in inst.s))
+        durations = rng.lognormal(np.array(mu)[None, :], np.array(sig)[None, :], (M, inst.n))
+    else:
+        durations = np.broadcast_to(inst.s[None, :].astype(float), (M, inst.n))
+    return shows, durations
+
+
+def simulate_instance(inst: "Instance", planning: dict, M: int, rng: np.random.Generator,
+                      cv: float = 0.0, scenarios: Optional[tuple] = None) -> np.ndarray:
+    """Weighted cost c_I*idle + c_W*wait + c_O*ot summed over the days, per scenario.
+
+    Returns the (M,) array of scenario costs, so that callers can report a mean,
+    a confidence interval or a paired test. With `scenarios` (from `draw_scenarios`)
+    every schedule of the same instance is evaluated on the same draws.
+    """
+    shows, durations = scenarios if scenarios is not None else (None, None)
+    cost = np.zeros(M)
+    for d in range(inst.D):
+        slot_patients = [planning.get((d, t), []) for t in range(inst.T[d])]
+        idle, wait, ot = simulate_day(slot_patients, inst.q, inst.s, inst.L[d], M, rng, cv,
+                                      shows=shows, durations=durations)
+        cost += inst.c_I * idle + inst.c_W * wait + inst.c_O * ot
+    return cost
+
+
+def evaluate_planning_exact(inst: "Instance", planning: dict, day_dynamics: bool = True) -> dict:
+    """Exact expected cost of a schedule.
+
+    day_dynamics=False: slot-separable evaluation (what the ILP optimises).
+    day_dynamics=True: Lindley day with carry-over and terminal idle (what the
+    simulator estimates), exact by 2^n enumeration per day.
+    """
+    E_idle = E_wait = E_OT = 0.0
+    for d in range(inst.D):
+        if day_dynamics:
+            slot_patients = [planning.get((d, t), []) for t in range(inst.T[d])]
+            ei, ew, eo = eval_day_exact(slot_patients, inst.q, inst.s, inst.L[d])
+        else:
+            ei = ew = eo = 0.0
+            for t in range(inst.T[d]):
+                si, sw, so = eval_slot_exact(planning.get((d, t), []), inst.q, inst.s, inst.L[d][t])
+                ei, ew, eo = ei + si, ew + sw, eo + so
+        E_idle += ei
+        E_wait += ew
+        E_OT += eo
+    return {"E_idle": E_idle, "E_wait": E_wait, "E_OT": E_OT,
+            "Z": inst.c_I * E_idle + inst.c_W * E_wait + inst.c_O * E_OT}
+
+
 def build_instance_from_patients(
     df_scored: pd.DataFrame, T: list[int], L: list[list[float]],
     s_A: float, s_B: float, c_I: float, c_W: float, c_O: float,

@@ -57,6 +57,8 @@ sys.path.insert(0, os.getcwd())
 from data_driven_plan import (
     Instance, Config, Solution, compute_coefficients, solve_ilp, SOLVER_NAME,
     objective_latex, validate_decisions,
+    eval_slot_exact, eval_day_exact, evaluate_planning_exact,
+    simulate_day, simulate_instance, draw_scenarios,
 )
 import pyomo.environ as pyo
 
@@ -126,32 +128,8 @@ md("## 2. Tests d'exactitude\n\n"
 
 code("""\
 # ── 2.1 Ré-énumération Bernoulli (≤ 4 scénarios par créneau) ─────────────────
-def eval_slot_exact(pats, q, s, L, c_I, c_W, c_O):
-    \"\"\"Enumère les 2^k scénarios pour un créneau, retourne (E_idle, E_wait, E_OT).\"\"\"
-    k = len(pats)
-    e_idle = e_wait = e_ot = 0.0
-    for mask in range(1 << k):
-        present = [pats[b] for b in range(k) if mask & (1 << b)]
-        prob = 1.0
-        for b in range(k):
-            prob *= q[pats[b]] if (mask & (1 << b)) else (1 - q[pats[b]])
-        if not present:
-            e_idle += prob * L
-            continue
-        # SPT order
-        present.sort(key=lambda i: s[i])
-        t = 0.0
-        slot_wait = 0.0
-        for i in present:
-            slot_wait += t    # wait = time elapsed since slot start
-            t += s[i]
-        slot_idle = max(0.0, L - t)
-        slot_ot   = max(0.0, t - L)
-        e_idle += prob * slot_idle
-        e_wait += prob * slot_wait
-        e_ot   += prob * slot_ot
-    return e_idle, e_wait, e_ot
-
+# eval_slot_exact (énumération des 2^k scénarios d'un créneau) est importé de
+# data_driven_plan : une seule implémentation pour les tests, les benchmarks et le module.
 def test_bernoulli_enum(inst: Instance, sol: Solution, tol=1e-9):
     # Compare E[Idle/Wait/OT] en minutes brutes (formule vs énumération Bernoulli).
     coeffs = sol.coeffs
@@ -159,8 +137,7 @@ def test_bernoulli_enum(inst: Instance, sol: Solution, tol=1e-9):
     err_max = 0.0
     for (d,t), pats in sol.planning.items():
         L = inst.L[d][t]
-        # eval_slot_exact retourne des minutes brutes (non pondérées par c_I/c_W/c_O)
-        ei, ew, eo = eval_slot_exact(pats, inst.q, inst.s, L, inst.c_I, inst.c_W, inst.c_O)
+        ei, ew, eo = eval_slot_exact(pats, inst.q, inst.s, L)   # minutes, non pondérées
         if len(pats) == 1:
             i = pats[0]
             mi = L - a[i,d,t]    # E[Idle] brut
@@ -561,7 +538,7 @@ def solve_b1_single(inst: Instance, cfg: Config = None) -> Solution:
     E_idle=E_wait=E_OT=0.0
     for (d,t), pats in planning.items():
         L=inst.L[d][t]
-        ei,ew,eo = eval_slot_exact(pats, inst.q, inst.s, L, inst.c_I, inst.c_W, inst.c_O)
+        ei,ew,eo = eval_slot_exact(pats, inst.q, inst.s, L)
         E_idle+=inst.c_I*ei; E_wait+=inst.c_W*ew; E_OT+=inst.c_O*eo
     # Créneaux vides
     for (d,t) in slots:
@@ -625,7 +602,7 @@ def solve_b2_fluid(inst: Instance, cfg: Config = None) -> Solution:
     E_idle=E_wait=E_OT=0.0
     for (d,t), pats in planning.items():
         L=inst.L[d][t]
-        ei,ew,eo = eval_slot_exact(pats, inst.q, inst.s, L, inst.c_I, inst.c_W, inst.c_O)
+        ei,ew,eo = eval_slot_exact(pats, inst.q, inst.s, L)
         E_idle+=inst.c_I*ei; E_wait+=inst.c_W*ew; E_OT+=inst.c_O*eo
     for (d,t) in slots:
         if (d,t) not in planning: E_idle += inst.c_I*inst.L[d][t]
@@ -692,7 +669,7 @@ def solve_b3_greedy(inst: Instance) -> Solution:
     E_idle=E_wait=E_OT=0.0
     for (d,t), pats in planning.items():
         L=inst.L[d][t]
-        ei,ew,eo = eval_slot_exact(pats, inst.q, inst.s, L, inst.c_I, inst.c_W, inst.c_O)
+        ei,ew,eo = eval_slot_exact(pats, inst.q, inst.s, L)
         E_idle+=inst.c_I*ei; E_wait+=inst.c_W*ew; E_OT+=inst.c_O*eo
     for (d,t) in slots:
         if (d,t) not in planning: E_idle += inst.c_I*inst.L[d][t]
@@ -754,7 +731,7 @@ def solve_b4_valenzuela(inst: Instance, Q_cap=1.2, cfg: Config = None) -> Soluti
     E_idle=E_wait=E_OT=0.0
     for (d,t), pats in planning.items():
         L=inst.L[d][t]
-        ei,ew,eo = eval_slot_exact(pats, inst.q, inst.s, L, inst.c_I, inst.c_W, inst.c_O)
+        ei,ew,eo = eval_slot_exact(pats, inst.q, inst.s, L)
         E_idle+=inst.c_I*ei; E_wait+=inst.c_W*ew; E_OT+=inst.c_O*eo
     for (d,t) in slots:
         if (d,t) not in planning: E_idle += inst.c_I*inst.L[d][t]
@@ -823,76 +800,33 @@ md("## 6. Simulation hors-échantillon, Dynamique séquentielle (Lindley)\n\n"
    "illustratif). Réduire davantage si le budget est dépassé.")
 
 code("""\
-# ── 6.1 Simulateur Lindley vectorisé (numpy) ──────────────────────────────────
-def _ln_params(mean, cv):
-    \"\"\"Paramètres (mu, sigma) lognormale de moyenne mean et CV cv.\"\"\"
-    var = (cv * mean)**2
-    sigma2 = np.log(1 + var / mean**2)
-    mu = np.log(mean) - sigma2 / 2
-    return mu, np.sqrt(sigma2)
-
-def simulate_day(slot_patients: list, q: np.ndarray, s: np.ndarray,
-                 L_slots: list, M: int, rng, cv: float = 0.0) -> tuple:
-    \"\"\"
-    Lindley intra-journée vectorisé.
-    slot_patients : list[list[int]] de longueur T (SPT order).
-    Retourne (idle[M], wait[M], ot[M]) en minutes.
-    \"\"\"
-    T = len(L_slots)
-    nominal_starts = np.concatenate([[0.0], np.cumsum(L_slots[:-1])])
-    day_end = float(sum(L_slots))
-
-    idle = np.zeros(M)
-    wait = np.zeros(M)
-    prev_end = np.zeros(M)
-
-    for t in range(T):
-        ns = nominal_starts[t]
-        # Idle : serveur attend si arrivée en avance
-        idle += np.maximum(0.0, ns - prev_end)
-        # Début réel du service
-        t_svc = np.maximum(prev_end, ns)
-
-        for i in slot_patients[t]:
-            shows = rng.random(M) < q[i]
-            if cv > 0:
-                mu, sig = _ln_params(float(s[i]), cv)
-                dur = rng.lognormal(mu, sig, M)
-            else:
-                dur = np.full(M, float(s[i]))
-            # Attente : t_svc - ns (arrivée au début nominal du créneau)
-            wait += shows * (t_svc - ns)
-            t_svc = t_svc + shows * dur
-
-        prev_end = t_svc
-
-    ot = np.maximum(0.0, prev_end - day_end)
-    return idle, wait, ot
-
-def simulate_instance(inst: Instance, planning: dict, M: int, rng, cv: float = 0.0):
-    \"\"\"Simule tous les jours, retourne coût moyen simulé.\"\"\"
-    total_idle = total_wait = total_ot = 0.0
-    for d in range(inst.D):
-        slot_patients = [planning.get((d,t), []) for t in range(inst.T[d])]
-        L_slots = inst.L[d]
-        idle, wait, ot = simulate_day(slot_patients, inst.q, inst.s, L_slots, M, rng, cv)
-        total_idle += idle.mean()
-        total_wait += wait.mean()
-        total_ot   += ot.mean()
-    return inst.c_I*total_idle + inst.c_W*total_wait + inst.c_O*total_ot
+# ── 6.1 Simulateur Lindley (data_driven_plan.simulate_day / simulate_instance) ─
+# Correction P1 : le simulateur compte désormais l'idle terminal, entre la fin du
+# dernier patient et la fin de la journée ; sans lui, une journée qui finit tôt
+# paraissait gratuite. simulate_instance renvoie le coût de chacun des M scénarios
+# (moyenne, IC et tests appariés possibles) ; eval_day_exact donne la même
+# espérance exactement, par énumération des 2^n profils de présence d'une journée.
+print("simulate_day, simulate_instance, eval_day_exact importés de data_driven_plan")
 """)
 
 code("""\
-# ── 6.2 Validation sur l'exemple illustratif (M=10 000) ──────────────────────
-_rng6 = np.random.default_rng(42)
-_M_ILLUS = 10_000
-_sim_Z3 = simulate_instance(_inst3, _sol3.planning, _M_ILLUS, _rng6, cv=0.0)
-_model_Z3 = _sol3.E_idle + _sol3.E_wait + _sol3.E_OT
+# ── 6.2 Validation sur l'exemple illustratif ─────────────────────────────────
+# Trois évaluations du même planning optimal :
+#  - modèle      : créneaux indépendants, ce que le PLNE optimise (eval_slot_exact) ;
+#  - jour exact  : dynamique de Lindley avec report et idle terminal, énumération 2^n ;
+#  - simulé      : même dynamique, M scénarios ; doit retrouver le jour exact à 4 erreurs-types près.
+_rng6 = np.random.default_rng(RANDOM_STATE)
+_M_ILLUS = 10_000 if SMOKE else 200_000
+_model_Z3 = evaluate_planning_exact(_inst3, _sol3.planning, day_dynamics=False)["Z"]
+_exact_Z3 = evaluate_planning_exact(_inst3, _sol3.planning, day_dynamics=True)["Z"]
+_sim3 = simulate_instance(_inst3, _sol3.planning, _M_ILLUS, _rng6, cv=0.0)
+_se3 = _sim3.std(ddof=1) / np.sqrt(_M_ILLUS)
 print(f"Exemple illustratif (M={_M_ILLUS:,}) :")
-print(f"  Coût modèle  : {_model_Z3:.4f}")
-print(f"  Coût simulé  : {_sim_Z3:.4f}")
-print(f"  Écart %       : {100*(_sim_Z3/_model_Z3-1):.2f}%")
-print("(écart = erreur d'indépendance des créneaux, doit être faible)")
+print(f"  Coût modèle (créneaux indépendants) : {_model_Z3:.4f}")
+print(f"  Coût exact de la journée (Lindley)   : {_exact_Z3:.4f}")
+print(f"  Coût simulé                          : {_sim3.mean():.4f} ± {1.96*_se3:.4f} (IC 95 %)")
+assert abs(_sim3.mean() - _exact_Z3) < 4 * _se3, "simulateur et évaluation exacte divergent"
+print(f"  Écart jour/modèle : {100*(_exact_Z3/_model_Z3-1):+.2f} % (erreur de l'hypothèse d'indépendance A6)")
 """)
 
 code("""\
@@ -904,9 +838,9 @@ def _sim_cell(cell):
     inst = generate_instance(**{k:v for k,v in cell.items() if k not in ("label",)})
     sol  = solve_ilp(inst, Config(time_limit=60.0))
     Z_model = sol.E_idle + sol.E_wait + sol.E_OT
-    Z_sim   = simulate_instance(inst, sol.planning, M_DOE_SIM, rng, cv=0.0)
-    Z_sim_ln3 = simulate_instance(inst, sol.planning, M_DOE_SIM, rng, cv=0.3)
-    Z_sim_ln5 = simulate_instance(inst, sol.planning, M_DOE_SIM, rng, cv=0.5)
+    Z_sim   = simulate_instance(inst, sol.planning, M_DOE_SIM, rng, cv=0.0).mean()
+    Z_sim_ln3 = simulate_instance(inst, sol.planning, M_DOE_SIM, rng, cv=0.3).mean()
+    Z_sim_ln5 = simulate_instance(inst, sol.planning, M_DOE_SIM, rng, cv=0.5).mean()
     gap_pct   = 100*(Z_sim/Z_model - 1) if Z_model > 1e-9 else 0.0
     return {
         "label": cell["label"], "seed": cell["seed"],
@@ -995,12 +929,12 @@ def _miscal_cell(seed, eps):
 
     # Évaluer sous q vrai
     rng = np.random.default_rng(seed+77777)
-    Z_sim_true = simulate_instance(inst_true, sol_hat.planning, 1000, rng)
+    Z_sim_true = simulate_instance(inst_true, sol_hat.planning, 1000, rng).mean()
 
     # Référence : solution optimale avec q vrai
     sol_true = solve_ilp(inst_true)
     rng2 = np.random.default_rng(seed+88888)
-    Z_sim_opt  = simulate_instance(inst_true, sol_true.planning, 1000, rng2)
+    Z_sim_opt  = simulate_instance(inst_true, sol_true.planning, 1000, rng2).mean()
 
     deg = 100*(Z_sim_true/Z_sim_opt - 1) if Z_sim_opt > 1e-9 else 0.0
     return {"seed": seed, "eps": eps, "Z_miscal": Z_sim_true,
@@ -1025,10 +959,10 @@ def _noise_cell(seed, sigma=0.05):
                         c_I=inst_true.c_I, c_W=inst_true.c_W, c_O=inst_true.c_O)
     sol_hat = solve_ilp(inst_hat)
     rng2 = np.random.default_rng(seed+22222)
-    Z_sim = simulate_instance(inst_true, sol_hat.planning, 1000, rng2)
+    Z_sim = simulate_instance(inst_true, sol_hat.planning, 1000, rng2).mean()
     sol_opt = solve_ilp(inst_true)
     rng3 = np.random.default_rng(seed+33333)
-    Z_opt = simulate_instance(inst_true, sol_opt.planning, 1000, rng3)
+    Z_opt = simulate_instance(inst_true, sol_opt.planning, 1000, rng3).mean()
     return {"seed": seed, "eps": f"N(0,{sigma})", "Z_miscal": Z_sim,
             "Z_opt": Z_opt, "deg_pct": 100*(Z_sim/Z_opt-1) if Z_opt>1e-9 else 0.0}
 
@@ -1056,10 +990,10 @@ def _dur_cell(seed, delta_s):
     sol = solve_ilp(inst_p)
     # Évaluer sous durées vraies
     rng = np.random.default_rng(seed+55)
-    Z_eval = simulate_instance(inst, sol.planning, 1000, rng)  # durées vraies
+    Z_eval = simulate_instance(inst, sol.planning, 1000, rng).mean()  # durées vraies
     sol_opt = solve_ilp(inst)
     rng2 = np.random.default_rng(seed+66)
-    Z_opt = simulate_instance(inst, sol_opt.planning, 1000, rng2)
+    Z_opt = simulate_instance(inst, sol_opt.planning, 1000, rng2).mean()
     return {"seed": seed, "perturb": f"{int(delta_s*100):+d}%",
             "deg_pct": 100*(Z_eval/Z_opt-1) if Z_opt>1e-9 else 0.0}
 
@@ -1075,10 +1009,10 @@ def _misclass_cell(seed, rate):
                       c_I=inst.c_I, c_W=inst.c_W, c_O=inst.c_O)
     sol = solve_ilp(inst_p)
     rng2 = np.random.default_rng(seed+222)
-    Z_eval = simulate_instance(inst, sol.planning, 1000, rng2)
+    Z_eval = simulate_instance(inst, sol.planning, 1000, rng2).mean()
     sol_opt = solve_ilp(inst)
     rng3 = np.random.default_rng(seed+333)
-    Z_opt  = simulate_instance(inst, sol_opt.planning, 1000, rng3)
+    Z_opt  = simulate_instance(inst, sol_opt.planning, 1000, rng3).mean()
     return {"seed": seed, "perturb": f"misclass {int(rate*100)}%",
             "deg_pct": 100*(Z_eval/Z_opt-1) if Z_opt>1e-9 else 0.0}
 
