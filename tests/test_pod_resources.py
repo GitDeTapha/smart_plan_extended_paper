@@ -97,3 +97,10 @@ def test_available_memory_reads_the_cgroup_limit(tmp_path):
     (tmp_path / "memory.max").write_text(str(8 * 2 ** 30))
     (tmp_path / "memory.current").write_text(str(2 * 2 ** 30))
     assert available_memory(str(tmp_path)) <= 6 * 2 ** 30
+
+
+def test_disk_check_stops_before_writing(tmp_path):
+    from data_driven_plan import check_free_disk
+    assert check_free_disk(str(tmp_path), 0.001) > 0
+    with pytest.raises(RuntimeError, match="volume"):
+        check_free_disk(str(tmp_path), 10 ** 9)

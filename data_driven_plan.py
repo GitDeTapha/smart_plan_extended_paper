@@ -196,6 +196,19 @@ def available_memory(cgroup_root: str = "/sys/fs/cgroup") -> int:
     return max(avail, 0)
 
 
+def check_free_disk(path: str, need_gb: float) -> float:
+    """Stop before a stage writes artifacts the disk cannot hold (the RunPod container
+    disk is 5 GB; the artifacts of a full run take about 70 GB). Returns the free GB."""
+    import shutil
+    os.makedirs(path, exist_ok=True)
+    free_gb = shutil.disk_usage(path).free / 2 ** 30
+    if free_gb < need_gb:
+        raise RuntimeError(f"{free_gb:.1f} GB free under {os.path.abspath(path)}, {need_gb:.0f} GB needed: "
+                           f"run from a volume with enough space (e.g. /workspace on RunPod)")
+    print(f"Disk: {free_gb:.1f} GB free under {os.path.abspath(path)} ({need_gb:.0f} GB needed)")
+    return free_gb
+
+
 def resolve_n_jobs(n_jobs: int) -> int:
     """n_jobs as an explicit count: -1 means every available CPU (see `available_cpus`)."""
     if n_jobs == -1:
@@ -374,6 +387,9 @@ class StageRunner:
     def finish(self, stage: str, **artifacts) -> None:
         d = os.path.join(self.dir, stage)
         os.makedirs(d, exist_ok=True)
+        big = sum(v.nbytes for v in artifacts.values() if isinstance(v, np.ndarray) and v.ndim == 2)
+        if big:
+            check_free_disk(d, 1.1 * big / 2 ** 30 + 1)
         small = {}
         for k, v in artifacts.items():
             if isinstance(v, np.ndarray) and v.ndim == 2:
