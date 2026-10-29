@@ -2451,6 +2451,7 @@ class Config:
     mip_gap: float = 1e-6
     threads: int = 1               # one HiGHS thread; parallelism is across instances
     require_optimal: bool = False  # raise instead of returning an unproven incumbent
+    symmetry_breaking: bool = False  # occupancy non-increasing over identical slots of a day
 
 
 @dataclass
@@ -2569,6 +2570,20 @@ def solve_ilp(inst: Instance, cfg: Optional[Config] = None) -> Solution:
         for (d, t) in slots:
             m.C5.add(sum(inst.q[i] * m.x[i, d, t] for i in I) <= inst.Q_bar)
 
+    # Optional symmetry breaking (audit 2.4). Within a day, two slots of the same
+    # length L have identical coefficients (a, o, delta, gamma depend on L only) and
+    # the same capacity, so their contents can be swapped without changing the cost.
+    # Ordering their occupancies (number of patients) non-increasingly along the day
+    # keeps at least one optimal solution and removes the permuted copies. It is
+    # valid only because the cost of a slot does not depend on its position t.
+    m.SB = pyo.ConstraintList()
+    if cfg.symmetry_breaking:
+        for d in range(inst.D):
+            for length in sorted(set(inst.L[d])):
+                same = [t for t in range(inst.T[d]) if inst.L[d][t] == length]
+                for t, t_next in zip(same, same[1:]):
+                    m.SB.add(sum(m.x[i, d, t] for i in I) >= sum(m.x[i, d, t_next] for i in I))
+
     report = solve_model(m, cfg)
     if cfg.require_optimal and not report.proven_optimal:
         raise RuntimeError(f"Optimality not proven: status {report.status}, gap {report.gap:.3e}")
@@ -2630,6 +2645,7 @@ def solve_ilp(inst: Instance, cfg: Optional[Config] = None) -> Solution:
     n_double = sum(1 for v in planning.values() if len(v) == 2)
 
     options = {**report.options, "z_binary": cfg.z_binary, "pruning": cfg.pruning,
+               "symmetry_breaking": cfg.symmetry_breaking, "n_symmetry_cuts": len(m.SB),
                "fractional_z": n_fractional}
     return Solution(planning=planning, E_idle=E_idle, E_wait=E_wait, E_OT=E_OT,
                     Z_reduced=Z_reduced, Z_complete=Z_complete, solve_time=report.solve_time, gap=gap,
