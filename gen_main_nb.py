@@ -58,13 +58,15 @@ md("# data_driven_plan, Cluster-Predict-Schedule pipeline\n\n"
    "A single CRISP-DM pipeline. All utility functions live in "
    "`data_driven_plan.py`, this notebook holds only the orchestration, the "
    "narrative and the outputs.\n\n"
-   "**Previously validated results, reproduced identically:** K=2 "
-   "(service_time clustering, bootstrapped silhouette), cutoff ~38.5 min "
-   "(decision tree), XGBoost as best no-show classifier.")
+   "**Changes since run_20260926_2002 (audit of 27/09):** duration groups by exact "
+   "K-medians on the training durations (the cutoff moves from about 38.5 to about "
+   "21.5 min), fit / valid / calib split inside the training set, calibration and "
+   "thresholds chosen outside the test set, ILP parameters exported with their "
+   "provenance. See reports/fixes_*.md.")
 
 code("""\
 # ── Configuration and reproducibility ─────────────────────────────────────────
-import sys, platform, warnings
+import json, os, sys, platform, warnings
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -91,6 +93,7 @@ SLOT_LENGTHS    = (30, 60)      # B4: s_A <= max(SLOT_LENGTHS) is asserted, the 
 SPLIT_MODE      = "stratified"  # "patient_group" for the ablation
 RANDOM_STATE    = 0
 SMOKE           = False         # True: 1% of the patients, minimal budgets
+RUN_ID          = None          # None: timestamp of the run; artifacts under models/ and results/run_<RUN_ID>/
 """)
 
 code("""\
@@ -98,7 +101,11 @@ code("""\
 DECISIONS = validate_decisions(DURATION_METHOD, DURATION_STAT, C_O_BASE, SLOT_LENGTHS,
                                SPLIT_MODE, RANDOM_STATE, SMOKE)
 np.random.seed(RANDOM_STATE)
-for k, v in DECISIONS.items():
+import time as _time
+RUN_ID = RUN_ID or _time.strftime("%Y%m%d_%H%M")
+RUN_RESULTS_DIR = os.path.join(RESULTS_DIR, f"run_{RUN_ID}")
+os.makedirs(RUN_RESULTS_DIR, exist_ok=True)
+for k, v in {**DECISIONS, "RUN_ID": RUN_ID}.items():
     print(f"{k:<16} {v}")
 """)
 
@@ -547,53 +554,58 @@ record_training_run("no-show: reference config", results_noshow, TRAIN_CFG_NOSHO
                     notes="grid / roc_auc / SMOTE / f1_macro threshold")
 """)
 
-md("### 4b. Service time, clustering then classification\n\n"
-   "**K-means (K=2):** validated by the elbow method (SAE) and the silhouette "
-   "coefficient on a 200k-row sample, confirmed by bootstrap (silhouette "
-   "stability across resamples).\n\n"
-   "The clustering parameters (candidate K, sample size, bootstrap) are "
-   "gathered in the cell below, like the training ones.")
+md("### 4b. Service time, duration groups then classification\n\n"
+   "**Exact K-medians, K = 2, on the training durations only** (audit B3). Service times "
+   "are integer minutes, so the optimal 1-D K-medians partition is found exactly by "
+   "dynamic programming over the distinct values (no initialisation, no randomness). "
+   "The group durations s_A, s_B are the cluster medians. The groups and their cutoff "
+   "are fitted on the training partition and applied unchanged to test and holdout. "
+   "K = 2 is imposed by the ILP (two duration classes); the cost and silhouette for "
+   "K = 2 to 5 are reported for reference. `DURATION_METHOD = \"kmeans\"` runs the "
+   "ablation with the former method.")
 
 code("""\
-# ── 4b. Clustering settings ───────────────────────────────────────────────────
-CLUSTER_KS = [2, 3, 4, 5]     # values of K compared (elbow + silhouette)
-CLUSTER_SAMPLE = 200_000      # rows used to evaluate K
-N_BOOTSTRAP = 10              # resamples validating the silhouette
+# ── 4b. Duration-group settings ─────────────────────────────────────────────
+DURATION_KS = [2, 3, 4, 5]    # values of K reported (cost + silhouette)
+SIL_SAMPLE = 20_000           # durations used for each silhouette
+N_BOOTSTRAP = 10              # bootstrap resamples of the silhouette (local generator)
 BOOTSTRAP_SAMPLE = 10_000     # size of each resample
-KMEANS_N_INIT = 10            # K-means restarts (solution stability)
-FORCE_K = None                # impose K (e.g. 2) instead of the maximum silhouette
 """)
 
 code("""\
-# ── 4b. Selecting K (elbow + silhouette) ──────────────────────────────────────
-sae_results, sil_results, service_time_std, cluster_scaler = evaluate_clustering_ks(
-    df_sample, service_time_col="service_time", candidate_ks=CLUSTER_KS,
-    sample_size=CLUSTER_SAMPLE, random_state=RANDOM_STATE,
-)
-best_k = FORCE_K or max(sil_results, key=sil_results.get)
-print(f"K selected ({'imposed' if FORCE_K else 'maximum silhouette'}): {best_k}")
+# ── 4b. Fit the groups on the training durations, apply them everywhere ─────
+_train_st = train_df["service_time"].to_numpy()
+duration_k_table = evaluate_duration_ks(_train_st, DURATION_KS, method=DURATION_METHOD,
+                                        sil_sample=SIL_SAMPLE, random_state=RANDOM_STATE,
+                                        prefix="servicetime")
+display(duration_k_table)
+DURATION_GROUPS = fit_duration_groups(_train_st, k=2, method=DURATION_METHOD, stat=DURATION_STAT,
+                                      random_state=RANDOM_STATE)
+best_k = 2
+mu_sil, sd_sil = bootstrap_silhouette(_train_st, DURATION_GROUPS, n_bootstrap=N_BOOTSTRAP,
+                                      sample_size=BOOTSTRAP_SAMPLE, random_state=RANDOM_STATE)
+df_sample["group_label"] = DURATION_GROUPS.labels(df_sample["service_time"])
+train_df["group_label"] = df_sample.loc[train_df.index, "group_label"]
+service_time_by_group = DURATION_GROUPS.s_by_group
+label_names = ["A", "B"]
+print(f"Method {DURATION_GROUPS.method} / {DURATION_GROUPS.stat}, fitted on {DURATION_GROUPS.n_train:,} "
+      f"training durations")
+print(f"s_A = {service_time_by_group['A']:g} min, s_B = {service_time_by_group['B']:g} min, "
+      f"cutoff {DURATION_GROUPS.cutoff:g} min, training share of A {DURATION_GROUPS.shares['A']:.4f}")
+print(f"Bootstrapped silhouette (K=2): mean={mu_sil:.4f}, sd={sd_sil:.4f}")
+# Audit B4: a long patient must fit in the longest slot, otherwise stop here
+if service_time_by_group["A"] > max(SLOT_LENGTHS):
+    raise ValueError(f"s_A = {service_time_by_group['A']:g} min exceeds the longest slot "
+                     f"{max(SLOT_LENGTHS)} min: decision required (SLOT_LENGTHS or DURATION_METHOD)")
 """)
 
 code("""\
-# ── 4b. Bootstrap validation + A/B labelling ──────────────────────────────────
-from sklearn.cluster import KMeans as _KMeans
-_labels_full = _KMeans(n_clusters=best_k, random_state=RANDOM_STATE, n_init=KMEANS_N_INIT).fit_predict(service_time_std)
-mu_sil, sd_sil = bootstrap_silhouette(service_time_std, _labels_full,
-                                      n_bootstrap=N_BOOTSTRAP, sample_size=BOOTSTRAP_SAMPLE)
-print(f"Bootstrapped silhouette (K={best_k}): mean={mu_sil:.4f}, sd={sd_sil:.4f}")
-
-df_sample, cluster_profile, label_map, label_names = fit_clustering_and_label(
-    df_sample, best_k, service_time_std, service_time_col="service_time", random_state=RANDOM_STATE,
-)
-service_time_by_group = df_sample.groupby("group_label")["service_time"].mean().to_dict()
-print("Mean service time per group:", service_time_by_group)
-""")
-
-code("""\
-# ── 4b. Interpretable cutoff (decision tree) ─────────────────────────────────
+# ── 4b. Interpretable cutoff (decision tree on the training labels) ─────────
 cluster_tree, primary_cutoff = learn_decision_tree_cutoffs(
-    df_sample, service_time_col="service_time", group_col="group_label", label_names=label_names,
+    train_df, service_time_col="service_time", group_col="group_label", label_names=label_names,
 )
+assert abs(primary_cutoff - DURATION_GROUPS.cutoff) <= 0.5 + 1e-9, \\
+    f"tree root {primary_cutoff} and group cutoff {DURATION_GROUPS.cutoff} disagree"
 """)
 
 md("**Group classifier.** Same training function, hence the same levers: "
@@ -822,6 +834,27 @@ print(f"\\nMean predicted show-up rate (q_i): {scored_inference['q_i'].mean():.3
       f"   |   observed (1-NoShow): {(1 - scored_inference['NoShow_actual']).mean():.3f}")
 print(f"Predicted group distribution:\\n{scored_inference['group'].value_counts()}")
 print(f"Actual group distribution   :\\n{scored_inference['group_label_actual'].value_counts()}")
+""")
+
+code("""\
+# ── 7.2b Export the ILP parameters and the scored holdout ───────────────────
+# plne_parameters.json is the only input of notebooks/01_ilp_validation.ipynb.
+# A smoke run writes it to its run directory only; a full run also writes the
+# versioned data/inference/plne_parameters.json.
+HOLDOUT_SCORES = pd.DataFrame({
+    "q_i": scored_inference["q_i"].to_numpy(),
+    "group_pred": scored_inference["group"].to_numpy(),
+    "group_actual": scored_inference["group_label_actual"].to_numpy(),
+    "no_show": scored_inference["NoShow_actual"].astype(int).to_numpy()})
+_param_paths = [os.path.join(RUN_RESULTS_DIR, "plne_parameters.json")]
+if not SMOKE:
+    _param_paths.append(os.path.join(INFERENCE_DIR, "plne_parameters.json"))
+PLNE_PARAMS = export_plne_parameters(_param_paths, DURATION_GROUPS, HOLDOUT_SCORES,
+                                     n_train=len(train_df), source_run=f"run_{RUN_ID}",
+                                     smoke=SMOKE, slot_lengths=SLOT_LENGTHS)
+export_holdout_scores(os.path.join(RUN_RESULTS_DIR, "holdout_scores.parquet"), HOLDOUT_SCORES)
+print(json.dumps(PLNE_PARAMS, indent=2))
+print("Written:", _param_paths, "and holdout_scores.parquet")
 """)
 
 code("""\

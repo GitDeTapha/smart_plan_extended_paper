@@ -2075,106 +2075,177 @@ def calibrate_and_select(
 
 
 # ============================================================================
-# 6. Service-time clustering (K-means) and classification
+# 6. Service-time groups: exact 1-D K-medians (or K-means for the ablation)
 # ============================================================================
 
-def evaluate_clustering_ks(
-    df: pd.DataFrame, service_time_col: str = "service_time", candidate_ks: Optional[list[int]] = None,
-    sample_size: int = 200_000, random_state: int = RANDOM_STATE,
-) -> tuple[dict, dict, np.ndarray, StandardScaler]:
-    """Evaluate several values of K (SAE elbow method + silhouette coefficient).
+def _segment_costs(x: np.ndarray, W: np.ndarray, S: np.ndarray, a: np.ndarray, b: int):
+    """Weighted L1 cost and weighted median of the segments x[a..b] (a vector, b scalar)."""
+    W0 = np.where(a > 0, W[a - 1], 0.0)
+    S0 = np.where(a > 0, S[a - 1], 0.0)
+    half = W0 + (W[b] - W0) / 2.0
+    m = np.minimum(np.searchsorted(W, half, side="left"), b)
+    m = np.maximum(m, a)
+    xm = x[m]
+    cost = xm * (W[m] - W0) - (S[m] - S0) + (S[b] - S[m]) - xm * (W[b] - W[m])
+    return cost, xm
 
-    Args:
-        df: DataFrame containing `service_time_col`.
-        service_time_col: column to cluster.
-        candidate_ks: values of K to test.
-        sample_size: sample size used to compute the silhouette.
-        random_state: seed.
+
+def kmedians_1d_exact(values: np.ndarray, k: int) -> dict:
+    """Exact K-medians of one-dimensional data (minimum total absolute deviation).
+
+    The optimal clusters of 1-D data are intervals of the sorted values, so a
+    dynamic programme over the U distinct values (weighted by their counts)
+    finds the global optimum in O(K U^2), with no initialisation and no
+    randomness. Service times are integer minutes, so U is small even for tens
+    of millions of rows. Centres are the lower weighted medians of the clusters.
 
     Returns:
-        (sae_per_k, silhouette_per_k, full_standardised_service_time, scaler)
+        dict with `centers` (ascending), `cutoffs` (midpoints between consecutive
+        centres: a value is assigned to the nearest centre), `cost` (sum of
+        absolute deviations) and `sizes` (rows per cluster).
     """
-    if candidate_ks is None:
-        candidate_ks = [2, 3, 4, 5]
+    v = np.asarray(values, dtype=float)
+    if v.size == 0 or not np.all(np.isfinite(v)):
+        raise ValueError("kmedians_1d_exact: empty input or non-finite values")
+    x, w = np.unique(v, return_counts=True)
+    U = x.size
+    if not 1 <= k <= U:
+        raise ValueError(f"k={k} must lie between 1 and the number of distinct values ({U})")
+    w = w.astype(float)
+    W, S = np.cumsum(w), np.cumsum(w * x)
+    D = np.full((k, U), np.inf)
+    arg = np.zeros((k, U), dtype=int)
+    for b in range(U):
+        D[0, b] = _segment_costs(x, W, S, np.array([0]), b)[0][0]
+    for j in range(1, k):
+        for b in range(j, U):
+            a = np.arange(j, b + 1)
+            c, _ = _segment_costs(x, W, S, a, b)
+            tot = D[j - 1, a - 1] + c
+            best = int(np.argmin(tot))
+            D[j, b], arg[j, b] = tot[best], a[best]
+    bounds, b = [], U - 1
+    for j in range(k - 1, -1, -1):
+        a = arg[j, b] if j > 0 else 0
+        bounds.append((a, b))
+        b = a - 1
+    bounds.reverse()
+    centers = np.array([_segment_costs(x, W, S, np.array([a]), b)[1][0] for a, b in bounds])
+    sizes = np.array([W[b] - (W[a - 1] if a > 0 else 0.0) for a, b in bounds])
+    return {"centers": centers, "cutoffs": (centers[:-1] + centers[1:]) / 2.0,
+            "cost": float(D[k - 1, U - 1]), "sizes": sizes}
 
-    values = df[[service_time_col]].astype(float)
-    scaler = StandardScaler()
-    service_time_std = scaler.fit_transform(values)
 
-    sample = df.sample(n=min(sample_size, len(df)), random_state=random_state)
-    sample_std = scaler.transform(sample[[service_time_col]].astype(float))
+@dataclass
+class DurationGroups:
+    """Service-time groups fitted on the training durations only (audit B3).
 
-    sae_results, sil_results = {}, {}
-    print("KMeans clustering")
+    Group "A" is the longest. `labels` applies the training cutoffs to any
+    partition, so that test and holdout never influence the groups.
+    """
+    method: str
+    stat: str
+    centers: np.ndarray        # ascending
+    cutoffs: np.ndarray        # ascending, between consecutive centres
+    s_by_group: dict           # duration used by the ILP for each group (statistic `stat`)
+    shares: dict               # share of training rows per group
+    n_train: int
+
+    @property
+    def names(self) -> list:
+        return ["ABCDE"[i] for i in range(len(self.centers))][::-1]   # ascending centres -> E..A
+
+    def labels(self, values) -> np.ndarray:
+        idx = np.searchsorted(self.cutoffs, np.asarray(values, dtype=float), side="right")
+        return np.asarray(self.names)[idx]
+
+    @property
+    def cutoff(self) -> float:
+        """Boundary between the two longest groups (the A/B cutoff when K = 2)."""
+        return float(self.cutoffs[-1])
+
+
+def fit_duration_groups(values, k: int = 2, method: str = "kmedians", stat: str = "median",
+                        random_state: int = RANDOM_STATE) -> DurationGroups:
+    """Fit K duration groups on training service times.
+
+    method="kmedians": exact 1-D K-medians (`kmedians_1d_exact`), the method of
+    the manuscript; the centres are medians. method="kmeans" (ablation): K-means
+    with 10 restarts on the same values.
+    """
+    v = np.asarray(values, dtype=float)
+    if method == "kmedians":
+        res = kmedians_1d_exact(v, k)
+        centers, cutoffs = res["centers"], res["cutoffs"]
+    elif method == "kmeans":
+        km = KMeans(n_clusters=k, n_init=10, random_state=random_state).fit(v.reshape(-1, 1))
+        centers = np.sort(km.cluster_centers_.ravel())
+        cutoffs = (centers[:-1] + centers[1:]) / 2.0
+    else:
+        raise ValueError(f"unknown duration method {method!r}")
+    groups = DurationGroups(method=method, stat=stat, centers=centers, cutoffs=cutoffs,
+                            s_by_group={}, shares={}, n_train=int(v.size))
+    lab = groups.labels(v)
+    agg = {"median": np.median, "mean": np.mean}[stat]
+    for g in groups.names:
+        sel = v[lab == g]
+        if sel.size == 0:
+            raise ValueError(f"group {g} is empty")
+        groups.s_by_group[g] = float(agg(sel))
+        groups.shares[g] = float(sel.size / v.size)
+    return groups
+
+
+def evaluate_duration_ks(values, candidate_ks=(2, 3, 4, 5), method: str = "kmedians",
+                         sil_sample: int = 20_000, random_state: int = RANDOM_STATE,
+                         prefix: str = "") -> pd.DataFrame:
+    """Within-cluster cost and silhouette for several K, on training durations.
+
+    The cost is the objective of the method (absolute deviations for K-medians,
+    squared deviations for K-means), computed on all values; the silhouette on
+    a sample drawn with a local generator (audit rec. 15).
+    """
+    v = np.asarray(values, dtype=float)
+    rng = np.random.default_rng(random_state)
+    sample = rng.choice(v, size=min(sil_sample, v.size), replace=False)
+    rows = []
     for k in candidate_ks:
-        clusterer = KMeans(n_clusters=k, random_state=random_state, n_init=10)
-        labels = clusterer.fit_predict(sample_std)
-        centers = clusterer.cluster_centers_
-        sae = float(np.sum(np.abs(sample_std - centers[labels])))
-        sil = float(silhouette_score(sample_std, labels))
-        sae_results[k], sil_results[k] = sae, sil
-        print(f"  K={k} | SAE={sae:.2f} | Silhouette={sil:.4f}")
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
-    axes[0].plot(list(sae_results), list(sae_results.values()), "o-", color=PLOT_COLORS[0])
-    axes[0].set_xlabel("K"); axes[0].set_ylabel("SAE")
-    axes[0].grid(alpha=0.4); sns.despine(ax=axes[0])
-    axes[1].plot(list(sil_results), list(sil_results.values()), "o-", color=PLOT_COLORS[2])
-    axes[1].set_xlabel("K"); axes[1].set_ylabel("Silhouette")
-    axes[1].grid(alpha=0.4); sns.despine(ax=axes[1])
-    _savefig("clustering_k_evaluation")
+        g = fit_duration_groups(v, k, method, "median" if method == "kmedians" else "mean", random_state)
+        lab = g.labels(v)
+        centre = dict(zip(g.names, g.centers[::-1]))
+        dev = v - np.vectorize(centre.get)(lab)
+        cost = float(np.abs(dev).sum()) if method == "kmedians" else float((dev ** 2).sum())
+        sil = float(silhouette_score(sample.reshape(-1, 1), g.labels(sample)))
+        rows.append({"K": k, "Cost": cost, "Silhouette": sil,
+                     "Centres (min)": ", ".join(f"{c:g}" for c in g.centers)})
+    table = pd.DataFrame(rows)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), constrained_layout=True)
+    axes[0].plot(table["K"], table["Cost"], "o-", color=PLOT_COLORS[0])
+    axes[0].set_xlabel("Number of groups K")
+    axes[0].set_ylabel("Absolute deviation (min)" if method == "kmedians" else "Squared deviation (min²)")
+    axes[1].plot(table["K"], table["Silhouette"], "o-", color=PLOT_COLORS[2])
+    axes[1].set_xlabel("Number of groups K"); axes[1].set_ylabel("Silhouette coefficient")
+    for ax in axes:
+        ax.grid(alpha=0.4); sns.despine(ax=ax)
+    _savefig("duration_k_evaluation", prefix)
     plt.show()
-    return sae_results, sil_results, service_time_std, scaler
+    return table
 
 
-def bootstrap_silhouette(data: np.ndarray, labels: np.ndarray, n_bootstrap: int = 10, sample_size: int = 10_000) -> tuple[float, float]:
-    """Bootstrap the silhouette coefficient to validate the stability of the
-    selected K.
+def bootstrap_silhouette(values, groups: DurationGroups, n_bootstrap: int = 10,
+                         sample_size: int = 10_000, random_state: int = RANDOM_STATE) -> tuple[float, float]:
+    """Bootstrap of the silhouette of the fitted groups (stability of K).
 
-    Args:
-        data: standardised data.
-        labels: cluster labels.
-        n_bootstrap: number of resamples.
-        sample_size: size of each resample.
-
-    Returns:
-        (mean, standard deviation) of the bootstrapped silhouette.
+    Draws come from a local generator seeded by `random_state` (audit rec. 15:
+    the former version used the global NumPy state).
     """
+    v = np.asarray(values, dtype=float)
+    rng = np.random.default_rng(random_state)
     sils = []
     for _ in range(n_bootstrap):
-        idx = np.random.choice(len(data), size=min(sample_size, len(data)), replace=True)
-        sils.append(silhouette_score(data[idx], labels[idx]))
+        sub = rng.choice(v, size=min(sample_size, v.size), replace=True)
+        sils.append(silhouette_score(sub.reshape(-1, 1), groups.labels(sub)))
     return float(np.mean(sils)), float(np.std(sils))
-
-
-def fit_clustering_and_label(
-    df: pd.DataFrame, best_k: int, service_time_std: np.ndarray, service_time_col: str = "service_time", random_state: int = RANDOM_STATE,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict, list[str]]:
-    """Final clustering and A/B/C labelling by decreasing service time.
-
-    Args:
-        df: DataFrame to enrich (modified in place).
-        best_k: selected number of clusters.
-        service_time_std: standardised service time (same order as df).
-        service_time_col: source column.
-        random_state: seed.
-
-    Returns:
-        (labelled_df, per_cluster_profile, label_map, label_names)
-    """
-    clusterer = KMeans(n_clusters=best_k, random_state=random_state, n_init=10)
-    labels = clusterer.fit_predict(service_time_std)
-    df["cluster"] = labels
-    profile = (df.groupby("cluster")[service_time_col].agg(["count", "mean", "median"])
-               .sort_values("mean", ascending=False))
-    print("\nGroup profile:")
-    print(profile)
-
-    order = profile.index.tolist()
-    label_names = ["A", "B", "C", "D", "E"][:len(order)]
-    label_map = {cluster: label_names[i] for i, cluster in enumerate(order)}
-    df["group_label"] = df["cluster"].map(label_map)
-    return df, profile, label_map, label_names
 
 
 def learn_decision_tree_cutoffs(
@@ -2307,6 +2378,70 @@ def load_artifacts(name_prefix: str = "final") -> dict:
         "cat_encodings": prep["cat_encodings"],
         "feature_cols": prep["feature_cols"],
     }
+
+
+def git_commit() -> str:
+    """Commit of the code that produced an artifact, "-dirty" if the tree has changes.
+
+    SMART_PLAN_COMMIT overrides it (e.g. a pod running from an exported archive).
+    Raises rather than writing an artifact without provenance.
+    """
+    if os.environ.get("SMART_PLAN_COMMIT"):
+        return os.environ["SMART_PLAN_COMMIT"]
+    import subprocess
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                              check=True).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"],
+                               capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("cannot read the git commit; set SMART_PLAN_COMMIT") from exc
+    return head + ("-dirty" if dirty else "")
+
+
+def export_plne_parameters(paths: Sequence[str], groups: DurationGroups, scores: pd.DataFrame,
+                           n_train: int, source_run: str, smoke: bool,
+                           slot_lengths: Sequence[float]) -> dict:
+    """Write plne_parameters.json (schema 2), the only input of the ILP campaign.
+
+    Args:
+        paths: files to write (the run directory, plus the versioned
+            data/inference/plne_parameters.json for a production run).
+        groups: duration groups fitted on the training durations.
+        scores: scored holdout with q_i, group_pred, group_actual, no_show.
+        n_train: training rows the groups were fitted on.
+
+    The dictionary is validated with `check_plne_parameters` before writing, so
+    a run whose durations leave the model's domain (s_A > longest slot) stops
+    here instead of feeding the campaign.
+    """
+    if len(groups.centers) != 2:
+        raise ValueError("the ILP uses two duration groups: K must be 2")
+    P = {"schema_version": PLNE_SCHEMA_VERSION, "duration_method": groups.method,
+         "duration_stat": groups.stat, "cutoff_minutes": groups.cutoff,
+         "s_A": groups.s_by_group["A"], "s_B": groups.s_by_group["B"],
+         "pi_A_actual": float((scores["group_actual"] == "A").mean()),
+         "pi_A_predicted": float((scores["group_pred"] == "A").mean()),
+         "noshow_rate": float(scores["no_show"].mean()),
+         "group_error_rate": float((scores["group_pred"] != scores["group_actual"]).mean()),
+         "n_train": int(n_train), "n_holdout": int(len(scores)),
+         "created": pd.Timestamp.now().isoformat(timespec="seconds"),
+         "git_commit": git_commit(), "source_run": source_run, "smoke": bool(smoke)}
+    check_plne_parameters(P, slot_lengths)
+    for path in paths:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(P, fh, indent=2)
+            fh.write("\n")
+    return P
+
+
+def export_holdout_scores(path: str, scores: pd.DataFrame) -> None:
+    """Patient-level holdout scores for the ILP campaign (never versioned)."""
+    from ilp_campaign import HOLDOUT_COLUMNS, check_holdout_scores
+    check_holdout_scores(scores)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    scores[list(HOLDOUT_COLUMNS)].reset_index(drop=True).to_parquet(path, index=False)
 
 
 # ============================================================================
