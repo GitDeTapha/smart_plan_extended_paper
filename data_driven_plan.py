@@ -149,6 +149,41 @@ def _savefig(name: str, prefix: str = "") -> None:
     plt.savefig(f"{FIGURES_DIR}/{stem}.png", dpi=300, bbox_inches="tight")
 
 
+def available_cpus(cgroup_root: str = "/sys/fs/cgroup") -> int:
+    """CPUs this process may actually use: the affinity mask, capped by the cgroup CPU
+    quota of a container (RunPod: 16 vCPU while the host reports 24 cores / 48 threads).
+
+    os.cpu_count() and psutil report the host; using them in a container
+    oversubscribes the allotted CPUs. A missing cgroup file means no quota.
+    """
+    n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    j = os.path.join
+    quotas = [(j(cgroup_root, "cpu.max"), None),                       # cgroup v2: "<quota> <period>"
+              (j(cgroup_root, "cpu", "cpu.cfs_quota_us"), j(cgroup_root, "cpu", "cpu.cfs_period_us"))]  # v1
+    for path, period_path in quotas:
+        if not os.path.exists(path):
+            continue
+        with open(path) as fh:
+            parts = fh.read().split()
+        if period_path is None:
+            quota, period = parts[0], parts[1]
+        else:
+            with open(period_path) as fh:
+                quota, period = parts[0], fh.read().strip()
+        if quota not in ("max", "-1"):
+            n = min(n, max(1, int(int(quota) // int(period))))
+    return int(n)
+
+
+def resolve_n_jobs(n_jobs: int) -> int:
+    """n_jobs as an explicit count: -1 means every available CPU (see `available_cpus`)."""
+    if n_jobs == -1:
+        return available_cpus()
+    if n_jobs < 1:
+        raise ValueError(f"n_jobs must be -1 or positive, got {n_jobs}")
+    return min(int(n_jobs), available_cpus())
+
+
 def latex_table(df: pd.DataFrame, path: str, caption: str, label: str,
                 decimals: int = 3, index: bool = False) -> str:
     """Write a booktabs LaTeX table with escaped headers and cells (audit rec. 14).
@@ -1264,6 +1299,7 @@ class TrainingConfig:
             raise ValueError(f"threshold_metric={self.threshold_metric!r}, expected among {list(THRESHOLD_METRICS)}")
         if not 0 < self.smote_sampling_strategy <= 0.1:
             raise ValueError("smote_sampling_strategy must lie in (0, 0.1] (audit 1.4)")
+        self.n_jobs = resolve_n_jobs(self.n_jobs)   # explicit count: -1 would mean the host's CPUs
         self.models = tuple(self.models)
 
     def grid_for(self, name: str) -> dict:

@@ -17,7 +17,7 @@ import joblib
 import numpy as np
 import psutil
 
-from data_driven_plan import Config, Instance, evaluate_planning_exact, solve_ilp
+from data_driven_plan import Config, Instance, available_cpus, evaluate_planning_exact, solve_ilp
 
 # ----------------------------------------------------------------------------
 # Attendance probabilities q_i (audit P2)
@@ -136,11 +136,18 @@ def load_holdout_scores(path: str) -> "pd.DataFrame":
 # Campaign configuration (rec. 6)
 # ----------------------------------------------------------------------------
 def physical_cores() -> int:
-    """Number of physical cores; raises rather than guessing when it is unknown."""
-    n = psutil.cpu_count(logical=False)
-    if not n:
-        raise RuntimeError("number of physical cores unknown: set n_workers explicitly")
-    return int(n)
+    """Processes of the campaign: one per physical core actually available (rec. 6).
+
+    In a container the allotted CPUs are hardware threads; their number divided by
+    the threads per core of the host (psutil, logical / physical) gives the cores
+    available. One single-threaded HiGHS per core keeps two solves off the same core,
+    so the reported solve times are not inflated by contention between siblings.
+    """
+    logical, physical = psutil.cpu_count(logical=True), psutil.cpu_count(logical=False)
+    if not logical or not physical:
+        raise RuntimeError("number of cores unknown: set n_workers explicitly")
+    threads_per_core = max(1, logical // physical)
+    return max(1, available_cpus() // threads_per_core)
 
 
 @dataclass(frozen=True)
