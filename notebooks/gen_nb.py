@@ -201,43 +201,53 @@ test_montecarlo()
 """)
 
 code("""\
-# ── 2.3 z binaires vs continus, même objectif (Proposition 1) ───────────────
-def test_z_integrality(n_instances=10, seed=7):
+# ── 2.3 Proposition 1 : z continus et z binaires, même optimum ───────────────
+# Correction P4 : la proposition n'est mise à l'épreuve que si l'optimum contient
+# au moins une paire saturée (delta != 0 ou gamma != 0). Instances construites
+# pour cela : patients de 36 et 30 min dans des créneaux de 60 min (36 + 30 > 60).
+def _saturated_instance(seed):
     rng = np.random.default_rng(seed)
-    print("Test Proposition 1 (z binaire vs continu) :")
+    n = 6
+    s = np.where(np.arange(n) % 2 == 0, 36.0, 30.0)
+    q = rng.uniform(0.6, 0.95, n)
+    return Instance(n=n, D=1, T=[2], L=[[60.0, 60.0]], s=s, q=q, c_I=1.0, c_W=0.5, c_O=C_O_BASE)
+
+def test_z_integrality(n_instances=10):
+    print("Proposition 1 (z continu vs z binaire) sur paires saturées :")
     for k in range(n_instances):
-        n = rng.integers(4, 12)
-        D, slots_per_day = 1, rng.integers(2, 5)
-        L_row = rng.choice([30.0, 60.0], slots_per_day).tolist()
-        s = rng.choice([s_B, s_A], n,
-                       p=[1-pi_A, pi_A]).astype(float)
-        q = rng.uniform(0.4, 0.9, n)
-        inst = Instance(n=int(n), D=D, T=[slots_per_day],
-                        L=[L_row], s=s, q=q, c_I=1.0, c_W=0.5, c_O=C_O_BASE)
-        sol_cont = solve_ilp(inst, Config(z_binary=False))
-        sol_bin  = solve_ilp(inst, Config(z_binary=True))
-        diff = abs(sol_cont.Z_reduced - sol_bin.Z_reduced)
-        print(f"  inst {k:2d}: n={n}, Z_cont={sol_cont.Z_reduced:.4f}, "
-              f"Z_bin={sol_bin.Z_reduced:.4f}, diff={diff:.2e}", end="")
-        assert diff < 1e-4, f"Proposition 1 violée : diff={diff}"
-        print(" ✓")
-    print("Proposition 1 vérifiée sur toutes les instances.")
+        inst = _saturated_instance(k)
+        cont = solve_ilp(inst, Config(z_binary=False, require_optimal=True))
+        binary = solve_ilp(inst, Config(z_binary=True, require_optimal=True))
+        dl, gm = cont.coeffs["delta"], cont.coeffs["gamma"]
+        n_sat = sum(1 for (d, t), p in cont.planning.items() if len(p) == 2
+                    and max(abs(dl[min(p), max(p), d, t]), abs(gm[min(p), max(p), d, t])) > 1e-9)
+        assert n_sat >= 1, f"instance {k} : aucune paire saturée à l'optimum"
+        diff = abs(cont.Z_complete - binary.Z_complete)
+        assert diff < 1e-6 * max(1.0, abs(binary.Z_complete)), f"Proposition 1 violée : diff={diff}"
+        assert cont.options["fractional_z"] == 0
+        print(f"  inst {k}: paires saturées={n_sat}, Z_cont={cont.Z_complete:.6f}, "
+              f"Z_bin={binary.Z_complete:.6f}, diff={diff:.1e}  OK")
+    print("Proposition 1 vérifiée.")
 
 test_z_integrality()
 """)
 
 code("""\
-# ── 2.4 Dominance SPT : w[SPT] ≤ w[tout autre ordre] ─────────────────────────
+# ── 2.4 Dominance SPT par énumération exacte ─────────────────────────────────
+# Correction P4 : l'ancien test comparait q_i q_j min(s) à q_i q_j max(s), une
+# tautologie. On évalue ici le même créneau sous les deux ordres avec eval_slot_exact.
 def test_spt_dominance(n_pairs=500, seed=3):
     rng = np.random.default_rng(seed)
     for _ in range(n_pairs):
-        qi, qj = rng.uniform(0.3, 0.99, 2)
-        si, sj = rng.uniform(5, 80, 2)
-        # SPT order : min(si,sj) first
-        w_spt   = qi * qj * min(si, sj)  # attente du second
-        w_other = qi * qj * max(si, sj)  # ordre inverse
-        assert w_spt <= w_other + 1e-12
-    print(f"✓ Dominance SPT vérifiée sur {n_pairs} paires aléatoires.")
+        q = rng.uniform(0.3, 0.99, 2)
+        s = rng.uniform(5, 80, 2)
+        L = float(rng.choice(SLOT_LENGTHS))
+        long_first = [int(np.argmax(s)), int(np.argmin(s))]
+        spt = eval_slot_exact(long_first, q, s, L, spt=True)
+        lpt = eval_slot_exact(long_first, q, s, L, spt=False)
+        assert spt[1] <= lpt[1] + 1e-12                       # attente
+        assert abs(spt[0] - lpt[0]) < 1e-9 and abs(spt[2] - lpt[2]) < 1e-9  # idle, overtime
+    print(f"Dominance SPT vérifiée sur {n_pairs} paires (attente plus faible, idle et overtime inchangés).")
 
 test_spt_dominance()
 print("\\n=== Tous les tests d'exactitude sont passés ===")
