@@ -1227,6 +1227,56 @@ class BalancedFit(ClassifierMixin, BaseEstimator):
         return self.estimator_.feature_importances_
 
 
+class CachedSMOTE(SMOTE):
+    """SMOTE whose synthetic rows are memoised on disk (pod readiness).
+
+    SMOTE is deterministic given (X, y, parameters, random_state), and the same
+    resampling is requested many times: by the four families refitted on fit +
+    valid, by every candidate of a halving iteration (they share the subsample),
+    by AdaBoost. Its nearest-neighbour search grows with the square of the
+    minority size (about 40 s for 40,000 minority rows in 200 dimensions), so at
+    full scale one call takes hours. The cache key is a BLAKE2b hash of the exact
+    bytes of X and y and of the parameters; on a hit the stored synthetic rows
+    are appended to X exactly as SMOTE appends them, so the output is identical
+    bit for bit (tests/test_pod_resources.py). cache_dir=None disables the cache.
+    """
+    _parameter_constraints = {**SMOTE._parameter_constraints, "cache_dir": [str, None]}
+
+    def __init__(self, *, sampling_strategy="auto", random_state=None, k_neighbors=5, cache_dir=None):
+        super().__init__(sampling_strategy=sampling_strategy, random_state=random_state,
+                         k_neighbors=k_neighbors)
+        self.cache_dir = cache_dir
+
+    def _key(self, X, y) -> str:
+        import hashlib
+        h = hashlib.blake2b(digest_size=20)
+        X = np.ascontiguousarray(X)
+        h.update(str((X.shape, X.dtype.str, self.sampling_strategy, self.random_state,
+                      self.k_neighbors)).encode())
+        h.update(memoryview(X).cast("B"))
+        h.update(np.ascontiguousarray(np.asarray(y)).tobytes())
+        return h.hexdigest()
+
+    def fit_resample(self, X, y, **params):
+        if self.cache_dir is None:
+            return super().fit_resample(X, y, **params)
+        X = np.asarray(X)
+        y = np.asarray(y)
+        path = os.path.join(self.cache_dir, f"smote_{self._key(X, y)}.npz")
+        if os.path.exists(path):
+            with np.load(path) as z:
+                X_new, y_new = z["X_new"], z["y_new"]
+        else:
+            X_res, y_res = super().fit_resample(X, y, **params)
+            X_new, y_new = X_res[len(X):], y_res[len(y):]
+            os.makedirs(self.cache_dir, exist_ok=True)
+            tmp = path + f".{os.getpid()}.tmp.npz"
+            np.savez(tmp, X_new=X_new, y_new=y_new)
+            os.replace(tmp, path)          # atomic: concurrent workers never read a partial file
+            return X_res, y_res
+        return np.vstack([X, X_new.astype(X.dtype, copy=False)]), np.concatenate([y, y_new.astype(y.dtype, copy=False)])
+
+
 def prior_correct(p: np.ndarray, prior: float, train_prior: float = 0.5) -> np.ndarray:
     """Bayes correction of probabilities learnt under a class prior `train_prior`
     back to the true prior `prior` (Saerens et al., 2002). Balanced weighting
@@ -1279,6 +1329,7 @@ class TrainingConfig:
     max_resources: Optional[int] = None
     smote_sampling_strategy: float = 0.1
     smote_k_neighbors: int = 5
+    smote_cache_dir: Optional[str] = None   # memoised SMOTE output (identical results, see CachedSMOTE)
     adaboost_max_estimators: int = 400
     adaboost_learning_rates: tuple = (0.5, 1.0)
     param_grids: dict = field(default_factory=dict)
@@ -1389,8 +1440,9 @@ def make_estimator(name: str, cfg: TrainingConfig, minority_ratio: float,
         raise ValueError(f"Unknown model: {name}")
     steps = []
     if minority_ratio < cfg.smote_sampling_strategy:
-        steps.append(("smote", SMOTE(sampling_strategy=cfg.smote_sampling_strategy,
-                                     k_neighbors=cfg.smote_k_neighbors, random_state=rs)))
+        steps.append(("smote", CachedSMOTE(sampling_strategy=cfg.smote_sampling_strategy,
+                                           k_neighbors=cfg.smote_k_neighbors, random_state=rs,
+                                           cache_dir=cfg.smote_cache_dir)))
     steps.append((PIPE_STEP, clf))
     pipe = ImbPipeline(steps)
     if params:

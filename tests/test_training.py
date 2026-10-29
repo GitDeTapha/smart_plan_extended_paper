@@ -98,3 +98,14 @@ def test_adaboost_tuned_in_a_separate_process(tmp_path):
     same = tune_binary_classifiers(X[:2500], y[:2500], 2000, cfg)
     assert sub["best"]["AdaBoost"] == same["best"]["AdaBoost"]
     assert sub["criterion"]["AdaBoost"] == pytest.approx(same["criterion"]["AdaBoost"])
+
+
+def test_smote_cache_leaves_the_search_unchanged(tmp_path):
+    from data_driven_plan import tune_binary_classifiers
+    X, y = data(3000, prior=0.01)   # positive share about 3 %: SMOTE applies
+    cfg = TrainingConfig(**{**SMALL, "models": ["XGBoost", "AdaBoost"]})
+    plain = tune_binary_classifiers(X[:2500], y[:2500], 2000, cfg)
+    cached = tune_binary_classifiers(X[:2500], y[:2500], 2000, cfg.replace(smote_cache_dir=str(tmp_path)))
+    assert plain["best"] == cached["best"]
+    assert plain["criterion"] == pytest.approx(cached["criterion"])
+    assert list(tmp_path.glob("smote_*.npz"))
