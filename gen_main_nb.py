@@ -94,7 +94,7 @@ params("""\
 # ── Authors' decisions (papermill parameters) ────────────────────────────────
 DURATION_METHOD = "kmedians"    # B3: method of the manuscript; "kmeans" for the ablation
 DURATION_STAT   = "median"      # s_A, s_B = K-medians centroids
-C_O_BASE        = 0.5           # V9: overtime kept (manuscript to update); 0 for the ablation
+C_O_BASE        = 0.0           # V9: no overtime, as in the manuscript (eq. 1, 8, 9); 0.5 for the extension of section 8.5
 SLOT_LENGTHS    = (30, 60)      # B4: s_A <= max(SLOT_LENGTHS) is asserted, the run stops otherwise
 SPLIT_MODE      = "stratified"  # "patient_group" for the ablation
 RANDOM_STATE    = 0

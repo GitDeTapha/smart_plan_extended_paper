@@ -24,7 +24,7 @@ params("""\
 # ── Décisions des auteurs (paramètres papermill) ─────────────────────────────
 DURATION_METHOD = "kmedians"    # B3 ; "kmeans" en ablation
 DURATION_STAT   = "median"      # s_A, s_B = centroïdes K-médianes
-C_O_BASE        = 0.5           # V9 : overtime conservé ; c_O = 0 en ablation
+C_O_BASE        = 0.0           # V9 : pas d'overtime, comme le manuscrit (éq. 1, 8, 9) ; 0,5 pour l'extension §8.5
 SLOT_LENGTHS    = (30, 60)      # B4 : assertion s_A <= max(SLOT_LENGTHS), sinon arrêt
 SPLIT_MODE      = "stratified"  # "patient_group" en ablation
 RANDOM_STATE    = 0
@@ -259,9 +259,11 @@ md("## 3. Exemple illustratif, Table 1\n\n"
    "Instance : n=10, D=1, 4 créneaux (2×30, 2×60 min) ; patients 0 à 2 du groupe A, 3 à 9 du "
    "groupe B ; q=[0,90 ; 0,85 ; … ; 0,45] ; c_I=1, c_W=0,5, c_O=0,5 (coûts de la Table 1 du "
    "manuscrit, fixés ici indépendamment de `C_O_BASE`).\n\n"
-   "Correction rec. 5 : l'exemple ne dépend plus des données. La **table historique** fixe "
-   "$s_A=43$, $s_B=8$ min et doit redonner $Z^\\star = 70{,}82$ (assertion) ; la **table données** "
-   "reprend $s_A$, $s_B$ de `plne_parameters.json`, à titre d'illustration.")
+   "Correction rec. 5 : l'exemple ne dépend plus des données. Variante **publiée** : $s_A=43$, "
+   "$s_B=8$ min, $c_O=0{,}5$ (coûts de la Table 1 du manuscrit), doit redonner $Z^\\star = 70{,}82$. "
+   "Variante **historique** : mêmes durées, $c_O$ = `C_O_BASE` ; avec $c_O = 0$ (modèle du "
+   "manuscrit), $Z^\\star = 65{,}62$, valeur à reporter dans le manuscrit. Variante **données** : "
+   "$s_A$, $s_B$ de `plne_parameters.json`, à titre d'illustration.")
 
 code("""\
 # ── 3.1 Construction et résolution des deux variantes ───────────────────────
@@ -269,23 +271,30 @@ ILLUS_Q = np.array([0.90, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.55, 0.50, 0.45])
 ILLUS_L = [[30.0, 30.0, 60.0, 60.0]]
 ILLUS_GROUPS = np.array(["A"] * 3 + ["B"] * 7)
 
-def illustrative_instance(sA, sB):
+def illustrative_instance(sA, sB, cO):
     return Instance(n=10, D=1, T=[4], L=ILLUS_L, s=np.where(ILLUS_GROUPS == "A", sA, sB),
-                    q=ILLUS_Q, c_I=1.0, c_W=0.5, c_O=0.5)
+                    q=ILLUS_Q, c_I=1.0, c_W=0.5, c_O=cO)
 
+# "publie" : coûts de la Table 1 du manuscrit (c_O = 0,5), contrôle de non-régression de 70,82.
+# "historique" et "donnees" : coût d'overtime C_O_BASE (0 : modèle du manuscrit, sans overtime).
 ILLUS = {}
-for _tag, (_sA, _sB) in {"historique": (43.0, 8.0), "donnees": (s_A, s_B)}.items():
-    _inst = illustrative_instance(_sA, _sB)
+for _tag, (_sA, _sB, _cO) in {"publie": (43.0, 8.0, 0.5), "historique": (43.0, 8.0, C_O_BASE),
+                              "donnees": (s_A, s_B, C_O_BASE)}.items():
+    _inst = illustrative_instance(_sA, _sB, _cO)
     _sol = solve_ilp(_inst, Config(require_optimal=True))
     ILLUS[_tag] = (_inst, _sol)
     print(f"[{_tag}] s_A={_sA:.2f}, s_B={_sB:.2f} : statut {_sol.status}, gap {_sol.gap_complete:.1e}, "
           f"Z* = {_sol.Z_complete:.4f}  (E[Idle]={_sol.E_idle:.3f}, E[Wait]={_sol.E_wait:.3f}, "
           f"E[OT]={_sol.E_OT:.3f}), servis {_sol.n_served}/10, doubles {_sol.n_double}/4")
 
-_Z_hist = ILLUS["historique"][1].Z_complete
-assert abs(_Z_hist - 70.82) < 5e-3, f"Table 1 historique : Z* = {_Z_hist:.4f}, attendu 70,82"
-print("Table 1 historique : Z* = 70,82 retrouvé.")
-# Les sections 3.2 à 6.2 utilisent la variante historique, stable d'un run à l'autre.
+_Z_pub = ILLUS["publie"][1].Z_complete
+assert abs(_Z_pub - 70.82) < 5e-3, f"Table 1 publiée : Z* = {_Z_pub:.4f}, attendu 70,82"
+print("Table 1 publiée (c_O = 0,5) : Z* = 70,82 retrouvé.")
+if C_O_BASE == 0:
+    _Z_hist = ILLUS["historique"][1].Z_complete
+    assert abs(_Z_hist - 65.62) < 5e-3, f"Table 1 sans overtime : Z* = {_Z_hist:.4f}, attendu 65,62"
+    print("Table 1 sans overtime (c_O = 0) : Z* = 65,62, valeur à reporter dans le manuscrit.")
+# Les sections 3.2 à 6.2 utilisent la variante historique (c_O = C_O_BASE).
 _inst3, _sol3 = ILLUS["historique"]
 """)
 

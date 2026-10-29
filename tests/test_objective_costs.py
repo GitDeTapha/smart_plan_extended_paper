@@ -40,3 +40,12 @@ def test_decisions_are_validated():
         validate_decisions("kmedian", "median", 0.5, (30, 60), "stratified", 0, False)
     with pytest.raises(ValueError):
         validate_decisions("kmedians", "mean", 0.5, (30, 60), "stratified", 0, False)
+
+
+def test_table1_without_overtime(illustrative_instance):
+    import dataclasses
+    from data_driven_plan import Config, solve_ilp
+    inst = dataclasses.replace(illustrative_instance, c_O=0.0)
+    sol = solve_ilp(inst, Config(require_optimal=True))
+    assert sol.Z_complete == pytest.approx(65.62, abs=5e-3)     # 70.82 with c_O = 0.5
+    assert sol.E_OT == 0.0
