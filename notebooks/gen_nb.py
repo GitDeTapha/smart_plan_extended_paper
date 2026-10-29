@@ -9,12 +9,27 @@ cells = []
 
 def md(src): cells.append({"cell_type":"markdown","metadata":{},"source":src})
 def code(src): cells.append({"cell_type":"code","execution_count":None,"metadata":{},"outputs":[],"source":src})
+def params(src):
+    """Code cell tagged `parameters`: papermill injects overrides right after it."""
+    cells.append({"cell_type":"code","execution_count":None,"metadata":{"tags":["parameters"]},
+                  "outputs":[],"source":src})
 
 # ── Section 0 ──────────────────────────────────────────────────────────────────
 md("# Notebook 01, Validation numérique du PLNE de rendez-vous ambulatoires\n\n"
    "**Sections 0–7** miroir des sections 11.1–11.4 du manuscrit (COR/EJOR).\n"
    "Toutes les durées sont en **minutes**. Ne pas modifier la formulation ; "
    "toute simplification computationnelle est signalée en tête de section.")
+
+params("""\
+# ── Décisions des auteurs (paramètres papermill) ─────────────────────────────
+DURATION_METHOD = "kmedians"    # B3 ; "kmeans" en ablation
+DURATION_STAT   = "median"      # s_A, s_B = centroïdes K-médianes
+C_O_BASE        = 0.5           # V9 : overtime conservé ; c_O = 0 en ablation
+SLOT_LENGTHS    = (30, 60)      # B4 : assertion s_A <= max(SLOT_LENGTHS), sinon arrêt
+SPLIT_MODE      = "stratified"  # "patient_group" en ablation
+RANDOM_STATE    = 0
+SMOKE           = False         # True : 1 % des données, budgets minimaux
+""")
 
 code("""\
 # ── 0. Environnement ──────────────────────────────────────────────────────────
@@ -40,10 +55,16 @@ import os
 sys.path.insert(0, os.getcwd())
 from data_driven_plan import (
     Instance, Config, Solution, compute_coefficients, solve_ilp, SOLVER_NAME,
+    objective_latex, validate_decisions,
 )
 import pyomo.environ as pyo
 
-RNG_SEED = 42
+DECISIONS = validate_decisions(DURATION_METHOD, DURATION_STAT, C_O_BASE, SLOT_LENGTHS,
+                               SPLIT_MODE, RANDOM_STATE, SMOKE)
+for _k, _v in DECISIONS.items():
+    print(f"{_k:<16} {_v}")
+
+RNG_SEED = RANDOM_STATE
 _RNG = np.random.default_rng(RNG_SEED)
 
 print(f"Python  : {sys.version.split()[0]}")
@@ -268,7 +289,7 @@ def test_z_integrality(n_instances=10, seed=7):
                        p=[1-pi_A, pi_A]).astype(float)
         q = rng.uniform(0.4, 0.9, n)
         inst = Instance(n=int(n), D=D, T=[slots_per_day],
-                        L=[L_row], s=s, q=q)
+                        L=[L_row], s=s, q=q, c_I=1.0, c_W=0.5, c_O=C_O_BASE)
         sol_cont = solve_ilp(inst, Config(z_binary=False))
         sol_bin  = solve_ilp(inst, Config(z_binary=True))
         diff = abs(sol_cont.Z_reduced - sol_bin.Z_reduced)
@@ -387,6 +408,22 @@ if not _df3p.empty:
 print("Tables LaTeX exportées dans tables/")
 """)
 
+# ── Objectif réellement résolu (B5) ─────────────────────────────────────────
+md("### Objectif résolu\n\n"
+   "La cellule suivante écrit, à partir des coûts effectivement passés au solveur, "
+   "l'objectif du PLNE en LaTeX (`tables/objective_solved.tex`). Avec `C_O_BASE = 0` "
+   "on retrouve l'équation (9) du manuscrit ; sinon le terme d'overtime apparaît explicitement.")
+
+code("""\
+_obj_tex = objective_latex(c_I=1.0, c_W=0.5, c_O=C_O_BASE)
+with open("tables/objective_solved.tex", "w", encoding="utf-8") as fh:
+    fh.write("% Objectif du PLNE tel que résolu (c_I=1, c_W=0.5, c_O=C_O_BASE)\\n")
+    fh.write("\\\\begin{equation}\\n" + _obj_tex + "\\n\\\\end{equation}\\n")
+from IPython.display import Math, display
+display(Math(_obj_tex))
+print(_obj_tex)
+""")
+
 # ── Section 4 : Générateur + DOE ─────────────────────────────────────────────
 md("## 4. Générateur d'instances et plan d'expériences\n\n"
    "**⚠ Simplification computationnelle :** S réduit à 20 créneaux (4 jours × 5) "
@@ -400,7 +437,7 @@ L_SHORT, L_LONG = 30.0, 60.0
 S_TOTAL, D_DOE, SLOTS_PER_DAY = 20, 4, 5  # ⚠ réduit (40,5,8)→(20,4,5) budget 45 min
 
 def generate_instance(seed, ratio=1.5, p_bar=0.20, long_share=0.15,
-                       cW_ratio=0.5, c_I=1.0, c_O=0.5,
+                       cW_ratio=0.5, c_I=1.0, c_O=C_O_BASE,
                        s_A_=None, s_B_=None, pi_A_=None,
                        Q_bar=None) -> Instance:
     \"\"\"

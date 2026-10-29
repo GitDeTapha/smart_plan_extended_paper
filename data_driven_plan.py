@@ -150,6 +150,43 @@ def _savefig(name: str, prefix: str = "") -> None:
 print(f"xgboost {__import__('xgboost').__version__} | imbalanced-learn {__import__('imblearn').__version__}")
 
 
+# ----------------------------------------------------------------------------
+# Authors' decisions (declared at the top of both notebooks, papermill-overridable)
+# ----------------------------------------------------------------------------
+ALLOWED_DECISIONS = {
+    "DURATION_METHOD": ("kmedians", "kmeans"),   # kmedians: manuscript; kmeans: ablation
+    "DURATION_STAT": ("median", "mean"),          # centroid statistic giving s_A, s_B
+    "SPLIT_MODE": ("stratified", "patient_group"),
+}
+
+
+def validate_decisions(DURATION_METHOD: str, DURATION_STAT: str, C_O_BASE: float,
+                       SLOT_LENGTHS: Sequence[float], SPLIT_MODE: str, RANDOM_STATE: int,
+                       SMOKE: bool) -> dict:
+    """Check the authors' decisions and return them as a dict for logging.
+
+    Raises:
+        ValueError: on any value outside its allowed set. There is no default to
+            fall back to: a typo must stop the run, not change the method silently.
+    """
+    given = {"DURATION_METHOD": DURATION_METHOD, "DURATION_STAT": DURATION_STAT,
+             "SPLIT_MODE": SPLIT_MODE}
+    for key, value in given.items():
+        if value not in ALLOWED_DECISIONS[key]:
+            raise ValueError(f"{key}={value!r} not in {ALLOWED_DECISIONS[key]}")
+    if DURATION_METHOD == "kmedians" and DURATION_STAT != "median":
+        raise ValueError("K-medians centroids are medians: DURATION_STAT must be 'median'")
+    if C_O_BASE < 0:
+        raise ValueError(f"C_O_BASE must be non-negative, got {C_O_BASE}")
+    slots = tuple(float(v) for v in SLOT_LENGTHS)
+    if not slots or min(slots) <= 0:
+        raise ValueError(f"SLOT_LENGTHS must be positive, got {SLOT_LENGTHS}")
+    if not isinstance(RANDOM_STATE, (int, np.integer)):
+        raise ValueError(f"RANDOM_STATE must be an integer, got {RANDOM_STATE!r}")
+    return {**given, "C_O_BASE": float(C_O_BASE), "SLOT_LENGTHS": slots,
+            "RANDOM_STATE": int(RANDOM_STATE), "SMOKE": bool(SMOKE)}
+
+
 # ============================================================================
 # 1. Generic utilities: I/O, master split, feature preparation
 # ============================================================================
@@ -2356,25 +2393,52 @@ def solve_model(m, cfg: "Config", warm_start: Optional[dict] = None) -> SolveRep
 
 @dataclass
 class Instance:
-    """Instance of the outpatient scheduling problem with overbooking (k<=2)."""
+    """Instance of the outpatient scheduling problem with overbooking (k<=2).
+
+    The three unit costs have no default: every instance states the objective it
+    is solved under. c_O = 0 gives the base model of the manuscript, equations (1)
+    and (8); c_O > 0 adds the expected overtime term of its section 8.5. The former
+    `include_overtime` flag was read nowhere while overtime was always charged
+    (audit B5); it is removed.
+    """
     n: int
     D: int
     T: list
     L: list
     s: np.ndarray
     q: np.ndarray
-    c_I: float = 1.0
-    c_W: float = 0.5
-    c_O: float = 0.5
-    include_overtime: bool = True
+    c_I: float
+    c_W: float
+    c_O: float
     Q_bar: Optional[float] = None
 
     def __post_init__(self):
         self.s = np.asarray(self.s, dtype=float)
         self.q = np.asarray(self.q, dtype=float)
-        assert len(self.s) == self.n
-        assert len(self.q) == self.n
-        assert np.all((self.q > 0) & (self.q < 1)), "q must lie in (0,1)"
+        if len(self.s) != self.n or len(self.q) != self.n:
+            raise ValueError(f"s and q must have n={self.n} entries (got {len(self.s)}, {len(self.q)})")
+        if not np.all((self.q > 0) & (self.q < 1)):
+            raise ValueError("q must lie in the open interval (0, 1)")
+        if min(self.c_I, self.c_W, self.c_O) < 0:
+            raise ValueError(f"unit costs must be non-negative (c_I={self.c_I}, c_W={self.c_W}, c_O={self.c_O})")
+        if len(self.T) != self.D or any(len(self.L[d]) != self.T[d] for d in range(self.D)):
+            raise ValueError("L must list T[d] slot lengths for each of the D days")
+
+
+def objective_latex(c_I: float, c_W: float, c_O: float) -> str:
+    """LaTeX of the objective actually minimised by `solve_ilp` (reduced form).
+
+    The constant c_I * sum_t L_t is dropped, as in equation (9) of the manuscript.
+    With c_O = 0 the expression is exactly equation (9); with c_O > 0 the overtime
+    terms o_it and the correction -delta_ijt appear.
+    """
+    def num(v):
+        return f"{v:g}".replace(".", "{,}")
+    if c_O == 0:
+        return (rf"\min_{{x,z}}\; -{num(c_I)} \sum_{{i,t}} a_{{it}}\, x_{{it}} + \sum_{{(i,j),t}}"
+                rf"\big({num(c_W)}\, w_{{ij}} - {num(c_I)}\, \delta_{{ijt}}\big)\, z_{{ijt}}")
+    return (rf"\min_{{x,z}}\; \sum_{{i,t}} \big({num(c_O)}\, o_{{it}} - {num(c_I)}\, a_{{it}}\big)\, x_{{it}}"
+            rf" + \sum_{{(i,j),t}} \big({num(c_W)}\, w_{{ij}} - {num(c_I + c_O)}\, \delta_{{ijt}}\big)\, z_{{ijt}}")
 
 
 @dataclass
@@ -2576,7 +2640,7 @@ def solve_ilp(inst: Instance, cfg: Optional[Config] = None) -> Solution:
 
 def build_instance_from_patients(
     df_scored: pd.DataFrame, T: list[int], L: list[list[float]],
-    s_A: float, s_B: float, c_I: float = 1.0, c_W: float = 0.5, c_O: float = 0.5,
+    s_A: float, s_B: float, c_I: float, c_W: float, c_O: float,
     group_col: str = "group", q_col: str = "q_i", positive_group: str = "A",
 ) -> Instance:
     """Build an ILP Instance from ACTUALLY predicted patients (never seen during
