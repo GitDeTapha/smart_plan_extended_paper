@@ -30,6 +30,7 @@ SPLIT_MODE      = "stratified"  # "patient_group" en ablation
 RANDOM_STATE    = 0
 SMOKE           = False         # True : 1 % des données, budgets minimaux
 PLNE_PARAMS_PATH = "data/inference/plne_parameters.json"  # exporté par data_driven_plan.ipynb
+HOLDOUT_SCORES_PATH = None  # holdout_scores.parquet du même run (q_i, groupes, no-show) ; requis
 """)
 
 code("""\
@@ -39,10 +40,7 @@ warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.stats import beta as beta_dist
 from scipy.spatial.distance import cdist
 from dataclasses import dataclass, field
 from typing import Optional
@@ -364,50 +362,39 @@ md("## 4. Générateur d'instances et plan d'expériences\n\n"
    "(ratio=1.5, p̄=0.20, long_share=0.15, c_W/c_I=0.50).")
 
 code("""\
-# ── 4.1 Générateur ────────────────────────────────────────────────────────────
+# ── 4.1 Générateur (ilp_campaign.generate_instance) ──────────────────────────
+# Correction P2 : q ~ Beta de moyenne 1 - p̄ et de concentration fixe kappa = 6,111
+# (écart-type 0,15 à la cellule centrale p̄ = 0,20, comme avant), sans le plancher
+# max(., 0.5) qui déplaçait la moyenne (0,844 au lieu de 0,90 à p̄ = 0,10).
+import ilp_campaign as campaign
+from ilp_campaign import BETA_CONCENTRATION, Q_CLIP, check_beta_mean, load_holdout_scores
+
 S_TOTAL, D_DOE, SLOTS_PER_DAY = 20, 4, 5  # ⚠ réduit (40,5,8)→(20,4,5) budget 45 min
 
-def generate_instance(seed, ratio=1.5, p_bar=0.20, long_share=0.15,
-                       cW_ratio=0.5, c_I=1.0, c_O=C_O_BASE,
-                       s_A_=None, s_B_=None, pi_A_=None,
-                       Q_bar=None) -> Instance:
-    \"\"\"
-    ratio  : n/S
-    p_bar  : taux de no-show moyen
-    long_share : fraction de créneaux longs
-    cW_ratio   : c_W / c_I
-    \"\"\"
-    rng = np.random.default_rng(seed)
-    _sA = s_A_ if s_A_ is not None else s_A
-    _sB = s_B_ if s_B_ is not None else s_B
-    _piA = pi_A_ if pi_A_ is not None else pi_A
+def generate_instance(seed, ratio=1.5, p_bar=0.20, long_share=0.15, cW_ratio=0.5,
+                      c_I=1.0, c_O=C_O_BASE, s_A_=None, s_B_=None, pi_A_=None,
+                      Q_bar=None, q_pool=None) -> Instance:
+    return campaign.generate_instance(
+        seed, days=D_DOE, slots_per_day=SLOTS_PER_DAY, slot_lengths=SLOT_LENGTHS,
+        ratio=ratio, p_bar=p_bar, long_share=long_share, cW_ratio=cW_ratio,
+        s_A=s_A if s_A_ is None else s_A_, s_B=s_B if s_B_ is None else s_B_,
+        pi_A=pi_A if pi_A_ is None else pi_A_, c_O=c_O, c_I=c_I, Q_bar=Q_bar, q_pool=q_pool)
+""")
 
-    n = max(1, round(ratio * S_TOTAL))
-    c_W = cW_ratio * c_I
+code("""\
+# ── 4.1b Contrôle de la loi de q à chaque niveau de p̄ (10^5 tirages) ────────
+for _pb in (0.03, 0.10, 0.20, 0.30):
+    _m = check_beta_mean(_pb, n=100_000, seed=RANDOM_STATE)
+    print(f"p̄ = {_pb:.2f} : moyenne empirique de q = {_m:.4f} (attendu {1-_pb:.4f}, |écart| < 0,01)")
+print(f"kappa = {BETA_CONCENTRATION}, q tronqué à {Q_CLIP}")
 
-    # Grille de créneaux : D_DOE jours × SLOTS_PER_DAY
-    T = [SLOTS_PER_DAY] * D_DOE
-    n_long = round(long_share * S_TOTAL)
-    slot_types = rng.permutation(
-        np.array([L_LONG]*n_long + [L_SHORT]*(S_TOTAL-n_long))
-    ).reshape(D_DOE, SLOTS_PER_DAY)
-    L = [slot_types[d].tolist() for d in range(D_DOE)]
-
-    # Patients
-    groups = rng.random(n) < _piA
-    s = np.where(groups, _sA, _sB)
-
-    # q ~ Beta(α, β) de moyenne (1-p_bar) et écart-type 0.15
-    mu_q = 1.0 - p_bar
-    var_q = 0.15**2
-    _a = mu_q * (mu_q*(1-mu_q)/var_q - 1)
-    _b = (1-mu_q) * (mu_q*(1-mu_q)/var_q - 1)
-    _a, _b = max(_a, 0.5), max(_b, 0.5)
-    q = beta_dist.rvs(_a, _b, size=n, random_state=int(seed) % (2**31))
-    q = np.clip(q, 0.05, 0.99)
-
-    return Instance(n=n, D=D_DOE, T=T, L=L, s=s, q=q,
-                    c_I=c_I, c_W=c_W, c_O=c_O, Q_bar=Q_bar)
+# Variante empirique : q_i calibrés du holdout (mêmes grilles et groupes, q rééchantillonnés)
+if HOLDOUT_SCORES_PATH is None:
+    raise ValueError("HOLDOUT_SCORES_PATH requis : holdout_scores.parquet exporté par data_driven_plan.ipynb")
+HOLDOUT = load_holdout_scores(HOLDOUT_SCORES_PATH)
+Q_POOL = HOLDOUT["q_i"].to_numpy()
+print(f"Holdout : {len(HOLDOUT):,} patients, q̄ = {Q_POOL.mean():.4f}, "
+      f"no-show observé = {HOLDOUT['no_show'].mean():.4f}")
 """)
 
 code("""\
@@ -426,10 +413,14 @@ for ratio in [1.0, 1.25, 2.0]:
         DOE_CELLS.append(dict(ratio=ratio, p_bar=0.20, long_share=0.15,
                               cW_ratio=0.50, seed=SEEDS[r], label=f"ratio_{ratio}"))
 # Variations p_bar
-for p_bar in [0.10, 0.30]:
+for p_bar in [0.03, 0.10, 0.30]:
     for r in range(R):
         DOE_CELLS.append(dict(ratio=1.5, p_bar=p_bar, long_share=0.15,
                               cW_ratio=0.50, seed=SEEDS[r], label=f"pbar_{p_bar}"))
+# Variante P2 : q rééchantillonnés parmi les q_i calibrés du holdout
+for r in range(R):
+    DOE_CELLS.append(dict(ratio=1.5, p_bar=float(1 - Q_POOL.mean()), long_share=0.15,
+                          cW_ratio=0.50, seed=SEEDS[r], label="q_empirique", q_pool=Q_POOL))
 # Variations long_share
 for ls in [0.25, 0.50]:
     for r in range(R):

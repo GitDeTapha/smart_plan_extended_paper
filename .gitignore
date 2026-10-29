@@ -11,6 +11,7 @@
 # Main pipeline
 !/data_driven_plan.py
 !/gen_main_nb.py
+!/ilp_campaign.py
 !/data_driven_plan.ipynb
 
 # Published results of a validated run (executed notebook + summary tables)
