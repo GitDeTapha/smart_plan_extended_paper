@@ -328,16 +328,17 @@ for _tag, (_inst, _sol) in ILLUS.items():
 """)
 
 code("""\
-# ── 3.4 Export LaTeX ─────────────────────────────────────────────────────────
+# ── 3.4 Export LaTeX (escaped, booktabs) ────────────────────────────────────
+from data_driven_plan import latex_table
 for _tag, (_df_plan, _df_pairs) in ILLUS_TABLES.items():
     _Z = ILLUS[_tag][1].Z_complete
-    _df_plan.to_latex(f"tables/table1_planning_{_tag}.tex", index=False, float_format="%.3f",
-                      caption=f"Planning illustratif, durées {_tag} ($Z^\\\\star$ = {_Z:.2f}).",
-                      label=f"tab:planning-{_tag}")
+    latex_table(_df_plan, f"tables/table1_planning_{_tag}.tex",
+                caption=f"Planning illustratif, durées {_tag} ($Z^\\\\star$ = {_Z:.2f}).",
+                label=f"tab:planning-{_tag}", decimals=3)
     if len(_df_pairs):
-        _df_pairs.to_latex(f"tables/table1_pairs_{_tag}.tex", index=False, float_format="%.4f",
-                           caption=f"Coefficients des paires doubles à l'optimum, durées {_tag}.",
-                           label=f"tab:pairs-{_tag}")
+        latex_table(_df_pairs, f"tables/table1_pairs_{_tag}.tex",
+                    caption=f"Coefficients des paires doubles à l'optimum, durées {_tag}.",
+                    label=f"tab:pairs-{_tag}", decimals=4)
 print("Tables LaTeX exportées dans tables/")
 """)
 
@@ -435,8 +436,11 @@ _df_doe["occ"] = _df_doe["n_served"] / _df_doe["n"]
 _df_doe["double_rate"] = _df_doe["n_double"] / CC.S
 _df_doe.to_csv("results/doe_ilp.csv", index=False)
 print(f"{len(DOE_SPECS)} PLNE en {_t_doe/60:.1f} min sur {CC.n_workers} processus")
-print(_df_doe.groupby("label")[["Z_complete", "E_idle", "E_wait", "E_OT", "n_served",
-                                "double_rate", "solve_time"]].mean().round(3))
+_doe_summary = _df_doe.groupby("label")[["Z_complete", "E_idle", "E_wait", "E_OT", "n_served",
+                                         "double_rate", "solve_time"]].mean()
+print(_doe_summary.round(3))
+latex_table(_doe_summary.reset_index(), "tables/table_doe.tex",
+            caption=f"Plan d'expériences : moyennes par cellule (R = {R}).", label="tab:doe", decimals=3)
 """)
 
 code("""\
@@ -515,6 +519,9 @@ for _b, (_name, _) in BENCHMARKS.items():
 _df_bench_cmp = pd.DataFrame(_rows)
 print(_df_bench_cmp.round(3).to_string(index=False))
 print(f"PLNE : doubles moyens {_df_bench['ILP_double'].mean():.1f}, coût exact moyen {_df_bench['ILP_Z'].mean():.2f}")
+latex_table(_df_bench_cmp, "tables/table_benchmarks.tex",
+            caption=f"Benchmarks contre le PLNE, cellule centrale, R = {R} graines appariées.",
+            label="tab:benchmarks", decimals=3)
 _beaten = _df_bench_cmp[(_df_bench_cmp["Coût"] == "modèle exact") & (_df_bench_cmp["Bat le PLNE"].str[0] != "0")]
 if len(_beaten):
     print("ATTENTION : une politique bat le PLNE sous son propre coût, donc au moins une "
@@ -692,6 +699,9 @@ for _, r in _sig.iterrows():
 if len(_nsig):
     print("Non significatif (aucune conclusion) : " +
           ", ".join(f"{r['Perturbation']} {r['Niveau']:+g}" for _, r in _nsig.iterrows()))
+latex_table(_df_sens, "tables/table_sensitivity.tex",
+            caption="Regret sous perturbation des entrées (IC à 95 %, tests de Wilcoxon appariés).",
+            label="tab:sensitivity", decimals=4)
 SENS_VERDICT = (f"{len(_sig)}/{len(_df_sens)} perturbations significatives ; regret exact maximal "
                 f"{_df_sens['Regret exact (%)'].max():.2f} %")
 """)
@@ -716,6 +726,8 @@ _thr = _df_thr.groupby("cW_ratio").agg(instances_avec_double=("has_double", "mea
                                        doubles_conformes=("doubles_rule_ok", "mean"))
 print("Statuts :", _df_thr["status"].value_counts().to_dict())
 print(_thr.round(3).to_string())
+latex_table(_thr.reset_index(), "tables/table_threshold_cw.tex",
+            caption="Seuil de double-booking : grille fine de $c_W/c_I$.", label="tab:threshold", decimals=3)
 fig, ax = plt.subplots(figsize=(6.5, 4))
 ax.plot(_thr.index, 100 * _thr["instances_avec_double"], "o-", label="Instances avec au moins un double")
 ax.plot(_thr.index, 100 * _thr["patients_sous_seuil"], "s--", label="Patients avec c_W/c_I < 1/q_i")
@@ -754,6 +766,9 @@ for _ref in ("ILP_oracle", "B1", "B3", "B5"):
                       "p (Wilcoxon)": _ps["p_wilcoxon"]})
 _df_hold_cmp = pd.DataFrame(_rows)
 _df_hold_cmp.to_csv("results/holdout_days_summary.csv", index=False)
+latex_table(_df_hold_cmp, "tables/table_holdout_days.tex",
+            caption="Journées du holdout : écarts appariés au PLNE (IC à 95 %, Wilcoxon).",
+            label="tab:holdout", decimals=3)
 print(_df_hold_cmp.round(3).to_string(index=False))
 """)
 

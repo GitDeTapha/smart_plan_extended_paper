@@ -10,6 +10,7 @@ previously executed cell.
 import hashlib
 import json
 import os
+import textwrap
 
 os.makedirs("figures", exist_ok=True)
 os.makedirs("models", exist_ok=True)
@@ -39,6 +40,11 @@ def md(src):
 def code(src):
     cells.append({"cell_type": "code", "execution_count": None, "id": _cell_id(src),
                   "metadata": {}, "outputs": [], "source": src.splitlines(keepends=True)})
+
+
+def code_stage(stage, src):
+    """Code cell run only when `stage` must be computed (resumable run, audit 1.7)."""
+    code(f'if RUN.compute("{stage}"):\n' + textwrap.indent(src, "    "))
 
 
 def params(src):
@@ -93,7 +99,11 @@ SLOT_LENGTHS    = (30, 60)      # B4: s_A <= max(SLOT_LENGTHS) is asserted, the 
 SPLIT_MODE      = "stratified"  # "patient_group" for the ablation
 RANDOM_STATE    = 0
 SMOKE           = False         # True: 1% of the patients, minimal budgets
-RUN_ID          = None          # None: timestamp of the run; artifacts under models/ and results/run_<RUN_ID>/
+RUN_ID          = None          # None: timestamp; artifacts in models/run_<RUN_ID>/, results/run_<RUN_ID>/
+STAGE           = "all"         # "prep" | "durations" | "tune" | "fit" | "calibrate" | "evaluate" | "export" | "all"
+N_JOBS          = -1            # processes / threads of the searches and of RF, XGBoost (nthread)
+BLAS_THREADS    = 1             # BLAS / OpenMP threads per process (the parallelism is in N_JOBS)
+SMOKE_PATIENT_FRACTION = 0.01   # SMOKE: share of patients kept, by hashed identifier
 """)
 
 code("""\
@@ -105,8 +115,16 @@ import time as _time
 RUN_ID = RUN_ID or _time.strftime("%Y%m%d_%H%M")
 RUN_RESULTS_DIR = os.path.join(RESULTS_DIR, f"run_{RUN_ID}")
 os.makedirs(RUN_RESULTS_DIR, exist_ok=True)
-for k, v in {**DECISIONS, "RUN_ID": RUN_ID}.items():
+from threadpoolctl import threadpool_limits
+# BLAS only: XGBoost's OpenMP threads are set by n_jobs, a global OpenMP cap would override them
+threadpool_limits(limits=BLAS_THREADS, user_api="blas")
+RUN = StageRunner(RUN_ID, target=STAGE)
+for k, v in {**DECISIONS, "RUN_ID": RUN_ID, "STAGE": STAGE, "N_JOBS": N_JOBS,
+             "BLAS_THREADS": BLAS_THREADS}.items():
     print(f"{k:<16} {v}")
+print(f"Status file: {RUN.status_path}")
+RUN.configure("prep", decisions=DECISIONS, data=RAW_PARQUET_DIR,
+              patient_fraction=SMOKE_PATIENT_FRACTION if SMOKE else None)
 """)
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -136,12 +154,13 @@ md("## 2. Data Understanding\n\n"
    "(`dts`/`dtc`), the attendance status (`disp`) and administrative metadata "
    "(facility, clinic stop code, region).")
 
-code("""\
+code_stage("prep", """\
 # ── 2.1 Load the raw data ─────────────────────────────────────────────────────
 # Paths come from the module and follow SMART_PLAN_DATA (default: ./data), so
 # this notebook runs unchanged wherever the dataset lives.
 print(f"Data root: {DATA_DIR}")
-data = pd.read_parquet(RAW_PARQUET_DIR, engine="pyarrow")
+data = load_raw_data(RAW_PARQUET_DIR, patient_fraction=SMOKE_PATIENT_FRACTION if SMOKE else None,
+                     key=f"smoke{RANDOM_STATE}")
 print(f"Raw shape: {data.shape}")
 data.info(memory_usage="deep")
 data.head()
@@ -159,7 +178,7 @@ md("### 2.2 Target description and class imbalance\n\n"
    "`NoShow` already encodes CANCELLED and `discontinued` the third state, so "
    "the COMPLETE/UPDATE category follows from the two.")
 
-code("""\
+code_stage("prep", """\
 # ── 2.2 Target decomposition + class imbalance ───────────────────────────────
 data = decompose_disp_column(data, disp_column="disp")
 plot_target_balance(data, "NoShow", labels={0: "Attended", 1: "No-show"}, prefix="eda")
@@ -176,13 +195,13 @@ md("### 2.3 Exploring the numeric and temporal variables\n\n"
    "start/end) are explored before cleaning, their raw values contain "
    "inconsistencies (dts > dtc) handled in Data Preparation.")
 
-code("""\
+code_stage("prep", """\
 # ── 2.3 Raw numeric distributions ─────────────────────────────────────────────
 plot_numeric_histograms(data, ["dta", "dts", "dtc"], bins=[50, 50, 50],
                         xlims=[(0, 100), (0, 250), (0, 500)], prefix="eda")
 """)
 
-code("""\
+code_stage("prep", """\
 # ── 2.3 (cont.) Missing values ────────────────────────────────────────────────
 missing_pct = display_missing_values(data, sentinel_col="state", sentinel_value="*Missing*")
 print(missing_pct[missing_pct > 0].sort_values(ascending=False))
@@ -194,12 +213,12 @@ md("`AdministrativeFlag` exceeds 55% missing values: reliable imputation is "
    "listwise deletion is preferred to imputation, with no material impact on a "
    "dataset of this size.")
 
-code("""\
+code_stage("prep", """\
 # ── 2.3 (cont.) Outlier diagnostic (IQR), visualisation only ────────────────
 visualize_outliers(data, prefix="eda")
 """)
 
-code("""\
+code_stage("prep", """\
 # ── 2.3 (cont.) Activity patterns (weekday / hour) ───────────────────────────
 _ = analyze_temporal_patterns(data, "activitydatetime", prefix="eda")
 """)
@@ -214,14 +233,14 @@ md("## 3. Data Preparation\n\n"
    "that durably changed waiting times and therefore no-show rates; including "
    "it would bias learning towards an obsolete operating regime.")
 
-code("""\
+code_stage("prep", """\
 # ── 3.1 Temporal filtering + calendar features ────────────────────────────────
 data = filter_dates_after(data, "activitydatetime", "2016-08-30 00:00:00")
 data = add_temporal_features(data, "activitydatetime")
 print(f"Shape after temporal filtering: {data.shape}")
 """)
 
-code("""\
+code_stage("prep", """\
 # ── 3.1 Missing values: column and row removal ───────────────────────────────
 data = drop_high_missing_columns(data, ["AdministrativeFlag"])
 data = drop_missing_rows(data, ["zip", "state"], missing_sentinels={"state": "*Missing*"})
@@ -234,7 +253,7 @@ md("**dts/dtc consistency:** a record whose service end time precedes its "
    "rare `NoShow=1` cases with `dts>dtc` (the patient's absence makes `dtc` "
    "meaningless).")
 
-code("""\
+code_stage("prep", """\
 # ── 3.1 dts/dtc consistency + duplicates + service_time ──────────────────────
 data = filter_dts_dtc_consistency(data, "dts", "dtc", "NoShow")
 data = data.drop_duplicates()
@@ -247,7 +266,7 @@ md("### 3.2 Transformation\n\n"
    "no-show are kept, a stop code with no no-show history carries no "
    "discriminating signal for this task and dilutes the training sample.")
 
-code("""\
+code_stage("prep", """\
 # ── 3.2 Filter out stop codes with no no-show history ────────────────────────
 data, _data_without_ns, _codes_dropped = separate_stopcodes_by_no_show(data)
 print(f"Stop codes excluded (never any no-show): {len(_codes_dropped)}")
@@ -259,14 +278,14 @@ md("**Patient history features:** days since the previous visit (per "
    "service times (per patient), lagged by one rank to exclude any information "
    "leaking from the current visit.")
 
-code("""\
+code_stage("prep", """\
 # ── 3.2 Patient history features ──────────────────────────────────────────────
 data = add_patient_history_features(data, "patientsid", "stopcode", "activitydatetime",
                                     "NoShow", "service_time")
 print(data[["days_between_visits", "prior_noShow_rate", "prior_service_time_avg"]].describe())
 """)
 
-code("""\
+code_stage("prep", """\
 # ── 3.2 Final feature selection + checkpoint ─────────────────────────────────
 # patientsid is kept until the split (SPLIT_MODE="patient_group" needs it) and
 # excluded from the features by prepare_features.
@@ -275,25 +294,6 @@ print(f"Final preprocessed shape: {data.shape}")
 print(f"Columns: {data.columns.tolist()}")
 save_preprocessed_data(data, PREPROCESSED_PATH)
 print(f"Saved -> {PREPROCESSED_PATH}")
-""")
-
-md("### 3.2bis Fast resume point (optional)\n\n"
-   "Section 2 (Data Understanding) and sections 3.1-3.2 (cleaning + feature "
-   "engineering) are expensive on the 40M+ raw rows. If "
-   "the preprocessed Parquet file already exists from a "
-   "previous run, the cell below skips them entirely when resuming: run only "
-   "the configuration cell at the very top, uncomment and run this one, then "
-   "continue normally from section 3.3. On a full run from the raw data, leave "
-   "it commented out (the `data` already in memory is identical).\n\n"
-   "**Parquet rather than CSV:** it preserves the optimised dtypes (category, "
-   "uint32, float32...), a CSV round-trip would restore them as "
-   "object/int64/float64, multiplying the memory footprint of a dataset of "
-   "this size.")
-
-code("""\
-# ── 3.2bis Fast resume: reload the preprocessed data instead of sections 2-3.2 ──
-# data = load_preprocessed_data(PREPROCESSED_PATH)
-# print(f"Preprocessed data reloaded: {data.shape}")
 """)
 
 md("### 3.3 Single partition\n\n"
@@ -310,7 +310,7 @@ md("### 3.3 Single partition\n\n"
    "`SPLIT_MODE = \"patient_group\"` (ablation) keeps every visit of a patient in the same "
    "partition, from a hash of `patientsid`.")
 
-code("""\
+code_stage("prep", """\
 # ── 3.3 Single split (fit / valid / calib / test / ILP holdout) ──────────────
 SPLIT = make_master_split(
     data, train_size=0.70, test_size=0.20, inference_size=0.10, inner_sizes=(0.80, 0.10, 0.10),
@@ -336,7 +336,7 @@ md("**Leakage warning:** `discontinued` (section 2.2) is derived from the same "
    "(section 3.1); `dts`/`dta` are therefore excluded from the features too, "
    "even though they remain in `data` for now.")
 
-code("""\
+code_stage("prep", """\
 # ── 3.3 Encoding + standardisation (fitted on train only) ────────────────────
 X_train, X_test, X_inference, feature_cols, scaler, cat_encodings = prepare_features(
     train_df, test_df, inference_df=df_inference,
@@ -356,6 +356,39 @@ print(f"X_fit {X_fit.shape} | X_valid {X_valid.shape} | X_calib {X_calib.shape}"
 # ═══════════════════════════════════════════════════════════════════════════
 # 4. Modeling
 # ═══════════════════════════════════════════════════════════════════════════
+code_stage("prep", """\
+# ── 3.4 Contiguous float32 matrices, cached once (fit | valid | calib rows) ──
+_XA = np.ascontiguousarray(X_train.to_numpy(dtype=np.float32))
+_XT = np.ascontiguousarray(X_test.to_numpy(dtype=np.float32))
+_XI = np.ascontiguousarray(X_inference.to_numpy(dtype=np.float32))
+del X_train, X_test, X_inference, X_fit, X_valid, X_calib, data
+RUN.finish("prep", XA=_XA, X_test=_XT, X_inf=_XI,
+           y_ns=train_df["NoShow"].to_numpy().astype(int),
+           y_test_ns=test_df["NoShow"].to_numpy().astype(int),
+           y_inf_ns=df_inference["NoShow"].to_numpy().astype(int),
+           st_train=train_df["service_time"].to_numpy(), st_test=test_df["service_time"].to_numpy(),
+           st_inf=df_inference["service_time"].to_numpy(),
+           N_FIT=len(SPLIT.fit), N_VALID=len(SPLIT.valid), split_sizes=SPLIT.sizes(), split_mode=SPLIT.mode,
+           feature_cols=feature_cols, scaler=scaler, cat_encodings=cat_encodings)
+del _XA, _XT, _XI
+""")
+
+code("""\\
+# ── 3.5 Prep artifacts (memory-mapped matrices) ──────────────────────────────
+if RUN.wanted("prep"):
+    PREP = RUN.load("prep")
+    XA, X_test_np, X_inf_np = PREP["XA"], PREP["X_test"], PREP["X_inf"]
+    y_ns, y_test_ns, y_inf_ns = PREP["y_ns"], PREP["y_test_ns"], PREP["y_inf_ns"]
+    N_FIT, N_VALID = PREP["N_FIT"], PREP["N_VALID"]
+    N_FV = N_FIT + N_VALID
+    feature_cols = PREP["feature_cols"]
+    display(PREP["split_sizes"])
+    print(f"XA {XA.shape} | test {X_test_np.shape} | holdout {X_inf_np.shape} | split {PREP['split_mode']}")
+""")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. Modeling
+# ═══════════════════════════════════════════════════════════════════════════
 md("## 4. Modeling\n\n"
    "Two sub-pipelines on the SAME split and features: no-show (4a) and service-time "
    "group (4b). Four families, as in the published study: RandomForest, XGBoost, "
@@ -365,14 +398,14 @@ md("## 4. Modeling\n\n"
    "on fit and scored on valid, with training rows growing from 500,000 to all of fit. "
    "Criterion: log-loss on valid of the probabilities corrected back to the true base rate "
    "(the models are trained on balanced classes). AdaBoost: one fit per learning rate at "
-   "the maximal number of estimators, iterations chosen on valid by `staged_predict_proba`. "
-   "Final model refitted on fit + valid.\n\n"
+   "the maximal number of estimators, iterations chosen on valid by `staged_predict_proba`, "
+   "in a separate process running in parallel. Final model refitted on fit + valid.\n\n"
    "**Imbalance (audit 1.4, as in the first paper: SMOTE with class weighting).** Every "
    "family is a pipeline applying SMOTE at fit time only, up to a minority / majority "
    "ratio of 0.1, then weights balancing the resampled classes (`class_weight` for the "
    "forest, `scale_pos_weight` for XGBoost, `sample_weight` for AdaBoost and the MLP).")
 
-code("""\
+code("""\\
 # ── 4.0 Training settings ───────────────────────────────────────────────────
 TRAIN_CFG_NOSHOW = TrainingConfig(
     models=["RandomForest", "XGBoost", "AdaBoost", "ANN"],
@@ -381,102 +414,119 @@ TRAIN_CFG_NOSHOW = TrainingConfig(
     max_resources=None,           # None: all of fit at the last iteration
     smote_sampling_strategy=0.1, smote_k_neighbors=5,
     adaboost_max_estimators=400, adaboost_learning_rates=(0.5, 1.0),
-    threshold_metric="youden", n_jobs=-1, verbose=1, random_state=RANDOM_STATE,
+    threshold_metric="youden", n_jobs=N_JOBS, verbose=1, random_state=RANDOM_STATE,
 )
 if SMOKE:   # minimal budgets: the smoke run checks that the code runs, not the results
     TRAIN_CFG_NOSHOW = TRAIN_CFG_NOSHOW.replace(
         n_candidates=4, min_resources=20_000, adaboost_max_estimators=40,
+        param_grids={"RandomForest": {"n_estimators": [100], "max_depth": [8, 12]},
+                     "XGBoost": {"n_estimators": [100]}},
         base_params={"ANN": {"max_iter": 20}})
 TRAIN_CFG_GROUP = TRAIN_CFG_NOSHOW.replace()
 display(TRAIN_CFG_NOSHOW.summary())
 """)
 
-code("""\
-# ── 4.0 Contiguous float32 matrices: fit | valid | calib are row slices (views) ─
-XA = np.ascontiguousarray(X_train.to_numpy(dtype=np.float32))
-X_test_np = np.ascontiguousarray(X_test.to_numpy(dtype=np.float32))
-X_inf_np = np.ascontiguousarray(X_inference.to_numpy(dtype=np.float32))
-N_FIT, N_VALID = len(SPLIT.fit), len(SPLIT.valid)
-N_FV = N_FIT + N_VALID
-del X_train, X_fit, X_valid, X_calib
-y_ns = train_df["NoShow"].to_numpy().astype(int)
-y_test_ns = test_df["NoShow"].to_numpy().astype(int)
-print(f"XA {XA.shape} ({XA.nbytes/1e9:.1f} GB) | test {X_test_np.shape} | holdout {X_inf_np.shape}")
-""")
-
-md("### 4a. No-show prediction")
-
-code("""\
-# ── 4a. Tune on fit / valid, refit on fit + valid ──────────────────────────
-noshow_models = train_binary_classifiers(XA[:N_FV], y_ns[:N_FV], N_FIT, TRAIN_CFG_NOSHOW)
-display(noshow_models.search_report)
-save_model_bundle({"models": noshow_models, "config": TRAIN_CFG_NOSHOW}, name="noshow_training_state")
-""")
-
-md("### 4b. Service time, duration groups then classification\n\n"
+md("### 4b (first part). Duration groups\n\n"
    "**Exact K-medians, K = 2, on the training durations only** (audit B3). Service times "
    "are integer minutes, so the optimal 1-D K-medians partition is found exactly by "
    "dynamic programming over the distinct values (no initialisation, no randomness). "
-   "The group durations s_A, s_B are the cluster medians. The groups and their cutoff "
-   "are fitted on the training partition and applied unchanged to test and holdout. "
-   "K = 2 is imposed by the ILP (two duration classes); the cost and silhouette for "
-   "K = 2 to 5 are reported for reference. `DURATION_METHOD = \"kmeans\"` runs the "
-   "ablation with the former method.")
+   "s_A, s_B are the cluster medians. Groups and cutoff are fitted on train and applied "
+   "unchanged to test and holdout. K = 2 is imposed by the ILP (two duration classes); "
+   "cost and silhouette for K = 2 to 5 are reported. `DURATION_METHOD = \"kmeans\"` runs "
+   "the ablation with the former method.")
 
-code("""\
+code("""\\
 # ── 4b. Duration-group settings ─────────────────────────────────────────────
 DURATION_KS = [2, 3, 4, 5]    # values of K reported (cost + silhouette)
-SIL_SAMPLE = 20_000           # durations used for each silhouette
+SIL_SAMPLE = 5_000 if SMOKE else 20_000   # durations used for each silhouette
 N_BOOTSTRAP = 10              # bootstrap resamples of the silhouette (local generator)
 BOOTSTRAP_SAMPLE = 10_000     # size of each resample
+RUN.configure("durations", method=DURATION_METHOD, stat=DURATION_STAT, ks=DURATION_KS,
+              sil=(SIL_SAMPLE, N_BOOTSTRAP, BOOTSTRAP_SAMPLE))
 """)
 
-code("""\
+code_stage("durations", """\\
 # ── 4b. Fit the groups on the training durations, apply them everywhere ─────
-_train_st = train_df["service_time"].to_numpy()
-duration_k_table = evaluate_duration_ks(_train_st, DURATION_KS, method=DURATION_METHOD,
-                                        sil_sample=SIL_SAMPLE, random_state=RANDOM_STATE,
-                                        prefix="servicetime")
-display(duration_k_table)
-DURATION_GROUPS = fit_duration_groups(_train_st, k=2, method=DURATION_METHOD, stat=DURATION_STAT,
-                                      random_state=RANDOM_STATE)
-best_k = 2
-mu_sil, sd_sil = bootstrap_silhouette(_train_st, DURATION_GROUPS, n_bootstrap=N_BOOTSTRAP,
-                                      sample_size=BOOTSTRAP_SAMPLE, random_state=RANDOM_STATE)
-df_sample["group_label"] = DURATION_GROUPS.labels(df_sample["service_time"])
-train_df["group_label"] = df_sample.loc[train_df.index, "group_label"]
-service_time_by_group = DURATION_GROUPS.s_by_group
-label_names = ["A", "B"]
-print(f"Method {DURATION_GROUPS.method} / {DURATION_GROUPS.stat}, fitted on {DURATION_GROUPS.n_train:,} "
-      f"training durations")
-print(f"s_A = {service_time_by_group['A']:g} min, s_B = {service_time_by_group['B']:g} min, "
-      f"cutoff {DURATION_GROUPS.cutoff:g} min, training share of A {DURATION_GROUPS.shares['A']:.4f}")
-print(f"Bootstrapped silhouette (K=2): mean={mu_sil:.4f}, sd={sd_sil:.4f}")
-# Audit B4: a long patient must fit in the longest slot, otherwise stop here
-if service_time_by_group["A"] > max(SLOT_LENGTHS):
-    raise ValueError(f"s_A = {service_time_by_group['A']:g} min exceeds the longest slot "
-                     f"{max(SLOT_LENGTHS)} min: decision required (SLOT_LENGTHS or DURATION_METHOD)")
+_st = np.asarray(PREP["st_train"], dtype=float)
+_k_table = evaluate_duration_ks(_st, DURATION_KS, method=DURATION_METHOD, sil_sample=SIL_SAMPLE,
+                                random_state=RANDOM_STATE, prefix="servicetime")
+_groups = fit_duration_groups(_st, k=2, method=DURATION_METHOD, stat=DURATION_STAT,
+                              random_state=RANDOM_STATE)
+_sil = bootstrap_silhouette(_st, _groups, n_bootstrap=N_BOOTSTRAP, sample_size=BOOTSTRAP_SAMPLE,
+                            random_state=RANDOM_STATE)
+_tree, _cut = learn_decision_tree_cutoffs(pd.DataFrame({"service_time": _st, "group_label": _groups.labels(_st)}),
+                                          service_time_col="service_time", group_col="group_label",
+                                          label_names=["A", "B"])
+RUN.finish("durations", groups=_groups, k_table=_k_table, sil=_sil, tree=_tree, tree_cutoff=_cut)
 """)
 
-code("""\
-# ── 4b. Interpretable cutoff (decision tree on the training labels) ─────────
-cluster_tree, primary_cutoff = learn_decision_tree_cutoffs(
-    train_df, service_time_col="service_time", group_col="group_label", label_names=label_names,
-)
-assert abs(primary_cutoff - DURATION_GROUPS.cutoff) <= 0.5 + 1e-9, \\
-    f"tree root {primary_cutoff} and group cutoff {DURATION_GROUPS.cutoff} disagree"
+code("""\\
+if RUN.wanted("durations"):
+    DUR = RUN.load("durations")
+    DURATION_GROUPS, cluster_tree = DUR["groups"], DUR["tree"]
+    mu_sil, sd_sil = DUR["sil"]
+    service_time_by_group = DURATION_GROUPS.s_by_group
+    display(DUR["k_table"])
+    latex_table(DUR["k_table"], os.path.join(TABLES_DIR, "table_duration_k.tex"),
+                caption="Duration groups: cost and silhouette by K (training durations).",
+                label="tab:duration-k", decimals=4)
+    y_grp = (DURATION_GROUPS.labels(PREP["st_train"]) == "A").astype(int)
+    y_test_grp = (DURATION_GROUPS.labels(PREP["st_test"]) == "A").astype(int)
+    grp_inf_actual = DURATION_GROUPS.labels(PREP["st_inf"])
+    print(f"{DURATION_GROUPS.method}/{DURATION_GROUPS.stat} on {DURATION_GROUPS.n_train:,} training durations: "
+          f"s_A = {service_time_by_group['A']:g} min, s_B = {service_time_by_group['B']:g} min, "
+          f"cutoff {DURATION_GROUPS.cutoff:g} min (tree root {DUR['tree_cutoff']:g}), "
+          f"training share of A {DURATION_GROUPS.shares['A']:.4f}")
+    print(f"Bootstrapped silhouette (K=2): mean={mu_sil:.4f}, sd={sd_sil:.4f}")
+    assert abs(DUR["tree_cutoff"] - DURATION_GROUPS.cutoff) <= 0.5 + 1e-9
+    # Audit B4: a long patient must fit in the longest slot, otherwise stop here
+    if service_time_by_group["A"] > max(SLOT_LENGTHS):
+        raise ValueError(f"s_A = {service_time_by_group['A']:g} min exceeds the longest slot "
+                         f"{max(SLOT_LENGTHS)} min: decision required (SLOT_LENGTHS or DURATION_METHOD)")
 """)
 
-md("**Group classifier.** Same function and protocol; the A/B target (about 35 % of "
-   "A) is above the SMOTE ratio of 0.1, so only the class weighting applies.")
+md("### 4a, 4b. Hyperparameter search on fit / valid")
 
-code("""\
-# ── 4b. Group classifier for new patients (target: training-fitted groups) ──
-y_grp = (df_sample.loc[train_df.index, "group_label"] == "A").to_numpy().astype(int)
-y_test_grp = (df_sample.loc[test_df.index, "group_label"] == "A").to_numpy().astype(int)
-group_models = train_binary_classifiers(XA[:N_FV], y_grp[:N_FV], N_FIT, TRAIN_CFG_GROUP)
-display(group_models.search_report)
-save_model_bundle({"models": group_models, "config": TRAIN_CFG_GROUP}, name="group_training_state")
+code("""\\
+RUN.configure("tune", noshow=TRAIN_CFG_NOSHOW.as_dict(), group=TRAIN_CFG_GROUP.as_dict())
+""")
+
+code_stage("tune", """\\
+# ── 4a / 4b. Tune both tasks (AdaBoost in a separate process) ────────────────
+_xa_path = os.path.join(RUN.dir, "prep", "XA.npy")
+_y_ns_path, _y_grp_path = RUN.path("tune", "y_ns.npy"), RUN.path("tune", "y_grp.npy")
+np.save(_y_ns_path, np.asarray(y_ns)); np.save(_y_grp_path, np.asarray(y_grp))
+tuned_ns = tune_binary_classifiers(XA[:N_FV], y_ns[:N_FV], N_FIT, TRAIN_CFG_NOSHOW,
+                                   adaboost_files=(_xa_path, _y_ns_path))
+tuned_grp = tune_binary_classifiers(XA[:N_FV], y_grp[:N_FV], N_FIT, TRAIN_CFG_GROUP,
+                                    adaboost_files=(_xa_path, _y_grp_path))
+RUN.finish("tune", tuned_ns=tuned_ns, tuned_grp=tuned_grp)
+""")
+
+code("""\\
+if RUN.wanted("tune"):
+    TUNE = RUN.load("tune")
+    tuned_ns, tuned_grp = TUNE["tuned_ns"], TUNE["tuned_grp"]
+    for _task, _t in (("no-show", tuned_ns), ("group", tuned_grp)):
+        print(f"{_task}: " + "; ".join(f"{m} {b} (log-loss valid {_t['criterion'][m]:.5f})"
+                                       for m, b in _t["best"].items()))
+    RUN.configure("fit")
+""")
+
+code_stage("fit", """\\
+# ── 4a / 4b. Refit on fit + valid ───────────────────────────────────────────
+noshow_models = fit_binary_classifiers(XA[:N_FV], y_ns[:N_FV], tuned_ns, TRAIN_CFG_NOSHOW)
+group_models = fit_binary_classifiers(XA[:N_FV], y_grp[:N_FV], tuned_grp, TRAIN_CFG_GROUP)
+RUN.finish("fit", noshow_models=noshow_models, group_models=group_models)
+""")
+
+code("""\\
+if RUN.wanted("fit"):
+    FIT = RUN.load("fit")
+    noshow_models, group_models = FIT["noshow_models"], FIT["group_models"]
+    display(noshow_models.search_report)
+    display(group_models.search_report)
+    RUN.configure("calibrate", methods=("sigmoid", "isotonic"))
 """)
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -486,240 +536,160 @@ md("## 5. Calibration, model choice and evaluation\n\n"
    "**On calib** (never on test): each family is calibrated (analytic prior correction, "
    "Platt scaling or isotonic regression, fitted on one half of calib); on the other half "
    "the calibrated Brier score chooses the method of each family, then the model; Youden's "
-   "threshold is read there too. **On test**: AUC-ROC, AUC-PR, log-loss, Brier, Brier skill "
-   "score against the training base rate, then at the calib threshold accuracy (with the "
-   "majority-class accuracy for reference) and precision, recall, F1 in macro average and "
-   "for the positive class (audit P5).")
+   "threshold is read there, and for the group classifier the threshold that makes the "
+   "predicted share of A equal to the observed one (rec. 12). **On test**: AUC-ROC, "
+   "AUC-PR, log-loss, Brier, Brier skill score against the training base rate, then at "
+   "the calib threshold accuracy (with the majority-class accuracy for reference) and "
+   "precision, recall, F1 in macro average and for the positive class (audit P5).")
 
-code("""\
-# ── 5.1 No-show: calibration and model choice on calib ──────────────────────
+code_stage("calibrate", """\\
+# ── 5.1 Calibration and model choice on calib ───────────────────────────────
 cal_ns = calibrate_and_select(noshow_models, XA[N_FV:], y_ns[N_FV:], random_state=RANDOM_STATE)
-display(cal_ns.table.round(5))
-best_noshow_name = cal_ns.best_name
-calibrated_noshow_model = cal_ns.models[best_noshow_name]
-print(f"Selected no-show model (calibrated Brier on calib): {best_noshow_name} "
-      f"({cal_ns.methods[best_noshow_name]})")
+cal_grp = calibrate_and_select(group_models, XA[N_FV:], y_grp[N_FV:], random_state=RANDOM_STATE)
+_thr = share_matching_threshold(cal_grp.p_calib_eval[cal_grp.best_name],
+                                target_share=float(cal_grp.y_calib_eval.mean()))
+RUN.finish("calibrate", cal_ns=cal_ns, cal_grp=cal_grp, group_threshold=_thr)
 """)
 
-code("""\
-# ── 5.2 No-show: reliability diagram of the selected model (calib half B) ───
-plot_calibration_curve_(cal_ns.y_calib_eval, cal_ns.p_calib_eval[best_noshow_name],
-                        f"{best_noshow_name}_calibrated", n_bins=10, prefix="calib")
+code("""\\
+if RUN.wanted("calibrate"):
+    CAL = RUN.load("calibrate")
+    cal_ns, cal_grp, GROUP_THRESHOLD = CAL["cal_ns"], CAL["cal_grp"], CAL["group_threshold"]
+    best_noshow_name, best_group_name = cal_ns.best_name, cal_grp.best_name
+    calibrated_noshow_model, best_group_model = cal_ns.models[best_noshow_name], cal_grp.models[best_group_name]
+    display(cal_ns.table.round(5)); display(cal_grp.table.round(5))
+    latex_table(pd.concat([cal_ns.table.assign(Task="no-show"), cal_grp.table.assign(Task="group A")]),
+                os.path.join(TABLES_DIR, "table_calibration.tex"),
+                caption="Calibration methods on calib (half B): Brier score and log-loss.",
+                label="tab:calibration", decimals=5)
+    print(f"No-show model: {best_noshow_name} ({cal_ns.methods[best_noshow_name]}) | "
+          f"group model: {best_group_name} ({cal_grp.methods[best_group_name]})")
+    print(f"Group threshold on calibrated p_A: {GROUP_THRESHOLD:.4f} (Youden {cal_grp.thresholds[best_group_name]:.4f}), "
+          f"observed share of A on calib {cal_grp.y_calib_eval.mean():.4f}")
+    plot_calibration_curve_(cal_ns.y_calib_eval, cal_ns.p_calib_eval[best_noshow_name],
+                            f"{best_noshow_name}_calibrated", n_bins=10, prefix="calib")
+    RUN.configure("evaluate", plots=list(ALL_EVAL_PLOTS))
 """)
 
-code("""\
-# ── 5.3 No-show: test metrics ───────────────────────────────────────────────
-_rng_tt = np.random.default_rng(RANDOM_STATE)
-_tt = _rng_tt.choice(N_FV, size=min(200_000, N_FV), replace=False)
+code_stage("evaluate", """\\
+# ── 5.2 Test metrics and figures (thresholds from calib) ────────────────────
+_tt = np.sort(np.random.default_rng(RANDOM_STATE).choice(N_FV, size=min(200_000, N_FV), replace=False))
 results_noshow = evaluate_binary_classification_models(
     cal_ns, X_test_np, y_test_ns, base_rate=noshow_models.prior,
     positive_name="NoShow", reference_name="Attended", feature_cols=feature_cols,
-    X_train=XA[np.sort(_tt)], y_tr=y_ns[np.sort(_tt)], prefix="noshow",
-    cache_dir=os.path.join(MODELS_DIR, f"run_{RUN_ID}", "test_predictions_noshow"))
-record_training_run("no-show", results_noshow)
-""")
-
-code("""\
-# ── 5.4 Group: calibration, model choice, thresholds on calib ───────────────
-cal_grp = calibrate_and_select(group_models, XA[N_FV:], y_grp[N_FV:], random_state=RANDOM_STATE)
-display(cal_grp.table.round(5))
-best_group_name = cal_grp.best_name
-best_group_model = cal_grp.models[best_group_name]
-print(f"Selected group model (calibrated Brier on calib): {best_group_name} ({cal_grp.methods[best_group_name]})")
-""")
-
-code("""\
-# ── 5.5 Group: test metrics ─────────────────────────────────────────────────
+    X_train=XA[_tt], y_tr=y_ns[_tt], prefix="noshow", cache_dir=RUN.path("evaluate", "proba_noshow"))
 results_group = evaluate_binary_classification_models(
     cal_grp, X_test_np, y_test_grp, base_rate=group_models.prior,
     positive_name="Group A (long)", reference_name="Group B (short)", feature_cols=feature_cols,
-    X_train=XA[np.sort(_tt)], y_tr=y_grp[np.sort(_tt)], prefix="servicetime",
-    cache_dir=os.path.join(MODELS_DIR, f"run_{RUN_ID}", "test_predictions_group"))
-record_training_run("A/B group", results_group)
-history = training_history_table()
-save_dataframe(history, os.path.join(RUN_RESULTS_DIR, "test_metrics.csv"))
+    X_train=XA[_tt], y_tr=y_grp[_tt], prefix="servicetime", cache_dir=RUN.path("evaluate", "proba_group"))
+RUN.finish("evaluate", results_noshow=results_noshow, results_group=results_group)
+""")
+
+code("""\\
+if RUN.wanted("evaluate"):
+    EV = RUN.load("evaluate")
+    results_noshow, results_group = EV["results_noshow"], EV["results_group"]
+    _metrics = pd.concat([results_noshow.assign(Task="no-show"), results_group.assign(Task="group A")])
+    display(_metrics.set_index(["Task", "Model"]).round(4))
+    save_dataframe(_metrics, os.path.join(RUN_RESULTS_DIR, "test_metrics.csv"))
+    latex_table(_metrics[["Task", "Model", "Calibration", AUC_COL, AP_COL, LOGLOSS_COL, BRIER_COL, BSS_COL,
+                          ACC_COL, BASE_ACC_COL, F1_COL, F1_POS_COL, THR_COL]],
+                os.path.join(TABLES_DIR, "table_test_metrics.tex"),
+                caption="Test metrics of the calibrated models (thresholds chosen on calib).",
+                label="tab:test-metrics", decimals=4)
+    RUN.configure("export", c=(1.0, 0.5, C_O_BASE), slots=SLOT_LENGTHS)
 """)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 6. Deployment
+# 6-7. Deployment and ILP
 # ═══════════════════════════════════════════════════════════════════════════
-md("## 6. Deployment\n\n"
-   "Serialisation of the three inference artifacts (calibrated no-show model, "
-   "service_time→group tree for interpretability, group classifier for "
-   "inference on new patients) and of the preprocessing objects fitted on the "
-   "training set. `predict_patient` is the single inference entry point, used "
-   "as-is by section 7.")
+md("## 6. Deployment and 7. ILP bridge\n\n"
+   "Serialisation of the calibrated models, the group threshold and the duration groups; "
+   "scoring of the ILP holdout (patients never seen by any model) with `predict_patient`; "
+   "export of `plne_parameters.json` (the only input of the ILP campaign, "
+   "`notebooks/01_ilp_validation.ipynb`) and of the scored holdout; one real ILP day "
+   "solved as a demonstration, with its termination status and gap.")
 
-code("""\
-# ── 6.1 Group threshold: predicted share of A = observed share (calib half B) ─
-GROUP_THRESHOLD = share_matching_threshold(cal_grp.p_calib_eval[best_group_name],
-                                           target_share=float(cal_grp.y_calib_eval.mean()))
-print(f"Threshold on calibrated p_A: {GROUP_THRESHOLD:.4f} (Youden: {cal_grp.thresholds[best_group_name]:.4f}); "
-      f"observed share of A on calib {cal_grp.y_calib_eval.mean():.4f}")
-""")
-
-code("""\
-# ── 6.2 Serialise the artifacts ─────────────────────────────────────────────
-save_artifacts(
-    calibrated_noshow_model, cluster_tree, best_group_model,
-    scaler, cat_encodings, feature_cols, name_prefix="final",
-    inference={"group_threshold": GROUP_THRESHOLD, "duration_groups": DURATION_GROUPS,
-               "run_id": RUN_ID, "noshow_model_name": best_noshow_name,
-               "group_model_name": best_group_name},
-)
-""")
-
-code("""\
-# ── 6.3 predict_patient on a few test rows ──────────────────────────────────
-demo_scores = predict_patient(X_test_np[:10], calibrated_noshow_model, best_group_model,
-                              threshold_A=GROUP_THRESHOLD, s_A=service_time_by_group["A"],
-                              s_B=service_time_by_group["B"], index=test_df.index[:10])
-demo_scores["NoShow_actual"] = y_test_ns[:10]
-display(demo_scores)
-""")
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 7. Solving the ILP
-# ═══════════════════════════════════════════════════════════════════════════
-md("## 7. Solving the ILP (outside CRISP-DM)\n\n"
-   "The inference holdout (`data/inference/inference_set_raw.csv`, "
-   "`df_inference`) was never seen by any model of sections 4-6. It is used "
-   "here to demonstrate the end-to-end bridge: serialised artifacts → "
-   "`predict_patient` → real ILP instance → `solve_ilp`.\n\n"
-   "`Instance`/`Config`/`Solution`/`compute_coefficients`/`solve_ilp` are "
-   "imported from `data_driven_plan.py`, the **same** model core as "
-   "`01_ilp_validation.ipynb` (regenerated by `notebooks/gen_nb.py`), which "
-   "carries the full experimental campaign (illustrative example, design of "
-   "experiments, benchmarks B1-B4, out-of-sample simulation, sensitivity "
-   "analysis). This section does not duplicate it: it adds the missing step, "
-   "building an instance from **real patients never used in training**, rather "
-   "than from synthetic patients drawn from distributions calibrated on "
-   "aggregate statistics.")
-
-code("""\
-# ── 7.1 Load the serialised artifacts ─────────────────────────────────────────
-artifacts = load_artifacts(name_prefix="final")
-print("Artifacts loaded:", list(artifacts.keys()))
-""")
-
-code("""\
-# ── 7.2 Inference on the holdout patients (never trained on) ────────────────
-_inf = artifacts["inference"]
-scored_inference = predict_patient(
-    X_inf_np, artifacts["noshow_model"], artifacts["group_classifier"],
-    threshold_A=_inf["group_threshold"], s_A=_inf["duration_groups"].s_by_group["A"],
-    s_B=_inf["duration_groups"].s_by_group["B"], index=df_inference.index,
-)
-scored_inference["NoShow_actual"] = df_inference["NoShow"].values
-scored_inference["group_label_actual"] = df_sample.loc[df_inference.index, "group_label"].values
-
-print("Predictions on patients never seen during training:")
-display(scored_inference.head(10))
-print(f"\\nMean predicted show-up rate (q_i): {scored_inference['q_i'].mean():.3f}"
-      f"   |   observed (1-NoShow): {(1 - scored_inference['NoShow_actual']).mean():.3f}")
-print(f"Share of group A, predicted / actual: {(scored_inference['group'] == 'A').mean():.4f} / "
-      f"{(scored_inference['group_label_actual'] == 'A').mean():.4f}")
-""")
-
-code("""\
-# ── 7.2b Export the ILP parameters and the scored holdout ───────────────────
-# plne_parameters.json is the only input of notebooks/01_ilp_validation.ipynb.
-# A smoke run writes it to its run directory only; a full run also writes the
-# versioned data/inference/plne_parameters.json.
-HOLDOUT_SCORES = pd.DataFrame({
-    "q_i": scored_inference["q_i"].to_numpy(),
-    "group_pred": scored_inference["group"].to_numpy(),
-    "group_actual": scored_inference["group_label_actual"].to_numpy(),
-    "no_show": scored_inference["NoShow_actual"].astype(int).to_numpy()})
-_param_paths = [os.path.join(RUN_RESULTS_DIR, "plne_parameters.json")]
+code_stage("export", """\\
+# ── 6.1 Artifacts ───────────────────────────────────────────────────────────
+save_artifacts(calibrated_noshow_model, cluster_tree, best_group_model,
+               PREP["scaler"], PREP["cat_encodings"], feature_cols, name_prefix="final",
+               inference={"group_threshold": GROUP_THRESHOLD, "duration_groups": DURATION_GROUPS,
+                          "run_id": RUN_ID, "noshow_model_name": best_noshow_name,
+                          "group_model_name": best_group_name})
+# ── 7.1 Score the holdout ───────────────────────────────────────────────────
+scored_inference = predict_patient(X_inf_np, calibrated_noshow_model, best_group_model,
+                                   threshold_A=GROUP_THRESHOLD, s_A=service_time_by_group["A"],
+                                   s_B=service_time_by_group["B"])
+scored_inference["NoShow_actual"] = y_inf_ns
+scored_inference["group_label_actual"] = grp_inf_actual
+HOLDOUT_SCORES = pd.DataFrame({"q_i": scored_inference["q_i"], "group_pred": scored_inference["group"],
+                               "group_actual": grp_inf_actual, "no_show": y_inf_ns})
+# ── 7.2 Export the ILP parameters (run directory; versioned file for a full run)
+_paths = [os.path.join(RUN_RESULTS_DIR, "plne_parameters.json")]
 if not SMOKE:
-    _param_paths.append(os.path.join(INFERENCE_DIR, "plne_parameters.json"))
-PLNE_PARAMS = export_plne_parameters(_param_paths, DURATION_GROUPS, HOLDOUT_SCORES,
-                                     n_train=len(train_df), source_run=f"run_{RUN_ID}",
-                                     smoke=SMOKE, slot_lengths=SLOT_LENGTHS)
+    _paths.append(os.path.join(INFERENCE_DIR, "plne_parameters.json"))
+PLNE_PARAMS = export_plne_parameters(_paths, DURATION_GROUPS, HOLDOUT_SCORES, n_train=len(y_ns),
+                                     source_run=f"run_{RUN_ID}", smoke=SMOKE, slot_lengths=SLOT_LENGTHS)
 export_holdout_scores(os.path.join(RUN_RESULTS_DIR, "holdout_scores.parquet"), HOLDOUT_SCORES)
-print(json.dumps(PLNE_PARAMS, indent=2))
-print("Written:", _param_paths, "and holdout_scores.parquet")
-""")
-
-code("""\
-# ── 7.3 Build a real ILP instance (one clinic day) ──────────────────────────
-N_DEMO = 30  # size of an illustrative day, at realistic scale
-demo_patients = scored_inference.sample(n=min(N_DEMO, len(scored_inference)), random_state=RANDOM_STATE)
-
-T_demo = [6]
-L_demo = [[30.0, 30.0, 30.0, 60.0, 60.0, 60.0]]
-s_A_real = service_time_by_group["A"]
-s_B_real = service_time_by_group["B"]
-
+# ── 7.3 One real ILP day from holdout patients ──────────────────────────────
+_day = scored_inference.sample(n=min(30, len(scored_inference)), random_state=RANDOM_STATE)
+T_demo, L_demo = [6], [[30.0, 30.0, 30.0, 60.0, 60.0, 60.0]]
 real_instance = build_instance_from_patients(
-    demo_patients, T=T_demo, L=L_demo, s_A=s_A_real, s_B=s_B_real,
-    c_I=1.0, c_W=0.5, c_O=C_O_BASE, duration_mode="class",   # "expected": s = p_A s_A + (1 - p_A) s_B
-)
-print(f"Real instance: n={real_instance.n} patients, {sum(T_demo)} slots "
-      f"(max capacity {2*sum(T_demo)} seats), s_A={s_A_real:.1f} min, s_B={s_B_real:.1f} min")
-""")
-
-code("""\
-# ── 7.4 Solve ─────────────────────────────────────────────────────────────────
+    _day, T=T_demo, L=L_demo, s_A=service_time_by_group["A"], s_B=service_time_by_group["B"],
+    c_I=1.0, c_W=0.5, c_O=C_O_BASE, duration_mode="class")   # "expected": s = p_A s_A + (1 - p_A) s_B
 real_solution = solve_ilp(real_instance, Config(time_limit=60.0))
-print(f"Status: {real_solution.status}   |   solve time: {real_solution.solve_time:.3f} s")
-print(f"Best bound (reduced): {real_solution.best_bound:.4f}   |   "
-      f"gap on complete cost: {real_solution.gap_complete:.2e}   |   "
-      f"gap on reduced objective: {real_solution.gap:.2e}")
-print(f"Z_reduced = {real_solution.Z_reduced:.4f}   Z_complete = {real_solution.Z_complete:.4f}")
-print(f"E[Idle]={real_solution.E_idle:.3f}  E[Wait]={real_solution.E_wait:.3f}  E[OT]={real_solution.E_OT:.3f}")
-print(f"Patients served: {real_solution.n_served}/{real_instance.n}   "
-      f"Double-booked slots: {real_solution.n_double}/{sum(T_demo)}")
+RUN.finish("export", plne_params=PLNE_PARAMS, scored_head=scored_inference.head(10),
+           share_A=((scored_inference["group"] == "A").mean(), (grp_inf_actual == "A").mean()),
+           q_mean=(scored_inference["q_i"].mean(), 1 - y_inf_ns.mean()),
+           real_solution={k: getattr(real_solution, k) for k in
+                          ("status", "best_bound", "gap", "gap_complete", "Z_complete", "E_idle",
+                           "E_wait", "E_OT", "n_served", "n_double", "solve_time")},
+           real_c=(real_instance.c_I, real_instance.c_W, real_instance.c_O), real_n=real_instance.n)
 """)
 
-code("""\
-# ── 7.5 Objective actually solved (costs passed to the solver) ──────────────
-from IPython.display import Math, display
-_obj_tex = objective_latex(real_instance.c_I, real_instance.c_W, real_instance.c_O)
-import os
-with open(os.path.join(TABLES_DIR, "objective_solved.tex"), "w", encoding="utf-8") as fh:
-    fh.write("\\\\begin{equation}\\n" + _obj_tex + "\\n\\\\end{equation}\\n")
-display(Math(_obj_tex))
-print(_obj_tex)
+code("""\\
+if RUN.wanted("export"):
+    EX = RUN.load("export")
+    print(json.dumps(EX["plne_params"], indent=2))
+    display(EX["scored_head"])
+    print(f"Share of group A, predicted / actual: {EX['share_A'][0]:.4f} / {EX['share_A'][1]:.4f}")
+    print(f"Mean q_i predicted / observed show-up rate: {EX['q_mean'][0]:.4f} / {EX['q_mean'][1]:.4f}")
+    _rs = EX["real_solution"]
+    print(f"Real ILP day (n={EX['real_n']}): status {_rs['status']}, Z = {_rs['Z_complete']:.4f}, "
+          f"gap on complete cost {_rs['gap_complete']:.2e}, gap on reduced objective {_rs['gap']:.2e}, "
+          f"{_rs['n_served']} served, {_rs['n_double']} double slots, {_rs['solve_time']:.1f} s")
+    from IPython.display import Math
+    _obj_tex = objective_latex(*EX["real_c"])
+    with open(os.path.join(TABLES_DIR, "objective_solved.tex"), "w", encoding="utf-8") as fh:
+        fh.write("\\\\begin{equation}\\n" + _obj_tex + "\\n\\\\end{equation}\\n")
+    display(Math(_obj_tex))
 """)
 
-md("**Full experimental campaign** (design of experiments with distributional "
-   "notation and factor levels, benchmarks B1-B4, out-of-sample simulation, "
-   "sensitivity analysis to the no-show rate / variance / load with percentage "
-   "deviation and solve time): see the companion notebook "
-   "**`notebooks/01_ilp_validation.ipynb`**, regenerated by `notebooks/gen_nb.py`. "
-   "It imports its model core "
-   "(`Instance`/`Config`/`solve_ilp`) from `data_driven_plan.py`, so both "
-   "solve exactly the same model.")
+md("**Full experimental campaign**: `notebooks/01_ilp_validation.ipynb` (generated by "
+   "`notebooks/gen_nb.py`), with `PLNE_PARAMS_PATH` and `HOLDOUT_SCORES_PATH` pointing to "
+   "the files written above. It imports the same model core from `data_driven_plan.py`.")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Final summary
-# ═══════════════════════════════════════════════════════════════════════════
 md("## Final summary")
 
-code("""\
-# ── Summary table ─────────────────────────────────────────────────────────────
-_rn, _rg = results_noshow.set_index("Model"), results_group.set_index("Model")
-recap = pd.DataFrame([
-    {"Item": "Split", "Value": f"{SPLIT.mode}: fit={len(SPLIT.fit):,} valid={len(SPLIT.valid):,} "
-     f"calib={len(SPLIT.calib):,} test={len(SPLIT.test):,} holdout={len(SPLIT.inference):,}"},
-    {"Item": "No-show: selected model (calibrated Brier on calib)",
-     "Value": f"{best_noshow_name} ({cal_ns.methods[best_noshow_name]})"},
-    {"Item": "No-show: test AUC-ROC / AUC-PR / Brier / BSS",
-     "Value": " / ".join(f"{_rn.loc[best_noshow_name, c]:.4f}" for c in (AUC_COL, AP_COL, BRIER_COL, BSS_COL))},
-    {"Item": "Durations", "Value": f"{DURATION_GROUPS.method}/{DURATION_GROUPS.stat}: s_A={service_time_by_group['A']:g}, "
-     f"s_B={service_time_by_group['B']:g} min, cutoff {DURATION_GROUPS.cutoff:g} min"},
-    {"Item": "Durations: bootstrapped silhouette (K=2)", "Value": f"mean={mu_sil:.4f}, sd={sd_sil:.4f}"},
-    {"Item": "Group: selected model", "Value": f"{best_group_name} ({cal_grp.methods[best_group_name]})"},
-    {"Item": "Group: test AUC-ROC / Brier",
-     "Value": f"{_rg.loc[best_group_name, AUC_COL]:.4f} / {_rg.loc[best_group_name, BRIER_COL]:.4f}"},
-    {"Item": "ILP: real instance (n patients)", "Value": str(real_instance.n)},
-    {"Item": "ILP: status, Z_complete", "Value": f"{real_solution.status}, {real_solution.Z_complete:.4f}"},
-])
-display(recap)
-save_dataframe(recap, "results/recap_data_driven_plan.csv")
-print("Summary saved -> results/recap_data_driven_plan.csv")
+code("""\\
+if RUN.wanted("export"):
+    _rn, _rg = results_noshow.set_index("Model"), results_group.set_index("Model")
+    recap = pd.DataFrame([
+        {"Item": "Split", "Value": PREP["split_sizes"].to_dict("records")},
+        {"Item": "No-show: selected model", "Value": f"{best_noshow_name} ({cal_ns.methods[best_noshow_name]})"},
+        {"Item": "No-show: test AUC-ROC / AUC-PR / Brier / BSS",
+         "Value": " / ".join(f"{_rn.loc[best_noshow_name, c]:.4f}" for c in (AUC_COL, AP_COL, BRIER_COL, BSS_COL))},
+        {"Item": "Durations", "Value": f"{DURATION_GROUPS.method}/{DURATION_GROUPS.stat}: "
+         f"s_A={service_time_by_group['A']:g}, s_B={service_time_by_group['B']:g} min, cutoff {DURATION_GROUPS.cutoff:g} min"},
+        {"Item": "Durations: bootstrapped silhouette (K=2)", "Value": f"mean={mu_sil:.4f}, sd={sd_sil:.4f}"},
+        {"Item": "Group: selected model", "Value": f"{best_group_name} ({cal_grp.methods[best_group_name]})"},
+        {"Item": "Group: test AUC-ROC / Brier",
+         "Value": f"{_rg.loc[best_group_name, AUC_COL]:.4f} / {_rg.loc[best_group_name, BRIER_COL]:.4f}"},
+        {"Item": "ILP day: status, Z", "Value": f"{EX['real_solution']['status']}, {EX['real_solution']['Z_complete']:.4f}"},
+    ])
+    display(recap)
+    save_dataframe(recap, os.path.join(RUN_RESULTS_DIR, "recap_data_driven_plan.csv"))
 """)
 
 # ═══════════════════════════════════════════════════════════════════════════

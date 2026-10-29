@@ -85,3 +85,16 @@ def test_predict_patient_and_duration_modes():
     assert cls.q.max() == pytest.approx(0.999)          # q = 1.0 clipped explicitly
     with pytest.raises(ValueError):
         build_instance_from_patients(out, duration_mode="mean", **kw)
+
+
+def test_adaboost_tuned_in_a_separate_process(tmp_path):
+    from data_driven_plan import tune_binary_classifiers
+    X, y = data(3000)
+    np.save(tmp_path / "XA.npy", X)
+    np.save(tmp_path / "y.npy", y)
+    cfg = TrainingConfig(**{**SMALL, "models": ["AdaBoost", "XGBoost"]})
+    sub = tune_binary_classifiers(X[:2500], y[:2500], 2000, cfg,
+                                  adaboost_files=(str(tmp_path / "XA.npy"), str(tmp_path / "y.npy")))
+    same = tune_binary_classifiers(X[:2500], y[:2500], 2000, cfg)
+    assert sub["best"]["AdaBoost"] == same["best"]["AdaBoost"]
+    assert sub["criterion"]["AdaBoost"] == pytest.approx(same["criterion"]["AdaBoost"])

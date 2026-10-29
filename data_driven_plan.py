@@ -149,6 +149,27 @@ def _savefig(name: str, prefix: str = "") -> None:
     plt.savefig(f"{FIGURES_DIR}/{stem}.png", dpi=300, bbox_inches="tight")
 
 
+def latex_table(df: pd.DataFrame, path: str, caption: str, label: str,
+                decimals: int = 3, index: bool = False) -> str:
+    """Write a booktabs LaTeX table with escaped headers and cells (audit rec. 14).
+
+    Column names such as "E[Idle] (min)", "q_i" or "Écart (%)" are escaped
+    (underscores, percent signs, ampersands), floats rounded to `decimals`,
+    negative zeros printed as zeros. The caption is written as given (it may
+    hold math).
+    """
+    out = df.copy()
+    for c in out.columns:
+        if pd.api.types.is_float_dtype(out[c]):
+            out[c] = out[c].round(decimals) + 0.0
+    tex = out.to_latex(index=index, escape=True, float_format=f"%.{decimals}f",
+                       caption=caption, label=label, position="htbp")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(tex)
+    return tex
+
+
 print(f"xgboost {__import__('xgboost').__version__} | imbalanced-learn {__import__('imblearn').__version__}")
 
 
@@ -210,6 +231,147 @@ def load_preprocessed_data(path: str) -> pd.DataFrame:
         return pd.read_parquet(path, engine="pyarrow")
     except FileNotFoundError:
         raise FileNotFoundError(f"File not found: {path}")
+
+
+def load_raw_data(path: str, patient_fraction: Optional[float] = None, key: str = "smoke",
+                  patient_col: str = "patientsid") -> pd.DataFrame:
+    """Read the raw Parquet data, optionally for a fraction of the patients only.
+
+    patient_fraction (smoke test): patients are kept when a 64-bit hash of
+    their identifier falls below the fraction, so every visit of a kept
+    patient is kept and the selection does not depend on the row order.
+    """
+    import pyarrow.dataset as pads
+    dset = pads.dataset(path)
+    if patient_fraction is None:
+        return dset.to_table().to_pandas()
+    if not 0 < patient_fraction < 1:
+        raise ValueError(f"patient_fraction={patient_fraction} outside (0, 1)")
+    ids = pd.Series(dset.to_table(columns=[patient_col]).column(0).to_numpy()).drop_duplicates()
+    keep = ids[_uniform_from_id(ids, key) < patient_fraction].to_numpy()
+    table = dset.to_table(filter=pads.field(patient_col).isin(keep))
+    print(f"Patient sample: {len(keep):,} / {len(ids):,} patients ({patient_fraction:.1%}), "
+          f"{table.num_rows:,} rows")
+    return table.to_pandas()
+
+
+#: Stages of the main notebook (audit 1.7), in execution order.
+STAGES: tuple[str, ...] = ("prep", "durations", "tune", "fit", "calibrate", "evaluate", "export")
+
+
+class StageRunner:
+    """Resumable execution of the main notebook (audit 1.7).
+
+    Each stage writes its artifacts to models/run_<id>/<stage>/ with a `.done`
+    marker holding the hash of its configuration (chained with the hashes of
+    the stages before it). A stage whose marker matches is loaded instead of
+    recomputed; stages after `target` are neither computed nor loaded.
+    runs/<id>/STATUS.md records start, end, duration, peak memory and artifact
+    of every stage.
+    """
+
+    def __init__(self, run_id: str, target: str = "all", root: str = MODELS_DIR, status_dir: str = "runs"):
+        if target != "all" and target not in STAGES:
+            raise ValueError(f"STAGE={target!r}, expected 'all' or one of {STAGES}")
+        self.run_id, self.target = run_id, target
+        self.dir = os.path.join(root, f"run_{run_id}")
+        self.status_path = os.path.join(status_dir, run_id, "STATUS.md")
+        self.cfg, self.hash, self._t0 = {}, {}, {}
+        os.makedirs(self.dir, exist_ok=True)
+        os.makedirs(os.path.dirname(self.status_path), exist_ok=True)
+        self._rows = self._read_status()
+
+    def wanted(self, stage: str) -> bool:
+        last = len(STAGES) - 1 if self.target == "all" else STAGES.index(self.target)
+        return STAGES.index(stage) <= last
+
+    def configure(self, stage: str, **cfg) -> str:
+        k = STAGES.index(stage)
+        upstream = self.hash.get(STAGES[k - 1], "") if k else ""
+        self.cfg[stage] = {"stage": stage, "upstream": upstream, **cfg}
+        blob = json.dumps(self.cfg[stage], sort_keys=True, default=str)
+        self.hash[stage] = __import__("hashlib").sha1(blob.encode()).hexdigest()[:16]
+        return self.hash[stage]
+
+    def _marker(self, stage: str) -> str:
+        return os.path.join(self.dir, stage, ".done")
+
+    def done(self, stage: str) -> bool:
+        path = self._marker(stage)
+        if stage not in self.hash or not os.path.exists(path):
+            return False
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh).get("hash") == self.hash[stage]
+
+    def compute(self, stage: str) -> bool:
+        """True when the stage must run now (wanted, configured, not done)."""
+        if stage not in self.hash:
+            raise RuntimeError(f"stage {stage!r} used before RUN.configure")
+        todo = self.wanted(stage) and not self.done(stage)
+        if todo and stage not in self._t0:
+            self._t0[stage] = time.time()
+            self._status(stage, "running")
+        elif self.wanted(stage) and not todo:
+            print(f"[{stage}] artifacts found for this configuration: loaded, not recomputed")
+        return todo
+
+    def finish(self, stage: str, **artifacts) -> None:
+        d = os.path.join(self.dir, stage)
+        os.makedirs(d, exist_ok=True)
+        small = {}
+        for k, v in artifacts.items():
+            if isinstance(v, np.ndarray) and v.ndim == 2:
+                np.save(os.path.join(d, f"{k}.npy"), np.ascontiguousarray(v))
+            else:
+                small[k] = v
+        joblib.dump(small, os.path.join(d, "artifacts.joblib"))
+        with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as fh:
+            json.dump(self.cfg[stage], fh, indent=2, default=str)
+        with open(self._marker(stage), "w", encoding="utf-8") as fh:
+            json.dump({"hash": self.hash[stage], "finished": pd.Timestamp.now().isoformat(timespec="seconds")}, fh)
+        self._status(stage, "done", artifact=d)
+
+    def load(self, stage: str) -> dict:
+        d = os.path.join(self.dir, stage)
+        if not self.done(stage):
+            raise RuntimeError(f"stage {stage!r} has no artifacts for this configuration")
+        out = joblib.load(os.path.join(d, "artifacts.joblib"))
+        for f in os.listdir(d):
+            if f.endswith(".npy"):
+                out[f[:-4]] = np.load(os.path.join(d, f), mmap_mode="r")
+        return out
+
+    def path(self, stage: str, name: str) -> str:
+        d = os.path.join(self.dir, stage)
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, name)
+
+    def _read_status(self) -> dict:
+        return {}
+
+    def _status(self, stage: str, state: str, artifact: str = "") -> None:
+        import resource
+        now = time.time()
+        row = self._rows.get(stage, {"start": now})
+        row.update(state=state, artifact=artifact or row.get("artifact", ""),
+                   peak_gb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6)
+        if state == "done":
+            row["end"] = now
+            row["start"] = self._t0.get(stage, row["start"])
+        self._rows[stage] = row
+        fmt = lambda t: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+        lines = [f"# Run {self.run_id}", "", f"Target stage: {self.target}", "",
+                 "| Stage | State | Start | End | Duration (s) | Peak RSS (GB) | Artifact |",
+                 "|---|---|---|---|---|---|---|"]
+        for st in STAGES:
+            if st in self._rows:
+                r = self._rows[st]
+                end = r.get("end")
+                lines.append(f"| {st} | {r['state']} | {fmt(r['start'])} | {fmt(end) if end else ''} | "
+                             f"{(end - r['start']):.0f} | {r['peak_gb']:.2f} | {r['artifact']} |"
+                             if end else f"| {st} | {r['state']} | {fmt(r['start'])} |  |  | {r['peak_gb']:.2f} |  |")
+        with open(self.status_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
 
 
 def save_preprocessed_data(df: pd.DataFrame, path: str) -> None:
@@ -1244,21 +1406,30 @@ def _adaboost_staged(cfg, X_fit, y_fit, X_valid, y_valid, prior, ratio):
     return best[1], float(best[0]), pd.DataFrame(rows)
 
 
-def train_binary_classifiers(X_fv: np.ndarray, y_fv: np.ndarray, n_fit: int,
-                             config: Optional[TrainingConfig] = None) -> ModelSet:
-    """Tune every family on fit / valid, then refit it on fit + valid.
+def _tune_adaboost_from_files(xa_path: str, y_path: str, n_fit: int, n_fv: int, cfg: TrainingConfig):
+    """AdaBoost tuning in its own process: matrices are memory-mapped, not copied."""
+    XA = np.load(xa_path, mmap_mode="r")
+    y = np.load(y_path).astype(int)
+    prior = float(y[:n_fit].mean())
+    t0 = time.time()
+    best, crit, table = _adaboost_staged(cfg, XA[:n_fit], y[:n_fit], XA[n_fit:n_fv], y[n_fit:n_fv],
+                                         prior, prior / (1 - prior))
+    return best, crit, table, time.time() - t0
+
+
+def tune_binary_classifiers(X_fv: np.ndarray, y_fv: np.ndarray, n_fit: int,
+                            config: Optional[TrainingConfig] = None,
+                            adaboost_files: Optional[tuple] = None) -> dict:
+    """Hyperparameters of every family, chosen on valid (audit 1.3).
 
     Args:
-        X_fv: features of fit followed by valid (contiguous rows, so that
-            X_fv[:n_fit] and X_fv[n_fit:] are views, not copies).
-        y_fv: binary target (1 = class of interest), same order.
-        n_fit: number of fit rows at the top of X_fv.
-        config: training configuration.
+        adaboost_files: (xa_path, y_path) of the .npy matrices; when given,
+            AdaBoost (sequential, the longest) is tuned in a separate process
+            in parallel with the other families (audit 1.7).
 
     Returns:
-        ModelSet {name: pipeline refitted on fit + valid}, with `search_report`
-        (criterion on valid, best parameters, timings), `best_params`, `prior`
-        (base rate of fit) and `config`.
+        {"best": {family: params}, "criterion": {family: log-loss on valid},
+         "tables": {family: search table}, "time": {family: seconds}, "prior": base rate of fit}
     """
     cfg = config or TrainingConfig()
     log = print if cfg.verbose else (lambda *a, **k: None)
@@ -1268,8 +1439,17 @@ def train_binary_classifiers(X_fv: np.ndarray, y_fv: np.ndarray, n_fit: int,
     ratio = prior / (1 - prior)
     log(f"fit {n_fit:,} rows, valid {len(y_valid):,} rows, positive share {prior:.4f} "
         f"(minority/majority {ratio:.4f}; SMOTE {'on' if ratio < cfg.smote_sampling_strategy else 'off'})")
-    models, rows, tables = ModelSet(), [], {}
+    out = {"best": {}, "criterion": {}, "tables": {}, "time": {}, "prior": prior}
+    future = None
+    if adaboost_files is not None and "AdaBoost" in cfg.models and cfg.search != "none":
+        import concurrent.futures
+        import multiprocessing
+        pool = concurrent.futures.ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn"))
+        future = pool.submit(_tune_adaboost_from_files, *adaboost_files, n_fit, len(y_fv), cfg)
+        log("AdaBoost: tuned in a separate process")
     for name in cfg.models:
+        if name == "AdaBoost" and future is not None:
+            continue
         t0 = time.time()
         if cfg.search == "none":
             best, crit, table = {}, float("nan"), pd.DataFrame()
@@ -1277,22 +1457,56 @@ def train_binary_classifiers(X_fv: np.ndarray, y_fv: np.ndarray, n_fit: int,
             best, crit, table = _adaboost_staged(cfg, X_fit, y_fit, X_valid, y_valid, prior, ratio)
         else:
             best, crit, table = _halving_search(name, cfg, X_fv, y_fv, n_fit, prior, ratio)
-        t_search = time.time() - t0
-        log(f"{name}: best {best}, corrected log-loss on valid {crit:.5f} ({t_search:.0f} s)")
+        out["best"][name], out["criterion"][name], out["tables"][name] = best, crit, table
+        out["time"][name] = time.time() - t0
+        log(f"{name}: best {best}, corrected log-loss on valid {crit:.5f} ({out['time'][name]:.0f} s)")
+    if future is not None:
+        best, crit, table, dt = future.result()
+        pool.shutdown()
+        out["best"]["AdaBoost"], out["criterion"]["AdaBoost"] = best, crit
+        out["tables"]["AdaBoost"], out["time"]["AdaBoost"] = table, dt
+        log(f"AdaBoost: best {best}, corrected log-loss on valid {crit:.5f} ({dt:.0f} s)")
+    return out
+
+
+def fit_binary_classifiers(X_fv: np.ndarray, y_fv: np.ndarray, tuned: dict,
+                           config: Optional[TrainingConfig] = None) -> ModelSet:
+    """Refit every family on fit + valid with the parameters chosen on valid."""
+    cfg = config or TrainingConfig()
+    log = print if cfg.verbose else (lambda *a, **k: None)
+    y_fv = np.asarray(y_fv).astype(int)
+    prior = tuned["prior"]
+    models, rows = ModelSet(), []
+    for name in cfg.models:
         t0 = time.time()
-        model = make_estimator(name, cfg, ratio, best)
+        model = make_estimator(name, cfg, prior / (1 - prior), tuned["best"][name])
         model.fit(X_fv, y_fv)
         t_fit = time.time() - t0
         log(f"{name}: refitted on fit + valid ({len(y_fv):,} rows) in {t_fit:.0f} s")
-        models[name], tables[name] = model, table
-        rows.append({"Model": name, "Best params": str(best), "Log-loss valid (corrected)": crit,
-                     "Search time (s)": round(t_search, 1), "Refit time (s)": round(t_fit, 1),
+        models[name] = model
+        rows.append({"Model": name, "Best params": str(tuned["best"][name]),
+                     "Log-loss valid (corrected)": tuned["criterion"][name],
+                     "Search time (s)": round(tuned["time"][name], 1), "Refit time (s)": round(t_fit, 1),
                      "Refit rows": len(y_fv)})
     models.search_report = pd.DataFrame(rows).set_index("Model")
-    models.search_tables = tables
-    models.best_params = {r["Model"]: r["Best params"] for r in rows}
+    models.search_tables = tuned["tables"]
+    models.best_params = dict(tuned["best"])
     models.prior, models.config = prior, cfg
     return models
+
+
+def train_binary_classifiers(X_fv: np.ndarray, y_fv: np.ndarray, n_fit: int,
+                             config: Optional[TrainingConfig] = None) -> ModelSet:
+    """Tune every family on fit / valid, then refit it on fit + valid.
+
+    Args:
+        X_fv: features of fit followed by valid (contiguous rows, so that
+            X_fv[:n_fit] and X_fv[n_fit:] are views, not copies).
+        y_fv: binary target (1 = class of interest), same order.
+        n_fit: number of fit rows at the top of X_fv.
+    """
+    tuned = tune_binary_classifiers(X_fv, y_fv, n_fit, config)
+    return fit_binary_classifiers(X_fv, y_fv, tuned, config)
 
 
 #: History of evaluated runs, see `record_training_run`.
@@ -1609,7 +1823,15 @@ def plot_feature_importances(
     """
     importances: dict[str, tuple[str, pd.Series]] = {}
     for name, model in models_dict.items():
-        inner = model.named_steps[PIPE_STEP] if isinstance(model, ImbPipeline) else model
+        inner = model
+        # calibrated wrappers -> fitted pipeline -> classifier step -> fitted estimator
+        if isinstance(inner, PriorCorrected):
+            inner = inner.model
+        if hasattr(inner, "calibrated_classifiers_"):
+            inner = inner.calibrated_classifiers_[0].estimator
+        if hasattr(inner, "estimator") and not isinstance(inner, (ImbPipeline, BalancedFit)):
+            inner = inner.estimator           # FrozenEstimator
+        inner = inner.named_steps[PIPE_STEP] if isinstance(inner, ImbPipeline) else inner
         if hasattr(inner, "estimator_") and hasattr(inner.estimator_, "feature_importances_"):
             inner = inner.estimator_
         if hasattr(inner, "feature_importances_"):
