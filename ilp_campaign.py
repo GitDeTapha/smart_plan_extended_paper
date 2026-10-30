@@ -29,7 +29,10 @@ from data_driven_plan import Config, Instance, available_cpus, evaluate_planning
 #: of 0.97 at p_bar = 0.03. Fixing the concentration keeps the mean exact.
 BETA_CONCENTRATION = 6.111
 #: q is kept inside (0, 1), as `Instance` requires; the clip moves the mean by
-#: less than 1e-3 at every level used (checked by `check_beta_mean`).
+#: less than 1e-3 at every level used (checked by `check_beta_mean`). Calibrated
+#: holdout q_i are stored as predicted, in [0, 1] (isotonic calibration is a step
+#: function whose end blocks can be exactly 0 or 1), and clipped here only when
+#: they enter an Instance, as `build_instance_from_patients` does (Q_BOUNDS).
 Q_CLIP = (0.01, 0.999)
 
 
@@ -50,10 +53,10 @@ def draw_q_beta(rng: np.random.Generator, p_bar: float, n: int,
 
 
 def draw_q_empirical(rng: np.random.Generator, q_pool: np.ndarray, n: int) -> np.ndarray:
-    """n attendance probabilities resampled from calibrated holdout predictions."""
+    """n attendance probabilities resampled from calibrated holdout predictions, clipped to Q_CLIP."""
     q_pool = np.asarray(q_pool, dtype=float)
-    if q_pool.size == 0 or not np.all((q_pool > 0) & (q_pool < 1)):
-        raise ValueError("q_pool must be a non-empty array of probabilities in (0, 1)")
+    if q_pool.size == 0 or not np.all((q_pool >= 0) & (q_pool <= 1)):
+        raise ValueError("q_pool must be a non-empty array of probabilities in [0, 1]")
     return np.clip(rng.choice(q_pool, n, replace=True), *Q_CLIP)
 
 
@@ -116,8 +119,8 @@ def check_holdout_scores(df) -> "pd.DataFrame":
         raise ValueError("holdout scores: empty table")
     if df[list(HOLDOUT_COLUMNS)].isna().any().any():
         raise ValueError("holdout scores: missing values")
-    if not ((df["q_i"] > 0) & (df["q_i"] < 1)).all():
-        raise ValueError("holdout scores: q_i outside (0, 1)")
+    if not ((df["q_i"] >= 0) & (df["q_i"] <= 1)).all():
+        raise ValueError("holdout scores: q_i outside [0, 1]")
     for col in ("group_pred", "group_actual"):
         if not df[col].isin(["A", "B"]).all():
             raise ValueError(f"holdout scores: {col} must be 'A' or 'B'")
@@ -711,7 +714,8 @@ def _holdout_instance(ctx: CampaignContext, spec: dict, groups: Sequence[str]) -
     n_long = round(spec["long_share"] * cc.slots_per_day)
     L = rng.permutation([L_long] * n_long + [L_short] * (cc.slots_per_day - n_long)).tolist()
     s = np.where(np.asarray(groups) == "A", ctx.s_A, ctx.s_B)
-    return Instance(n=len(groups), D=1, T=[cc.slots_per_day], L=[L], s=s, q=np.asarray(spec["q"]),
+    return Instance(n=len(groups), D=1, T=[cc.slots_per_day], L=[L], s=s,
+                    q=np.clip(np.asarray(spec["q"], dtype=float), *Q_CLIP),
                     c_I=1.0, c_W=spec["cW_ratio"], c_O=ctx.c_O)
 
 
