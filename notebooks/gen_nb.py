@@ -422,6 +422,11 @@ HOLDOUT = load_holdout_scores(HOLDOUT_SCORES_PATH)
 Q_POOL = HOLDOUT["q_i"].to_numpy()
 print(f"Holdout : {len(HOLDOUT):,} patients, q̄ = {Q_POOL.mean():.4f}, "
       f"no-show observé = {HOLDOUT['no_show'].mean():.4f}")
+# La calibration isotone est en escalier : ses paliers extrêmes peuvent valoir 0 ou 1.
+# Les q_i sont stockés tels que prédits et tronqués à Q_CLIP à l'entrée d'une instance.
+Q_OUTSIDE = int(((Q_POOL < Q_CLIP[0]) | (Q_POOL > Q_CLIP[1])).sum())
+print(f"q_i hors de {Q_CLIP} (tronqués dans les instances) : {Q_OUTSIDE} sur {len(Q_POOL):,} "
+      f"({100 * Q_OUTSIDE / len(Q_POOL):.4f} %)")
 """)
 
 code("""\
@@ -812,6 +817,7 @@ _md = f\"\"\"# RESULTS.md, chiffres clés pour le manuscrit
 Paramètres : {PLNE['source_run']} (commit {PLNE['git_commit']}), s_A = {s_A:.2f}, s_B = {s_B:.2f},
 pi_A = {pi_A:.4f}, c_O = {C_O_BASE}. Campagne : S = {CC.S}, R = {CC.R}, limite {CC.time_limit:g} s,
 gap cible {CC.mip_gap:g}. Smoke : {SMOKE}.
+Holdout : {len(Q_POOL):,} patients, {Q_OUTSIDE} q_i hors de {Q_CLIP}, tronqués dans les instances.
 
 ## Table 1 (section 3)
 - Historique (s_A = 43, s_B = 8) : Z* = {_sol_hist.Z_complete:.4f} ({_sol_hist.status})

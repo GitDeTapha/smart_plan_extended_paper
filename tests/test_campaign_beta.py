@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ilp_campaign import (BETA_CONCENTRATION, beta_parameters, check_beta_mean,
+from ilp_campaign import (BETA_CONCENTRATION, Q_CLIP, beta_parameters, check_beta_mean,
                           check_holdout_scores, draw_q_empirical, generate_instance)
 
 
@@ -31,7 +31,13 @@ def test_empirical_variant_resamples_the_pool():
     q = draw_q_empirical(np.random.default_rng(0), pool, 1000)
     assert set(np.round(q, 6)) <= set(pool)
     with pytest.raises(ValueError):
-        draw_q_empirical(np.random.default_rng(0), np.array([0.5, 1.0]), 3)
+        draw_q_empirical(np.random.default_rng(0), np.array([0.5, 1.2]), 3)
+
+
+def test_isotonic_end_blocks_are_clipped_when_drawn():
+    # isotonic calibration can predict P(no-show) = 0 or 1 exactly
+    q = draw_q_empirical(np.random.default_rng(0), np.array([0.0, 1.0]), 1000)
+    assert set(q) == set(Q_CLIP)
 
 
 def test_generator_uses_the_pool_and_shares_the_grid():
@@ -49,5 +55,8 @@ def test_holdout_scores_are_checked():
     check_holdout_scores(ok)
     with pytest.raises(ValueError):
         check_holdout_scores(ok.drop(columns="no_show"))
+    check_holdout_scores(ok.assign(q_i=[1.0, 0.0]))     # isotonic end blocks, kept as predicted
     with pytest.raises(ValueError):
-        check_holdout_scores(ok.assign(q_i=[1.0, 0.8]))
+        check_holdout_scores(ok.assign(q_i=[1.2, 0.8]))
+    with pytest.raises(ValueError):
+        check_holdout_scores(ok.assign(q_i=[-0.1, 0.8]))
