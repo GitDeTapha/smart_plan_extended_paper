@@ -1,0 +1,9 @@
+Item,Value
+Split,"[{'Partition': 'fit', 'Rows': 22474711, 'Share': 0.5599999930232696, 'NoShow rate': 0.031672754323737465}, {'Partition': 'valid', 'Rows': 2809339, 'Share': 0.07000000224252047, 'NoShow rate': 0.03167257493666659}, {'Partition': 'calib', 'Rows': 2809339, 'Share': 0.07000000224252047, 'NoShow rate': 0.03167257493666659}, {'Partition': 'test', 'Rows': 8026683, 'Share': 0.20000000996675762, 'NoShow rate': 0.03167260996852623}, {'Partition': 'inference', 'Rows': 4013341, 'Share': 0.09999999252493179, 'NoShow rate': 0.03167261391444186}]"
+No-show: selected model,ANN (isotonic)
+No-show: test AUC-ROC / AUC-PR / Brier / BSS,0.7573 / 0.1355 / 0.0290 / 0.0540
+Durations,"kmedians/median: s_A=36, s_B=7 min, cutoff 21.5 min"
+Durations: bootstrapped silhouette (K=2),"mean=0.5969, sd=0.0026"
+Group: selected model,XGBoost (isotonic)
+Group: test AUC-ROC / Brier,0.7032 / 0.2004
+"ILP day: status, Z","optimal, 56.6889"
