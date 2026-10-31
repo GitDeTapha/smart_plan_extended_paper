@@ -55,6 +55,8 @@ import os
 # le même modèle (pas de duplication de solve_ilp/Instance/Config). Ce
 # notebook est exécuté avec le répertoire du projet comme répertoire courant.
 sys.path.insert(0, os.getcwd())
+for _d in ("figures", "tables", "results"):   # outputs; absent from a fresh clone (not versioned)
+    os.makedirs(_d, exist_ok=True)
 from data_driven_plan import (
     Instance, Config, Solution, compute_coefficients, solve_ilp, SOLVER_NAME,
     objective_latex, validate_decisions,
