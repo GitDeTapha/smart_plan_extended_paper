@@ -7,9 +7,9 @@ from data_driven_plan import Config, Instance, eval_slot_exact, solve_ilp
 
 def _saturated_instance(seed):
     """Long patients in 60-minute slots: any pair (36 + 30 > 60 minutes) is saturated
-    (delta != 0, gamma != 0) and double-booking still pays, so the optimum uses some."""
+    (delta != 0, gamma != 0); four patients in two slots, so the optimum doubles both."""
     rng = np.random.default_rng(seed)
-    n = 6
+    n = 4    # every patient served: at most two per slot
     s = np.where(np.arange(n) % 2 == 0, 36.0, 30.0)
     q = rng.uniform(0.6, 0.95, n)
     return Instance(n=n, D=1, T=[2], L=[[60.0, 60.0]], s=s, q=q, c_I=1.0, c_W=0.5, c_O=0.5)

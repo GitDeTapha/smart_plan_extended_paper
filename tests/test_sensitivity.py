@@ -25,6 +25,6 @@ def test_table_flags_significance_only_with_a_paired_test():
                        "Z_hat": [11, 12, 13, 14, 15, 16.0], "Z_opt": [10, 11, 12, 13, 14, 15.0],
                        "Zsim_hat": [11, 12, 13, 14, 15, 16.0], "Zsim_opt": [10, 11, 12, 13, 14, 15.0]})
     t = sensitivity_table(df)
-    assert bool(t.loc[0, "Significatif (5 %)"])
+    assert bool(t.loc[0, "Significant (5 %)"])
     t0 = sensitivity_table(df.assign(Z_hat=df["Z_opt"], Zsim_hat=df["Zsim_opt"]))
-    assert not bool(t0.loc[0, "Significatif (5 %)"])
+    assert not bool(t0.loc[0, "Significant (5 %)"])

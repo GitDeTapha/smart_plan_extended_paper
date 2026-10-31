@@ -170,7 +170,6 @@ class CampaignConfig:
     p_bars: tuple
     long_shares: tuple
     cw_ratios: tuple
-    cw_fine: tuple             # c_W / c_I grid of the threshold study (rec. 11)
     holdout_days: int          # out-of-sample days built from holdout patients (rec. 10)
     n_workers: int             # processes; one HiGHS thread each
     seed_base: int = 1000
@@ -203,14 +202,13 @@ class CampaignConfig:
         return cls(days=1, slots_per_day=8, R=30, time_limit=600.0, mip_gap=1e-6, M_sim=10_000,
                    ratios=(1.0, 1.25, 1.5, 1.75, 2.0), p_bars=(0.03, 0.10, 0.20, 0.30),
                    long_shares=(0.15, 0.25, 0.50), cw_ratios=(0.1, 0.25, 0.5, 1.0, 2.0),
-                   cw_fine=tuple(round(1.0 + 0.05 * k, 2) for k in range(11)),
                    holdout_days=100, n_workers=n_workers or physical_cores())
 
     @classmethod
     def smoke(cls, n_workers: Optional[int] = None) -> "CampaignConfig":
         return cls(days=1, slots_per_day=5, R=2, time_limit=10.0, mip_gap=1e-4, M_sim=2_000,
                    ratios=(1.0, 1.5, 2.0), p_bars=(0.03, 0.20), long_shares=(0.15, 0.50),
-                   cw_ratios=(0.5, 1.0), cw_fine=(1.0, 1.25, 1.5),
+                   cw_ratios=(0.5, 1.0),
                    holdout_days=4, n_workers=n_workers or physical_cores())
 
 
@@ -392,9 +390,20 @@ def spec_cost(spec: dict) -> float:
     return spec["ratio"] * (2.0 if spec.get("Q_bar") is not None else 1.0)
 
 
-def solve_spec(ctx: CampaignContext, spec: dict) -> dict:
-    """Worker entry point: the cached ILP record of a cell, with the cell's factors."""
-    rec = ctx.solve(spec)
+def solve_spec(ctx: CampaignContext, spec: dict, allow_infeasible: bool = False) -> dict:
+    """Worker entry point: the cached ILP record of a cell, with the cell's factors.
+
+    allow_infeasible: a cell proven infeasible by HiGHS (a hard cap Q_bar may
+    leave no way to serve every patient) is returned with status "infeasible"
+    and no cost, instead of stopping the campaign. Any other failure raises.
+    """
+    from data_driven_plan import NoFeasibleSolution
+    try:
+        rec = ctx.solve(spec)
+    except NoFeasibleSolution as exc:
+        if not (allow_infeasible and exc.termination == "infeasible"):
+            raise
+        rec = {"status": "infeasible", "Z_complete": float("nan"), "n_served": 0, "n_double": 0}
     out = {k: v for k, v in rec.items() if k != "planning"}
     out.update(spec)
     out["n"] = ctx.instance(spec).n
@@ -428,7 +437,7 @@ def simulate_spec(ctx: CampaignContext, spec: dict, cvs: Sequence[float] = (0.0,
 # Benchmark policies (rec. 8). Every schedule is evaluated with the same exact
 # cost as the ILP (`model_cost`), whatever objective produced it.
 # ----------------------------------------------------------------------------
-def _x_model(inst: Instance, capacity: int):
+def _x_model(inst: Instance, capacity: int, serve_all: bool = False):
     import pyomo.environ as pyo
     slots = [(d, t) for d in range(inst.D) for t in range(inst.T[d])]
     idx = [(i, d, t) for i in range(inst.n) for (d, t) in slots]
@@ -436,7 +445,8 @@ def _x_model(inst: Instance, capacity: int):
     m.x = pyo.Var(idx, domain=pyo.Binary, initialize=0)
     m.C1 = pyo.ConstraintList()
     for i in range(inst.n):
-        m.C1.add(sum(m.x[i, d, t] for (d, t) in slots) <= 1)
+        assigned = sum(m.x[i, d, t] for (d, t) in slots)
+        m.C1.add(assigned == 1 if serve_all else assigned <= 1)
     m.C2 = pyo.ConstraintList()
     for (d, t) in slots:
         m.C2.add(sum(m.x[i, d, t] for i in range(inst.n)) <= capacity)
@@ -456,7 +466,10 @@ def _solve_x_model(m, inst, slots, cfg) -> dict:
 
 
 def bench_b1_single(inst: Instance, cfg: Config) -> dict:
-    """B1, single booking: the ILP's objective with at most one patient per slot."""
+    """B1, single booking: the ILP's objective with at most one patient per slot.
+
+    One patient per slot cannot serve everyone when n > S: B1 serves at most S
+    patients, by definition of single booking, and the others are refused."""
     import pyomo.environ as pyo
     from data_driven_plan import compute_coefficients
     co = compute_coefficients(inst)
@@ -467,11 +480,12 @@ def bench_b1_single(inst: Instance, cfg: Config) -> dict:
 
 def bench_b2_fluid(inst: Instance, cfg: Config) -> dict:
     """B2, fluid (Jensen) approximation: idle of a slot replaced by
-    (L - sum q_i s_i x_i)^+, linearised with u >= 0; waiting ignored."""
+    (L - sum q_i s_i x_i)^+, linearised with u >= 0; waiting ignored. Same
+    constraints as the ILP, every patient served."""
     import pyomo.environ as pyo
     from data_driven_plan import compute_coefficients
     co = compute_coefficients(inst)
-    m, slots, idx = _x_model(inst, 2)
+    m, slots, idx = _x_model(inst, 2, serve_all=True)
     m.u = pyo.Var(slots, bounds=(0, None))
     m.Cf = pyo.ConstraintList()
     for (d, t) in slots:
@@ -487,7 +501,8 @@ def bench_b3_greedy(inst: Instance, cfg: Config = None) -> dict:
 
 def bench_b4_valenzuela(inst: Instance, cfg: Config, Q_cap: float = 1.2) -> dict:
     """B4, utility in the spirit of Valenzuela: max sum q_i x - 0.5 * (double slots),
-    expected attendance per slot capped at Q_cap, at most two patients per slot."""
+    expected attendance per slot capped at Q_cap, at most two patients per slot.
+    The cap can make serving everyone infeasible, so B4 serves as many as it can."""
     import pyomo.environ as pyo
     m, slots, idx = _x_model(inst, 2)
     m.B = pyo.Var(slots, domain=pyo.Binary)
@@ -512,11 +527,11 @@ def bench_b5_uniform(inst: Instance, cfg: Config = None) -> dict:
     return {"planning": planning, "status": "heuristic", "gap": float("nan"), "solve_time": 0.0}
 
 
-BENCHMARKS = {"B1": ("Réservation simple", bench_b1_single),
-              "B2": ("Fluide (Jensen)", bench_b2_fluid),
-              "B3": ("Glouton", bench_b3_greedy),
-              "B4": ("Utilité Valenzuela", bench_b4_valenzuela),
-              "B5": ("Surréservation uniforme", bench_b5_uniform)}
+BENCHMARKS = {"B1": ("Single booking", bench_b1_single),
+              "B2": ("Fluid (Jensen)", bench_b2_fluid),
+              "B3": ("Greedy", bench_b3_greedy),
+              "B4": ("Valenzuela utility", bench_b4_valenzuela),
+              "B5": ("Uniform overbooking", bench_b5_uniform)}
 
 
 def bench_spec(ctx: CampaignContext, spec: dict) -> dict:
@@ -647,36 +662,13 @@ def sensitivity_table(df) -> "pd.DataFrame":
     for (kind, level), g in df.groupby(["kind", "level"], sort=True):
         ex = paired_summary(g["Z_hat"], g["Z_opt"])
         sim = paired_summary(g["Zsim_hat"], g["Zsim_opt"])
-        rows.append({"Perturbation": kind, "Niveau": level, "n": ex["n"],
-                     "Regret exact (%)": ex["rel_pct"], "ΔZ exact": ex["mean_diff"],
-                     "IC 95 % bas": ex["ci_low"], "IC 95 % haut": ex["ci_high"],
-                     "p exact": ex["p_wilcoxon"], "ΔZ simulé": sim["mean_diff"],
-                     "p simulé": sim["p_wilcoxon"],
-                     "Significatif (5 %)": bool(ex["p_wilcoxon"] < 0.05) if ex["n"] > 1 else False})
+        rows.append({"Perturbation": kind, "Level": level, "n": ex["n"],
+                     "Exact regret (%)": ex["rel_pct"], "Exact ΔZ": ex["mean_diff"],
+                     "95 % CI low": ex["ci_low"], "95 % CI high": ex["ci_high"],
+                     "Exact p": ex["p_wilcoxon"], "Simulated ΔZ": sim["mean_diff"],
+                     "Simulated p": sim["p_wilcoxon"],
+                     "Significant (5 %)": bool(ex["p_wilcoxon"] < 0.05) if ex["n"] > 1 else False})
     return pd.DataFrame(rows)
-
-
-# ----------------------------------------------------------------------------
-# Double-booking threshold (rec. 11)
-# ----------------------------------------------------------------------------
-def threshold_spec(ctx: CampaignContext, spec: dict) -> dict:
-    """Worker: ILP of a cell of the fine c_W/c_I grid, read against the
-    per-patient threshold. Putting j behind i in a slot (no saturation, equal
-    durations) trades c_I q_j s of idle for c_W q_i q_j s of waiting, so it pays
-    when c_W / c_I < 1 / q_i, where i is the patient served first. The
-    threshold is individual, 1/q_i, not 1/q_bar."""
-    rec = ctx.solve(spec)
-    inst = ctx.instance(spec)
-    r = spec["cW_ratio"]
-    first = [p[0] for p in rec["planning"].values() if len(p) == 2]
-    return {**spec, "n_double": rec["n_double"], "has_double": rec["n_double"] > 0,
-            "status": rec["status"],
-            "share_below_threshold": float(np.mean(r < 1.0 / inst.q)),
-            "doubles_rule_ok": float(np.mean([r < 1.0 / inst.q[i] for i in first])) if first else float("nan")}
-
-
-def threshold_specs(cc: CampaignConfig) -> list:
-    return [cell_spec(cc, "cw_fine", seed, cW_ratio=v) for v in cc.cw_fine for seed in cc.seeds]
 
 
 # ----------------------------------------------------------------------------
@@ -753,4 +745,5 @@ def holdout_day(ctx: CampaignContext, spec: dict) -> dict:
         row[f"{name}_Zday"] = true.c_I * ei + true.c_W * ew + true.c_O * eo
         row[f"{name}_Zreal"] = float(true.c_I * idle[0] + true.c_W * wait[0] + true.c_O * ot[0])
         row[f"{name}_status"] = rec["status"]
+        row[f"{name}_served"] = sum(len(p) for p in rec["planning"].values())
     return row

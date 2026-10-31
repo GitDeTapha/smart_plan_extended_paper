@@ -2677,6 +2677,14 @@ def relative_gap(objective: float, bound: float) -> float:
     return abs(objective - bound) / max(abs(objective), 1e-9)
 
 
+class NoFeasibleSolution(RuntimeError):
+    """HiGHS stopped without a feasible solution; `termination` is its condition name."""
+
+    def __init__(self, message: str, termination: str):
+        super().__init__(message)
+        self.termination = termination
+
+
 def solve_model(m, cfg: "Config", warm_start: Optional[dict] = None) -> SolveReport:
     """Solve a Pyomo MIP with HiGHS and load the solution only once it is known to exist.
 
@@ -2690,8 +2698,8 @@ def solve_model(m, cfg: "Config", warm_start: Optional[dict] = None) -> SolveRep
         SolveReport read from the solver.
 
     Raises:
-        RuntimeError: no feasible solution (infeasible, unbounded, error, or the
-            time limit was reached before any incumbent was found).
+        NoFeasibleSolution: no feasible solution (infeasible, unbounded, error, or
+            the time limit was reached before any incumbent was found).
     """
     opt = _AppsiHighs()
     opt.config.load_solution = False
@@ -2712,8 +2720,8 @@ def solve_model(m, cfg: "Config", warm_start: Optional[dict] = None) -> SolveRep
     tc = res.termination_condition
     incumbent = res.best_feasible_objective
     if tc not in _FEASIBLE_STOPS or incumbent is None or not np.isfinite(incumbent):
-        raise RuntimeError(f"HiGHS returned no feasible solution (termination: {tc.name}, "
-                           f"incumbent: {incumbent}, options: {options})")
+        raise NoFeasibleSolution(f"HiGHS returned no feasible solution (termination: {tc.name}, "
+                                 f"incumbent: {incumbent}, options: {options})", tc.name)
     res.solution_loader.load_vars()
     bound = res.best_objective_bound
     # HiGHS' own figures, read from the underlying highspy model. The wall-clock
@@ -2842,6 +2850,7 @@ class Config:
     threads: int = 1               # one HiGHS thread; parallelism is across instances
     require_optimal: bool = False  # raise instead of returning an unproven incumbent
     symmetry_breaking: bool = False  # occupancy non-increasing over identical slots of a day
+    serve_all: bool = True         # C1 as an equality: every patient gets a slot (needs n <= 2 S)
 
 
 @dataclass
@@ -2933,6 +2942,12 @@ def solve_ilp(inst: Instance, cfg: Optional[Config] = None,
     slots, pairs = coeffs["slots"], coeffs["pairs"]
 
     I = list(range(inst.n))
+    # Leaving a patient out costs nothing in the objective, so with C1 as an
+    # inequality the optimum refuses patients whose double would add more waiting
+    # than it removes idle time. Serving everyone is a constraint of the clinic,
+    # feasible only when the n patients fit two per slot.
+    if cfg.serve_all and inst.n > 2 * len(slots):
+        raise ValueError(f"serve_all: {inst.n} patients cannot fit in {len(slots)} slots of capacity 2")
     active_pairs = [(i, j) for (i, j) in pairs if not cfg.pruning or inst.q[i] * inst.q[j] > cfg.pruning_thr]
     x_idx = [(i, d, t) for i in I for (d, t) in slots]
     z_idx = [(i, j, d, t) for (i, j) in active_pairs for (d, t) in slots]
@@ -2949,7 +2964,8 @@ def solve_ilp(inst: Instance, cfg: Optional[Config] = None,
 
     m.C1 = pyo.ConstraintList()
     for i in I:
-        m.C1.add(sum(m.x[i, d, t] for (d, t) in slots) <= 1)
+        assigned = sum(m.x[i, d, t] for (d, t) in slots)
+        m.C1.add(assigned == 1 if cfg.serve_all else assigned <= 1)
 
     m.C2 = pyo.ConstraintList()
     for (d, t) in slots:
@@ -3050,7 +3066,7 @@ def solve_ilp(inst: Instance, cfg: Optional[Config] = None,
     n_served = sum(len(v) for v in planning.values())
     n_double = sum(1 for v in planning.values() if len(v) == 2)
 
-    options = {**report.options, "z_binary": cfg.z_binary, "pruning": cfg.pruning,
+    options = {**report.options, "serve_all": cfg.serve_all, "z_binary": cfg.z_binary, "pruning": cfg.pruning,
                "symmetry_breaking": cfg.symmetry_breaking, "n_symmetry_cuts": len(m.SB),
                "fractional_z": n_fractional}
     return Solution(planning=planning, E_idle=E_idle, E_wait=E_wait, E_OT=E_OT,

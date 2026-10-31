@@ -14,7 +14,7 @@ def test_production_and_smoke_sizes():
     assert (smoke.S, smoke.R) == (5, 2)
     assert prod.mip_gap == 1e-6 and prod.time_limit == 600.0
     assert prod.solver_config().threads == 1
-    assert prod.cw_fine[0] == 1.0 and prod.cw_fine[-1] == 1.5 and len(prod.cw_fine) == 11
+    assert max(prod.ratios) <= 2.0                           # every patient fits two per slot
 
 
 def test_cache_computes_once(tmp_path):
