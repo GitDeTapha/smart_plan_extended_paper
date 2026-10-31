@@ -65,6 +65,13 @@ from data_driven_plan import (
 )
 import pyomo.environ as pyo
 
+# Figures of the article: data_driven_plan sets the large fonts of the training
+# notebook (15 pt labels), which overlap or get cut in multi-panel figures sized
+# for a printed page. Smaller fonts here, figures sized close to their print width.
+plt.rcParams.update({"font.size": 8, "axes.labelsize": 8, "axes.titlesize": 8,
+                     "xtick.labelsize": 7, "ytick.labelsize": 7, "legend.fontsize": 7,
+                     "legend.title_fontsize": 7, "lines.markersize": 4, "lines.linewidth": 1.4})
+
 DECISIONS = validate_decisions(DURATION_METHOD, DURATION_STAT, C_O_BASE, SLOT_LENGTHS,
                                SPLIT_MODE, RANDOM_STATE, SMOKE)
 for _k, _v in DECISIONS.items():
@@ -127,7 +134,12 @@ md("## 1. Modèle\n\n"
    "`Instance`, `Config`, `Solution`, `compute_coefficients` et `solve_ilp` sont "
    "importés de **data_driven_plan.py** (racine du projet), voir la cellule "
    "d'environnement ci-dessus. Ce cœur de modèle est ainsi partagé, à "
-   "l'identique, avec `data_driven_plan.ipynb` (section 7).")
+   "l'identique, avec `data_driven_plan.ipynb` (section 7).\n\n"
+   "**Tous les patients sont planifiés** (`Config.serve_all = True`) : la contrainte C1 est une "
+   "égalité, $\\sum_{d,t} x_{idt} = 1$. Avec C1 en inégalité, ne pas planifier un patient ne coûtait "
+   "rien dans l'objectif, et l'optimum refusait les patients dont le double ajoutait plus d'attente "
+   "qu'il ne retirait d'inactivité (12,5 patients servis sur 16 en moyenne à la charge 2,0). "
+   "L'égalité exige $n \\le 2S$ ; sinon `solve_ilp` s'arrête avec une erreur explicite.")
 
 code("""\
 # ── 1.1-1.3 Dataclasses + compute_coefficients + solve_ilp ───────────────────
@@ -220,7 +232,7 @@ code("""\
 # pour cela : patients de 36 et 30 min dans des créneaux de 60 min (36 + 30 > 60).
 def _saturated_instance(seed):
     rng = np.random.default_rng(seed)
-    n = 6
+    n = 4    # tous servis : au plus deux patients par créneau
     s = np.where(np.arange(n) % 2 == 0, 36.0, 30.0)
     q = rng.uniform(0.6, 0.95, n)
     return Instance(n=n, D=1, T=[2], L=[[60.0, 60.0]], s=s, q=q, c_I=1.0, c_W=0.5, c_O=C_O_BASE)
@@ -268,9 +280,11 @@ print("\\n=== Tous les tests d'exactitude sont passés ===")
 
 # ── Section 3 : Exemple illustratif ──────────────────────────────────────────
 md("## 3. Exemple illustratif, Table 1\n\n"
-   "Instance : n=10, D=1, 4 créneaux (2×30, 2×60 min) ; patients 0 à 2 du groupe A, 3 à 9 du "
-   "groupe B ; q=[0,90 ; 0,85 ; … ; 0,45] ; c_I=1, c_W=0,5, c_O=0,5 (coûts de la Table 1 du "
-   "manuscrit, fixés ici indépendamment de `C_O_BASE`).\n\n"
+   "Instance : n=7, D=1, 4 créneaux (2×30, 2×60 min) ; patients 0 à 2 du groupe A, 3 à 6 du "
+   "groupe B ; q=[0,90 ; 0,85 ; … ; 0,60] ; c_I=1, c_W=0,5, c_O=0,5 (coûts de la Table 1 du "
+   "manuscrit, fixés ici indépendamment de `C_O_BASE`). L'ancienne instance avait 10 patients ; "
+   "son optimum laissait de côté les patients 7 à 9 (q = 0,55 ; 0,50 ; 0,45), ce que la contrainte "
+   "« tous servis » interdit (10 > 2 × 4). Sans eux, l'optimum et $Z^\\star$ sont inchangés.\n\n"
    "Correction rec. 5 : l'exemple ne dépend plus des données. Variante **publiée** : $s_A=43$, "
    "$s_B=8$ min, $c_O=0{,}5$ (coûts de la Table 1 du manuscrit), doit redonner $Z^\\star = 70{,}82$. "
    "Variante **historique** : mêmes durées, $c_O$ = `C_O_BASE` ; avec $c_O = 0$ (modèle du "
@@ -279,12 +293,12 @@ md("## 3. Exemple illustratif, Table 1\n\n"
 
 code("""\
 # ── 3.1 Construction et résolution des deux variantes ───────────────────────
-ILLUS_Q = np.array([0.90, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.55, 0.50, 0.45])
+ILLUS_Q = np.array([0.90, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60])
 ILLUS_L = [[30.0, 30.0, 60.0, 60.0]]
-ILLUS_GROUPS = np.array(["A"] * 3 + ["B"] * 7)
+ILLUS_GROUPS = np.array(["A"] * 3 + ["B"] * 4)
 
 def illustrative_instance(sA, sB, cO):
-    return Instance(n=10, D=1, T=[4], L=ILLUS_L, s=np.where(ILLUS_GROUPS == "A", sA, sB),
+    return Instance(n=len(ILLUS_Q), D=1, T=[4], L=ILLUS_L, s=np.where(ILLUS_GROUPS == "A", sA, sB),
                     q=ILLUS_Q, c_I=1.0, c_W=0.5, c_O=cO)
 
 # "publie" : coûts de la Table 1 du manuscrit (c_O = 0,5), contrôle de non-régression de 70,82.
@@ -297,7 +311,7 @@ for _tag, (_sA, _sB, _cO) in {"publie": (43.0, 8.0, 0.5), "historique": (43.0, 8
     ILLUS[_tag] = (_inst, _sol)
     print(f"[{_tag}] s_A={_sA:.2f}, s_B={_sB:.2f} : statut {_sol.status}, gap {_sol.gap_complete:.1e}, "
           f"Z* = {_sol.Z_complete:.4f}  (E[Idle]={_sol.E_idle:.3f}, E[Wait]={_sol.E_wait:.3f}, "
-          f"E[OT]={_sol.E_OT:.3f}), servis {_sol.n_served}/10, doubles {_sol.n_double}/4")
+          f"E[OT]={_sol.E_OT:.3f}), servis {_sol.n_served}/{_inst.n}, doubles {_sol.n_double}/4")
 
 _Z_pub = ILLUS["publie"][1].Z_complete
 assert abs(_Z_pub - 70.82) < 5e-3, f"Table 1 publiée : Z* = {_Z_pub:.4f}, attendu 70,82"
@@ -325,17 +339,18 @@ def illustrative_tables(inst, sol):
     for (d, t) in sol.coeffs["slots"]:
         pats = sol.planning.get((d, t), [])
         ei, ew, eo = eval_slot_exact(pats, inst.q, inst.s, inst.L[d][t])
-        rows.append({"Créneau": f"S{t}", "L (min)": inst.L[d][t],
-                     "Patients (ordre SPT)": ", ".join(map(str, pats)) or "-",
-                     "Groupes": "".join(ILLUS_GROUPS[i] for i in pats) or "-",
-                     "E[Idle] (min)": inst.c_I * ei, "E[Wait] (min)": inst.c_W * ew,
-                     "E[OT] (min)": inst.c_O * eo})
+        # Cost columns are weighted by their unit cost: c_W E[Wait] is not minutes of waiting.
+        rows.append({"Slot": f"S{t}", "L (min)": inst.L[d][t],
+                     "Patients (SPT order)": ", ".join(map(str, pats)) or "-",
+                     "Groups": "".join(ILLUS_GROUPS[i] for i in pats) or "-",
+                     "E[Wait] (min)": ew, "c_I E[Idle]": inst.c_I * ei, "c_W E[Wait]": inst.c_W * ew,
+                     "c_O E[OT]": inst.c_O * eo})
         if len(pats) == 2:
             i, j = min(pats), max(pats)
-            pair_rows.append({"i": i, "j": j, "Créneau": f"S{t}", "L (min)": inst.L[d][t],
+            pair_rows.append({"i": i, "j": j, "Slot": f"S{t}", "L (min)": inst.L[d][t],
                               "q_i": inst.q[i], "q_j": inst.q[j], "s_i": inst.s[i], "s_j": inst.s[j],
                               "delta": dl[i, j, d, t], "w": w[i, j], "gamma": gm[i, j, d, t],
-                              "coeff. z": inst.c_W * w[i, j] - (inst.c_I + inst.c_O) * dl[i, j, d, t]})
+                              "z coeff.": inst.c_W * w[i, j] - (inst.c_I + inst.c_O) * dl[i, j, d, t]})
     return pd.DataFrame(rows), pd.DataFrame(pair_rows)
 
 ILLUS_TABLES = {}
@@ -354,11 +369,11 @@ from data_driven_plan import latex_table
 for _tag, (_df_plan, _df_pairs) in ILLUS_TABLES.items():
     _Z = ILLUS[_tag][1].Z_complete
     latex_table(_df_plan, f"tables/table1_planning_{_tag}.tex",
-                caption=f"Planning illustratif, durées {_tag} ($Z^\\\\star$ = {_Z:.2f}).",
+                caption=f"Illustrative schedule, {_tag} durations ($Z^\\\\star$ = {_Z:.2f}).",
                 label=f"tab:planning-{_tag}", decimals=3)
     if len(_df_pairs):
         latex_table(_df_pairs, f"tables/table1_pairs_{_tag}.tex",
-                    caption=f"Coefficients des paires doubles à l'optimum, durées {_tag}.",
+                    caption=f"Coefficients of the double-booked pairs at the optimum, {_tag} durations.",
                     label=f"tab:pairs-{_tag}", decimals=4)
 print("Tables LaTeX exportées dans tables/")
 """)
@@ -465,11 +480,18 @@ _df_doe["occ"] = _df_doe["n_served"] / _df_doe["n"]
 _df_doe["double_rate"] = _df_doe["n_double"] / CC.S
 _df_doe.to_csv("results/doe_ilp.csv", index=False)
 print(f"{len(DOE_SPECS)} PLNE en {_t_doe/60:.1f} min sur {CC.n_workers} processus")
-_doe_summary = _df_doe.groupby("label")[["Z_complete", "E_idle", "E_wait", "E_OT", "n_served",
+_doe_summary = _df_doe.groupby("label")[["n", "Z_complete", "E_idle", "E_wait", "E_OT", "n_served",
                                          "double_rate", "solve_time"]].mean()
 print(_doe_summary.round(3))
-latex_table(_doe_summary.reset_index(), "tables/table_doe.tex",
-            caption=f"Plan d'expériences : moyennes par cellule (R = {R}).", label="tab:doe", decimals=3)
+# E_idle, E_wait, E_OT are weighted by c_I, c_W, c_O (cost units, not minutes)
+_DOE_COLS = {"label": "Cell", "Z_complete": "Z", "E_idle": "c_I E[Idle]", "E_wait": "c_W E[Wait]",
+             "E_OT": "c_O E[OT]", "n_served": "Served", "double_rate": "Double share", "solve_time": "Time (s)"}
+_doe_tab = _doe_summary.reset_index().rename(columns=_DOE_COLS)
+if C_O_BASE == 0:
+    _doe_tab = _doe_tab.drop(columns="c_O E[OT]")   # identically 0 without an overtime cost
+latex_table(_doe_tab, "tables/table_doe.tex",
+            caption=f"Design of experiments: means per cell over R = {R} seeds. Cost columns are "
+                    "weighted by their unit cost; every patient is served.", label="tab:doe", decimals=3)
 """)
 
 code("""\
@@ -495,21 +517,28 @@ def _mean_ci(x):
     h = sps.t.ppf(0.975, len(x) - 1) * x.std(ddof=1) / np.sqrt(len(x)) if len(x) > 1 else np.nan
     return x.mean(), h
 
-_FACTORS = [("ratio", "Charge n/S", "ratio_", CC.central_ratio),
-            ("p_bar", "Taux de no-show moyen p̄", "pbar_", CC.central_p_bar),
-            ("long_share", "Part de créneaux longs", "ls_", CC.central_long_share),
-            ("cW_ratio", "c_W / c_I", "cW_", CC.central_cw_ratio)]
-_METRICS = [("Z_complete", "Coût espéré Z (min pondérées)"), ("E_idle", "E[Idle] pondéré (min)"),
-            ("E_wait", "E[Wait] pondéré (min)"), ("E_OT", "E[OT] pondéré (min)")]
-fig, axes = plt.subplots(len(_METRICS), len(_FACTORS), figsize=(14, 11))
+_FACTORS = [("ratio", "Load n/S", "ratio_", CC.central_ratio),
+            ("p_bar", "Mean no-show rate", "pbar_", CC.central_p_bar),
+            ("long_share", "Share of long slots", "ls_", CC.central_long_share),
+            ("cW_ratio", "$c_W / c_I$", "cW_", CC.central_cw_ratio)]
+_METRICS = [("Z_complete", "Expected cost Z"), ("E_idle", "$c_I\\\\,E[\\\\mathrm{Idle}]$"),
+            ("E_wait", "$c_W\\\\,E[\\\\mathrm{Wait}]$")]
+if C_O_BASE != 0:
+    _METRICS.append(("E_OT", "$c_O\\\\,E[\\\\mathrm{OT}]$"))   # identically 0 without an overtime cost
+fig, axes = plt.subplots(len(_METRICS), len(_FACTORS), figsize=(7.2, 1.8 * len(_METRICS) + 0.3),
+                         sharex="col")
 for c, (fac, xlabel, prefix, center) in enumerate(_FACTORS):
     sub = _df_doe[(_df_doe["label"] == "central") | _df_doe["label"].str.startswith(prefix)]
     for r, (met, ylabel) in enumerate(_METRICS):
         g = sub.groupby(fac)[met].apply(_mean_ci)
         lv = np.array(g.index, float); mu = np.array([v[0] for v in g]); hw = np.array([v[1] for v in g])
         ax = axes[r, c]
-        ax.errorbar(lv, mu, yerr=hw, fmt="o-", capsize=3)
-        ax.set_xlabel(xlabel); ax.set_ylabel(ylabel); ax.grid(True, alpha=0.3)
+        ax.errorbar(lv, mu, yerr=hw, fmt="o-", capsize=2)
+        ax.grid(True, alpha=0.3)
+        if c == 0:
+            ax.set_ylabel(ylabel)
+        if r == len(_METRICS) - 1:
+            ax.set_xlabel(xlabel)
 plt.tight_layout()
 plt.savefig("figures/doe_metrics.pdf", bbox_inches="tight")
 plt.savefig("figures/doe_metrics.png", dpi=300, bbox_inches="tight")
@@ -518,7 +547,10 @@ plt.show()
 
 # ── Section 5 : Benchmarks ───────────────────────────────────────────────────
 md("## 5. Benchmarks B1 à B5\n\n"
-   "Cellule centrale, R graines appariées. B1 réservation simple (même objectif, un patient "
+   "Cellule centrale, R graines appariées. Le PLNE, B2, B3 et B5 servent tous les patients ; "
+   "B1 (un patient par créneau) n'en sert que S et B4 est limité par son plafond de présence : "
+   "leurs coûts portent sur moins de patients (colonne « Served »). "
+   "B1 réservation simple (même objectif, un patient "
    "par créneau) ; B2 approximation fluide (Jensen) ; B3 glouton ; B4 utilité de type "
    "Valenzuela (plafond de présence espérée 1,2 par créneau) ; B5 surréservation uniforme "
    "(rotation jusqu'à deux patients par créneau, sans regarder q ni s ; rec. 8). Chaque planning "
@@ -541,20 +573,26 @@ code("""\
 # ── 5.2 Comparaison appariée au PLNE ─────────────────────────────────────────
 _rows = []
 for _b, (_name, _) in BENCHMARKS.items():
-    for _kind, _suffix in (("modèle exact", "_Z"), ("simulé, NAC", "_Zsim")):
+    for _kind, _suffix in (("exact model", "_Z"), ("simulated, CRN", "_Zsim")):
         _ps = paired_summary(_df_bench[_b + _suffix], _df_bench["ILP" + _suffix])
-        _rows.append({"Politique": f"{_b} {_name}", "Coût": _kind,
-                      "ΔZ moyen": _ps["mean_diff"], "IC 95 % bas": _ps["ci_low"],
-                      "IC 95 % haut": _ps["ci_high"], "Écart moyen (%)": _ps["rel_pct"],
-                      "Bat le PLNE": f"{_ps['n_better']}/{_ps['n']}", "p (Wilcoxon)": _ps["p_wilcoxon"],
-                      "Doubles moyens": _df_bench[f"{_b}_double"].mean()})
+        _rows.append({"Policy": f"{_b} {_name}", "Cost": _kind,
+                      "Mean ΔZ": _ps["mean_diff"], "95 % CI low": _ps["ci_low"],
+                      "95 % CI high": _ps["ci_high"], "Mean gap (%)": _ps["rel_pct"],
+                      "Beats the ILP": f"{_ps['n_better']}/{_ps['n']}", "p (Wilcoxon)": _ps["p_wilcoxon"],
+                      "Doubles": _df_bench[f"{_b}_double"].mean(),
+                      "Served": _df_bench[f"{_b}_served"].mean()})
 _df_bench_cmp = pd.DataFrame(_rows)
 print(_df_bench_cmp.round(3).to_string(index=False))
-print(f"PLNE : doubles moyens {_df_bench['ILP_double'].mean():.1f}, coût exact moyen {_df_bench['ILP_Z'].mean():.2f}")
+print(f"PLNE : doubles moyens {_df_bench['ILP_double'].mean():.1f}, servis {_df_bench['ILP_served'].mean():.1f}, "
+      f"coût exact moyen {_df_bench['ILP_Z'].mean():.2f}")
 latex_table(_df_bench_cmp, "tables/table_benchmarks.tex",
-            caption=f"Benchmarks contre le PLNE, cellule centrale, R = {R} graines appariées.",
+            caption=f"Benchmarks against the ILP, central cell, R = {R} paired seeds. The ILP serves "
+                    f"every patient ({_df_bench['ILP_served'].mean():.0f}); B1 and B4 serve fewer.",
             label="tab:benchmarks", decimals=3)
-_beaten = _df_bench_cmp[(_df_bench_cmp["Coût"] == "modèle exact") & (_df_bench_cmp["Bat le PLNE"].str[0] != "0")]
+# Only a policy serving every patient competes on the ILP's own feasible set
+_full = _df_bench_cmp["Served"] >= _df_bench["ILP_served"].mean() - 1e-9
+_beaten = _df_bench_cmp[(_df_bench_cmp["Cost"] == "exact model") & _full
+                        & (_df_bench_cmp["Beats the ILP"].str.split("/").str[0] != "0")]
 if len(_beaten):
     print("ATTENTION : une politique bat le PLNE sous son propre coût, donc au moins une "
           "solution du PLNE n'est pas optimale (voir les statuts ci-dessus).")
@@ -611,14 +649,14 @@ print(_df_sim.groupby("label")["gap_pct"].agg(["mean", "std"]).round(2))
 
 code("""\
 # ── 6.4 Figures : écart % selon la charge et la part de doubles ─────────────
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.0, 2.8))
 _sub = _df_sim[(_df_sim["label"] == "central") | _df_sim["label"].str.startswith("ratio_")]
 g = _sub.groupby("ratio")["gap_pct"].apply(_mean_ci)
-ax1.errorbar(g.index, [v[0] for v in g], yerr=[v[1] for v in g], fmt="o-", capsize=3)
-ax1.set_xlabel("Charge n/S"); ax1.set_ylabel("Écart coût simulé / modèle (%)")
+ax1.errorbar(g.index, [v[0] for v in g], yerr=[v[1] for v in g], fmt="o-", capsize=2)
+ax1.set_xlabel("Load n/S"); ax1.set_ylabel("Simulated vs model cost (%)")
 ax1.grid(True, alpha=0.3)
-ax2.scatter(_df_sim["double_rate"], _df_sim["gap_pct"], alpha=0.4, s=15)
-ax2.set_xlabel("Part de créneaux doublés"); ax2.set_ylabel("Écart coût simulé / modèle (%)")
+ax2.scatter(_df_sim["double_rate"], _df_sim["gap_pct"], alpha=0.4, s=8)
+ax2.set_xlabel("Share of double-booked slots"); ax2.set_ylabel("Simulated vs model cost (%)")
 ax2.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig("figures/sim_gap_analysis.pdf", bbox_inches="tight")
@@ -628,14 +666,14 @@ plt.show()
 
 code("""\
 # ── 6.5 Variabilité des durées (lognormale, cv = 0,3 et 0,5) ────────────────
-fig, ax = plt.subplots(figsize=(6.5, 4))
+fig, ax = plt.subplots(figsize=(4.2, 2.8))
 for cv in (0.0, 0.3, 0.5):
     col = f"Z_sim_cv{cv:g}"
     dev = 100 * (_sub[col] / _sub["Z_model"] - 1)
     g = dev.groupby(_sub["ratio"]).apply(_mean_ci)
-    ax.errorbar(g.index, [v[0] for v in g], yerr=[v[1] for v in g], fmt="o-", capsize=3,
+    ax.errorbar(g.index, [v[0] for v in g], yerr=[v[1] for v in g], fmt="o-", capsize=2,
                 label=f"cv = {cv:g}")
-ax.set_xlabel("Charge n/S"); ax.set_ylabel("Écart coût simulé / modèle (%)")
+ax.set_xlabel("Load n/S"); ax.set_ylabel("Simulated vs model cost (%)")
 ax.legend(); ax.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig("figures/sim_lognormal.pdf", bbox_inches="tight")
@@ -668,15 +706,15 @@ print(_df_sens.round(4).to_string(index=False))
 
 code("""\
 # ── 7.2 Figure : regret exact par perturbation (moyenne et IC à 95 %) ───────
-_KIND_LABEL = {"q_shift": "Décalage de q", "q_noise": "Bruit gaussien sur q",
-               "duration": "Erreur relative sur s", "misclass": "Taux de mauvaise classification"}
-fig, axes = plt.subplots(1, 4, figsize=(16, 3.8))
-for ax, (kind, lab) in zip(axes, _KIND_LABEL.items()):
+_KIND_LABEL = {"q_shift": "Shift of q", "q_noise": "Gaussian noise on q (sd)",
+               "duration": "Relative error on s", "misclass": "Group misclassification rate"}
+fig, axes = plt.subplots(2, 2, figsize=(6.0, 4.4))
+for ax, (kind, lab) in zip(axes.flat, _KIND_LABEL.items()):
     sub = _df_sens_raw[_df_sens_raw["kind"] == kind]
     g = sub.groupby("level")["deg_pct"].apply(_mean_ci)
-    ax.errorbar(g.index, [v[0] for v in g], yerr=[v[1] for v in g], fmt="o-", capsize=3)
+    ax.errorbar(g.index, [v[0] for v in g], yerr=[v[1] for v in g], fmt="o-", capsize=2)
     ax.axhline(0, color="grey", lw=0.8)
-    ax.set_xlabel(lab); ax.set_ylabel("Regret exact (% du coût optimal)"); ax.grid(True, alpha=0.3)
+    ax.set_xlabel(lab); ax.set_ylabel("Exact regret (%)"); ax.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig("figures/sensitivity_regret.pdf", bbox_inches="tight")
 plt.savefig("figures/sensitivity_regret.png", dpi=300, bbox_inches="tight")
@@ -689,10 +727,17 @@ Q_BARS = [1.0, 1.2, 1.5, None]
 PI_AS = sorted({0.05, 0.15, 0.30, round(pi_A, 4)})
 QBAR_SPECS = [cell_spec(CC, "qbar", sd, Q_bar=qb, pi_A=pa)
               for qb in Q_BARS for pa in PI_AS for sd in SEEDS[:10]]
-_df_qbar = pd.DataFrame(run_lpt(functools.partial(solve_spec, CTX), QBAR_SPECS, spec_cost, CC.n_workers))
-_df_qbar["Q_bar"] = _df_qbar["Q_bar"].map(lambda v: "aucun" if pd.isna(v) else f"{v:g}")
+# Tous les patients étant servis, un plafond Q̄ trop bas rend l'instance infaisable
+# (somme des q_i > S Q̄) : HiGHS le prouve, la cellule est comptée « infeasible », sans coût.
+_df_qbar = pd.DataFrame(run_lpt(functools.partial(solve_spec, CTX, allow_infeasible=True),
+                                QBAR_SPECS, spec_cost, CC.n_workers))
+_df_qbar["Q_bar"] = _df_qbar["Q_bar"].map(lambda v: "none" if pd.isna(v) else f"{v:g}")
 _df_qbar.to_csv("results/sensitivity_qbar.csv", index=False)
 print("Statuts :", _df_qbar["status"].value_counts().to_dict())
+print("Instances infaisables par Q̄ :")
+print(_df_qbar.assign(inf=_df_qbar["status"] == "infeasible").pivot_table(
+    values="inf", index="Q_bar", columns="pi_A", aggfunc="sum"))
+print("Coût moyen des instances faisables :")
 print(_df_qbar.pivot_table(values="Z_complete", index="Q_bar", columns="pi_A", aggfunc="mean").round(3))
 """)
 
@@ -705,15 +750,15 @@ _df_pareto = pd.DataFrame(run_lpt(functools.partial(solve_spec, CTX), PARETO_SPE
 _df_pareto["wait_min"] = _df_pareto["E_wait"] / _df_pareto["cW_ratio"]
 _df_pareto.to_csv("results/pareto_idle_wait.csv", index=False)
 grp_p = _df_pareto.groupby("cW_ratio")[["E_idle", "wait_min"]].mean()
-fig, ax = plt.subplots(figsize=(6, 5))
-sc = ax.scatter(grp_p["E_idle"], grp_p["wait_min"], c=np.log(grp_p.index), cmap="viridis", s=60, zorder=5)
+fig, ax = plt.subplots(figsize=(4.4, 3.4))
+sc = ax.scatter(grp_p["E_idle"], grp_p["wait_min"], c=np.log(grp_p.index), cmap="viridis", s=25, zorder=5)
 for cwr, row in grp_p.iterrows():
-    ax.annotate(f"{cwr:g}", (row["E_idle"], row["wait_min"]), fontsize=7,
-                textcoords="offset points", xytext=(4, 4))
+    ax.annotate(f"{cwr:g}", (row["E_idle"], row["wait_min"]), fontsize=6,
+                textcoords="offset points", xytext=(3, 3))
 ax.plot(grp_p["E_idle"], grp_p["wait_min"], "k--", alpha=0.4)
-ax.set_xlabel("Inactivité espérée E[Idle] (min)"); ax.set_ylabel("Attente espérée E[Wait] (min)")
+ax.set_xlabel("Expected idle time E[Idle] (min)"); ax.set_ylabel("Expected waiting time E[Wait] (min)")
 ax.grid(True, alpha=0.3)
-plt.colorbar(sc, ax=ax, label="log(c_W / c_I)")
+plt.colorbar(sc, ax=ax, label="$\\\\log(c_W / c_I)$")
 plt.tight_layout()
 plt.savefig("figures/pareto_idle_wait.pdf", bbox_inches="tight")
 plt.savefig("figures/pareto_idle_wait.png", dpi=300, bbox_inches="tight")
@@ -722,53 +767,20 @@ plt.show()
 
 code("""\
 # ── 7.5 Synthèse : seules les différences significatives sont qualifiées ────
-_sig = _df_sens[_df_sens["Significatif (5 %)"]]
-_nsig = _df_sens[~_df_sens["Significatif (5 %)"]]
+_sig = _df_sens[_df_sens["Significant (5 %)"]]
+_nsig = _df_sens[~_df_sens["Significant (5 %)"]]
 print(f"{len(_sig)} perturbation(s) sur {len(_df_sens)} dégradent significativement le coût (Wilcoxon, 5 %).")
 for _, r in _sig.iterrows():
-    print(f"  {r['Perturbation']} {r['Niveau']:+g} : regret {r['Regret exact (%)']:.2f} %, "
-          f"IC 95 % de ΔZ [{r['IC 95 % bas']:.2f} ; {r['IC 95 % haut']:.2f}], p = {r['p exact']:.3g}")
+    print(f"  {r['Perturbation']} {r['Level']:+g} : regret {r['Exact regret (%)']:.2f} %, "
+          f"IC 95 % de ΔZ [{r['95 % CI low']:.2f} ; {r['95 % CI high']:.2f}], p = {r['Exact p']:.3g}")
 if len(_nsig):
     print("Non significatif (aucune conclusion) : " +
-          ", ".join(f"{r['Perturbation']} {r['Niveau']:+g}" for _, r in _nsig.iterrows()))
+          ", ".join(f"{r['Perturbation']} {r['Level']:+g}" for _, r in _nsig.iterrows()))
 latex_table(_df_sens, "tables/table_sensitivity.tex",
-            caption="Regret sous perturbation des entrées (IC à 95 %, tests de Wilcoxon appariés).",
+            caption="Regret under perturbed inputs (95 % CI, paired Wilcoxon tests).",
             label="tab:sensitivity", decimals=4)
 SENS_VERDICT = (f"{len(_sig)}/{len(_df_sens)} perturbations significatives ; regret exact maximal "
-                f"{_df_sens['Regret exact (%)'].max():.2f} %")
-""")
-
-# ── Section 7.6 : seuil de double-booking ───────────────────────────────────
-md("### 7.6 Seuil de double-booking (rec. 11)\n\n"
-   "Placer j derrière i dans un créneau (sans saturation, durées égales) échange $c_I q_j s$ "
-   "d'inactivité contre $c_W q_i q_j s$ d'attente : le double est rentable si "
-   "$c_W/c_I < 1/q_i$, où $i$ est le patient servi en premier. Le seuil est **individuel** ; "
-   "avec des $q_i$ dispersés, on attend une bande de transition centrée sur $1/\\bar q$ et non "
-   "une bascule nette. Grille fine de $c_W/c_I$ de 1,0 à 1,5 par pas de 0,05, R graines.")
-
-code("""\
-# ── 7.6 Balayage fin de c_W/c_I ─────────────────────────────────────────────
-from ilp_campaign import threshold_spec, threshold_specs
-_df_thr = pd.DataFrame(run_lpt(functools.partial(threshold_spec, CTX), threshold_specs(CC),
-                               spec_cost, CC.n_workers))
-_df_thr.to_csv("results/threshold_cw_fine.csv", index=False)
-_thr = _df_thr.groupby("cW_ratio").agg(instances_avec_double=("has_double", "mean"),
-                                       doubles_moyens=("n_double", "mean"),
-                                       patients_sous_seuil=("share_below_threshold", "mean"),
-                                       doubles_conformes=("doubles_rule_ok", "mean"))
-print("Statuts :", _df_thr["status"].value_counts().to_dict())
-print(_thr.round(3).to_string())
-latex_table(_thr.reset_index(), "tables/table_threshold_cw.tex",
-            caption="Seuil de double-booking : grille fine de $c_W/c_I$.", label="tab:threshold", decimals=3)
-fig, ax = plt.subplots(figsize=(6.5, 4))
-ax.plot(_thr.index, 100 * _thr["instances_avec_double"], "o-", label="Instances avec au moins un double")
-ax.plot(_thr.index, 100 * _thr["patients_sous_seuil"], "s--", label="Patients avec c_W/c_I < 1/q_i")
-ax.axvline(1 / (1 - CC.central_p_bar), color="grey", lw=0.8, ls=":", label="1 / q̄")
-ax.set_xlabel("c_W / c_I"); ax.set_ylabel("Part (%)"); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
-plt.tight_layout()
-plt.savefig("figures/threshold_cw_fine.pdf", bbox_inches="tight")
-plt.savefig("figures/threshold_cw_fine.png", dpi=300, bbox_inches="tight")
-plt.show()
+                f"{_df_sens['Exact regret (%)'].max():.2f} %")
 """)
 
 # ── Section 8 : validation hors échantillon sur le holdout ──────────────────
@@ -777,7 +789,8 @@ md("## 8. Validation hors échantillon sur des patients du holdout (rec. 10)\n\n
    "le PLNE planifie avec les $q_i$ et les groupes **prédits** ; chaque planning est ensuite jugé "
    "sur la vérité : groupes **réels** (durées), coût espéré du modèle, coût espéré exact de la "
    "journée (Lindley, idle terminal) et coût **réalisé** compte tenu des présences observées. "
-   "Références : PLNE oracle (groupes réels), B1, B3, B5. Comparaisons appariées par journée.")
+   "Références : PLNE oracle (groupes réels), B1, B3, B5. Comparaisons appariées par journée. "
+   "B1 ne sert que S patients sur n ; les autres politiques les servent tous.")
 
 code("""\
 # ── 8.1 Journées du holdout ──────────────────────────────────────────────────
@@ -790,16 +803,17 @@ print(f"{len(_df_hold)} journées de {_df_hold['n'].iloc[0]} patients ; statut d
       _df_hold["ILP_status"].value_counts().to_dict())
 _rows = []
 for _ref in ("ILP_oracle", "B1", "B3", "B5"):
-    for _kind, _suffix in (("espéré, modèle", "_Zmodel"), ("espéré, journée", "_Zday"), ("réalisé", "_Zreal")):
+    for _kind, _suffix in (("expected, model", "_Zmodel"), ("expected, day", "_Zday"), ("realised", "_Zreal")):
         _ps = paired_summary(_df_hold[_ref + _suffix], _df_hold["ILP" + _suffix])
-        _rows.append({"Politique": _ref, "Coût": _kind, "ΔZ moyen vs PLNE": _ps["mean_diff"],
-                      "IC 95 % bas": _ps["ci_low"], "IC 95 % haut": _ps["ci_high"],
-                      "Écart moyen (%)": _ps["rel_pct"], "Fait mieux": f"{_ps['n_better']}/{_ps['n']}",
-                      "p (Wilcoxon)": _ps["p_wilcoxon"]})
+        _rows.append({"Policy": _ref, "Cost": _kind, "Mean ΔZ vs ILP": _ps["mean_diff"],
+                      "95 % CI low": _ps["ci_low"], "95 % CI high": _ps["ci_high"],
+                      "Mean gap (%)": _ps["rel_pct"], "Does better": f"{_ps['n_better']}/{_ps['n']}",
+                      "p (Wilcoxon)": _ps["p_wilcoxon"], "Served": _df_hold[_ref + "_served"].mean()})
 _df_hold_cmp = pd.DataFrame(_rows)
 _df_hold_cmp.to_csv("results/holdout_days_summary.csv", index=False)
 latex_table(_df_hold_cmp, "tables/table_holdout_days.tex",
-            caption="Journées du holdout : écarts appariés au PLNE (IC à 95 %, Wilcoxon).",
+            caption="Holdout days: paired differences with the ILP (95 % CI, Wilcoxon). B1 serves "
+                    "one patient per slot, the other policies every patient.",
             label="tab:holdout", decimals=3)
 print(_df_hold_cmp.round(3).to_string(index=False))
 """)
@@ -811,18 +825,18 @@ _central = _df_doe[_df_doe.label == "central"]
 _sol_hist = ILLUS["historique"][1]
 def _cmp_lines(df, kind):
     return "\\n".join(
-        f"- {r['Politique']} : {r.iloc[2]:+.2f} [{r['IC 95 % bas']:.2f} ; {r['IC 95 % haut']:.2f}], "
-        f"p = {r['p (Wilcoxon)']:.3g}" for _, r in df[df["Coût"] == kind].iterrows())
+        f"- {r['Policy']} : {r.iloc[2]:+.2f} [{r['95 % CI low']:.2f} ; {r['95 % CI high']:.2f}], "
+        f"p = {r['p (Wilcoxon)']:.3g}, served {r['Served']:.1f}" for _, r in df[df["Cost"] == kind].iterrows())
 
 _md = f\"\"\"# RESULTS.md, chiffres clés pour le manuscrit
 
 Paramètres : {PLNE['source_run']} (commit {PLNE['git_commit']}), s_A = {s_A:.2f}, s_B = {s_B:.2f},
 pi_A = {pi_A:.4f}, c_O = {C_O_BASE}. Campagne : S = {CC.S}, R = {CC.R}, limite {CC.time_limit:g} s,
-gap cible {CC.mip_gap:g}. Smoke : {SMOKE}.
+gap cible {CC.mip_gap:g}. Smoke : {SMOKE}. Tous les patients servis (C1 en égalité).
 Holdout : {len(Q_POOL):,} patients, {Q_OUTSIDE} q_i hors de {Q_CLIP}, tronqués dans les instances.
 
 ## Table 1 (section 3)
-- Historique (s_A = 43, s_B = 8) : Z* = {_sol_hist.Z_complete:.4f} ({_sol_hist.status})
+- Historique (n = {ILLUS['historique'][0].n}, s_A = 43, s_B = 8) : Z* = {_sol_hist.Z_complete:.4f} ({_sol_hist.status})
 - Données : Z* = {ILLUS['donnees'][1].Z_complete:.4f}
 
 ## Plan d'expériences
@@ -833,7 +847,7 @@ Holdout : {len(Q_POOL):,} patients, {Q_OUTSIDE} q_i hors de {Q_CLIP}, tronqués 
 - Cellule centrale : Z = {_central['Z_complete'].mean():.3f} ± {_central['Z_complete'].std():.3f}
 
 ## Benchmarks (coût exact du modèle, Delta Z vs PLNE, IC 95 %)
-{_cmp_lines(_df_bench_cmp.rename(columns={'ΔZ moyen': 'd'}), 'modèle exact')}
+{_cmp_lines(_df_bench_cmp, 'exact model')}
 
 ## Simulation (M = {M_DOE_SIM})
 - Écart simulé / modèle, cellule centrale : {_df_sim[_df_sim.label == 'central']['gap_pct'].mean():.2f} %
@@ -842,7 +856,7 @@ Holdout : {len(Q_POOL):,} patients, {Q_OUTSIDE} q_i hors de {Q_CLIP}, tronqués 
 - {SENS_VERDICT}
 
 ## Hors échantillon (holdout, coût réalisé, Delta Z vs PLNE)
-{_cmp_lines(_df_hold_cmp, 'réalisé')}
+{_cmp_lines(_df_hold_cmp, 'realised')}
 \"\"\"
 with open("results/RESULTS.md", "w", encoding="utf-8") as fh:
     fh.write(_md)
