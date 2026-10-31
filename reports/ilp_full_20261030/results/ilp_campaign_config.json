@@ -1,0 +1,85 @@
+{
+  "campaign": {
+    "days": 1,
+    "slots_per_day": 8,
+    "R": 30,
+    "time_limit": 600.0,
+    "mip_gap": 1e-06,
+    "M_sim": 10000,
+    "ratios": [
+      1.0,
+      1.25,
+      1.5,
+      1.75,
+      2.0
+    ],
+    "p_bars": [
+      0.03,
+      0.1,
+      0.2,
+      0.3
+    ],
+    "long_shares": [
+      0.15,
+      0.25,
+      0.5
+    ],
+    "cw_ratios": [
+      0.1,
+      0.25,
+      0.5,
+      1.0,
+      2.0
+    ],
+    "cw_fine": [
+      1.0,
+      1.05,
+      1.1,
+      1.15,
+      1.2,
+      1.25,
+      1.3,
+      1.35,
+      1.4,
+      1.45,
+      1.5
+    ],
+    "holdout_days": 100,
+    "n_workers": 4,
+    "seed_base": 1000,
+    "central_ratio": 1.5,
+    "central_p_bar": 0.2,
+    "central_long_share": 0.15,
+    "central_cw_ratio": 0.5
+  },
+  "decisions": {
+    "DURATION_METHOD": "kmedians",
+    "DURATION_STAT": "median",
+    "SPLIT_MODE": "stratified",
+    "C_O_BASE": 0.0,
+    "SLOT_LENGTHS": [
+      30.0,
+      60.0
+    ],
+    "RANDOM_STATE": 0,
+    "SMOKE": false
+  },
+  "plne_parameters": {
+    "schema_version": 2,
+    "duration_method": "kmedians",
+    "duration_stat": "median",
+    "cutoff_minutes": 21.5,
+    "s_A": 36.0,
+    "s_B": 7.0,
+    "pi_A_actual": 0.34630349128070603,
+    "pi_A_predicted": 0.34739883802547555,
+    "noshow_rate": 0.03167261391444186,
+    "group_error_rate": 0.33231464757168655,
+    "n_train": 28093389,
+    "n_holdout": 4013341,
+    "created": "2026-10-31T03:17:35",
+    "git_commit": "8615e6564b67321c11e2ee6208425014f15d0c85",
+    "source_run": "run_full_20261030",
+    "smoke": false
+  }
+}

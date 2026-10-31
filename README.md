@@ -1,130 +1,142 @@
-# Smart Plan — Cluster-Predict-Schedule
+# Smart Plan: Cluster-Predict-Schedule
 
-Data-driven outpatient appointment scheduling. Two predictive models (no-show
-probability, service-time group) feed a stochastic overbooking integer program
-that allows at most two patients per slot, trading slot idle time against
-patient waiting time.
+Data-driven outpatient appointment scheduling. Two predictive models (the
+no-show probability of each patient and its service-time group) feed a
+stochastic overbooking integer program (ILP) that allows at most two patients
+per slot, trading slot idle time against patient waiting time.
 
-The pipeline follows CRISP-DM and lives in a single notebook:
+This repository is the evidence behind the paper: the code, the executed
+notebooks of the runs reported in it, their inputs and outputs, and the
+provenance of each number. Results are not restated here; they are read in the
+executed notebooks listed below.
 
-| Section | Content |
+## Where to find what
+
+| Question | File |
 |---|---|
-| 1-2 | Business understanding, exploration of the raw consultations |
-| 3 | Cleaning, patient-history features, one leak-proof 70/20/10 split |
-| 4 | No-show classifiers and service-time clustering + group classifier |
-| 5 | Test-set evaluation and probability calibration (Brier) |
-| 6 | Serialised inference artifacts, single `predict_patient` entry point |
-| 7 | ILP instance built from held-out patients, solved with Pyomo/HiGHS |
+| How were the models trained, and with which outputs? | [reports/run_full_20261030.ipynb](reports/run_full_20261030.ipynb) (executed notebook, all outputs) |
+| How long did each training stage take, with how much memory? | [reports/run_full_20261030/STATUS.md](reports/run_full_20261030/STATUS.md) |
+| On which machine and package versions? | [pod_env.txt](reports/run_full_20261030/pod_env.txt), [pod_freeze.txt](reports/run_full_20261030/pod_freeze.txt) |
+| Test metrics of the trained models | [test_metrics.csv](reports/run_full_20261030/test_metrics.csv), [tables/](reports/run_full_20261030/tables/) |
+| Figures of the training run | [reports/run_full_20261030/figures/](reports/run_full_20261030/figures/) |
+| Parameters passed from the models to the ILP | [data/inference/plne_parameters.json](data/inference/plne_parameters.json) |
+| How was the ILP validated, and with which outputs? | [reports/ilp_full_20261030/ilp_validation_full_20261030.ipynb](reports/ilp_full_20261030/ilp_validation_full_20261030.ipynb) |
+| Key ILP figures for the manuscript | [reports/ilp_full_20261030/RESULTS.md](reports/ilp_full_20261030/RESULTS.md) |
+| Raw ILP campaign tables, LaTeX tables and figures | [results/](reports/ilp_full_20261030/results/), [tables/](reports/ilp_full_20261030/tables/), [figures/](reports/ilp_full_20261030/figures/) |
+| Which code produced each run? | [PROVENANCE.md](reports/run_full_20261030/PROVENANCE.md), [CAMPAIGN.md](reports/ilp_full_20261030/CAMPAIGN.md) |
+| Are the unversioned outputs the ones used? | [SHA256SUMS](reports/run_full_20261030/SHA256SUMS) |
 
-## Repository layout
+The `.ipynb` files open directly in the GitHub web interface (outputs and
+figures included). For a large notebook that GitHub does not render, download
+it and open it with Jupyter or VS Code.
+
+## How the pieces fit
 
 ```
-data_driven_plan.py      all reusable functions (I/O, features, models, ILP core)
-gen_main_nb.py           generator of the notebook — edit this, not the .ipynb
-data_driven_plan.ipynb   the pipeline: orchestration, narrative, outputs
-scripts/csv_to_parquet.py  converts the raw CSV into chunked Parquet input
-requirements.txt         pinned dependencies (Python 3.13)
-LICENSE                  MIT
+raw consultations (not versioned)
+        │  scripts/csv_to_parquet.py
+        ▼
+data_driven_plan.ipynb  ── executed on a RunPod pod (16 vCPU, 128 GB) ──►  reports/run_full_20261030.ipynb
+        │  export stage
+        ├──► data/inference/plne_parameters.json   s_A, s_B, pi_A, no-show rate, provenance (versioned)
+        └──► holdout_scores.parquet                q_i and groups of holdout patients (patient level,
+        │                                          not versioned; SHA-256 in SHA256SUMS)
+        ▼
+notebooks/01_ilp_validation.ipynb  ── executed on a laptop (4 cores, 16 GB) ──►  reports/ilp_full_20261030/
 ```
 
-The dataset is **not** part of this repository: it contains patient-level
-consultation records. `data/` and every generated
-artifact (`figures/`, `models/`, `results/`, `tables/`) are untracked.
+The training needs a server; the ILP campaign runs on a laptop, which shows that
+the scheduling step can be deployed on modest hardware. The ILP campaign reads
+nothing but the two exported files, so its results follow from the training run
+without any recomputation.
 
-## Setup
+## Repository tree
+
+```
+.
+├── README.md
+├── requirements.txt               pinned dependencies (Python 3.13)
+├── data_driven_plan.py            all reusable functions: data, features, models, ILP core, evaluators
+├── ilp_campaign.py                ILP campaign: instance generator, benchmarks B1-B5, cache, parallel runner
+├── gen_main_nb.py                 GENERATOR of data_driven_plan.ipynb (edit this file, not the notebook)
+├── data_driven_plan.ipynb         GENERATED template of the training pipeline, without outputs
+├── notebooks/
+│   ├── gen_nb.py                  GENERATOR of 01_ilp_validation.ipynb
+│   └── 01_ilp_validation.ipynb    GENERATED template of the ILP validation, without outputs
+├── scripts/csv_to_parquet.py      converts the raw CSV into chunked Parquet input
+├── data/inference/
+│   └── plne_parameters.json       the only versioned data file (aggregates, no patient record)
+├── tests/                         pytest suite (exactness of the ILP, evaluators, training, campaign)
+└── reports/                       EXECUTED runs: the evidence
+    ├── run_full_20261030.ipynb        training run on all patients (pod), with outputs
+    ├── run_full_20261030/             its status, environment, metrics, tables, figures, checksums
+    ├── ilp_full_20261030/             ILP campaign on the outputs of that run (laptop)
+    ├── commit_map_old_new.tsv         commit correspondence with the original repository
+    ├── fixes_20261029.md              changes made after the audit of the pipeline
+    └── run_20260926_2002.ipynb,       earlier run, before the audit (kept for the record,
+        recap_data_driven_plan.csv,    superseded by run_full_20261030)
+        training_history.csv
+```
+
+### Generated templates and executed runs
+
+`data_driven_plan.ipynb` and `notebooks/01_ilp_validation.ipynb` are written by
+`gen_main_nb.py` and `notebooks/gen_nb.py`. They are kept without outputs: they
+are the programs. Each run executes a copy with papermill, which records the
+parameters of the run in a cell tagged `injected-parameters`; that executed copy
+is the one stored in `reports/`. To change a notebook, edit its generator and
+regenerate (`python3 gen_main_nb.py`, or `cd notebooks && python3 gen_nb.py`).
+
+## Data
+
+The dataset is not part of this repository: it contains patient-level
+consultation records. `.gitignore` is an allow-list, so `data/`, `models/`,
+`results/`, `figures/`, `tables/` and `runs/` stay local unless a file is
+explicitly allowed. All data paths derive from `SMART_PLAN_DATA` (default
+`./data`).
+
+## Reproducing the runs
+
+Setup:
 
 ```bash
 python3 -m venv ml_env
 ./ml_env/bin/pip install -r requirements.txt
 ```
 
-The ILP uses HiGHS through Pyomo (`highspy`); CBC is used as a fallback if
-HiGHS is unavailable.
-
-## Running
-
-Convert the raw CSV once, then run the notebook top to bottom:
+Convert the raw CSV once:
 
 ```bash
 ./ml_env/bin/python scripts/csv_to_parquet.py \
   --csv data/consult_waits_2024_03_25.csv \
   --out-dir data/raw_data_parquet --chunksize 500000 --compression snappy
-
-./ml_env/bin/jupyter lab data_driven_plan.ipynb
 ```
 
-All data paths derive from `SMART_PLAN_DATA` (default `./data`), so the
-notebook runs unchanged against a dataset stored elsewhere:
+Training (the full run took 25.5 h on 16 vCPU and 128 GB; stages resume from
+their saved artifacts after an interruption):
 
 ```bash
-export SMART_PLAN_DATA=/mnt/volume/data
+python -m papermill data_driven_plan.ipynb runs/full_executed.ipynb -k python3 \
+  -p RUN_ID full_<date> -p MMAP_MATRICES False
 ```
 
-To run it headless on a server, execute it with nbconvert:
+`-p PATIENT_FRACTION 0.1` runs a pilot on 10 % of the patients; `-p SMOKE True`
+a quick check. On a local disk `MMAP_MATRICES` can stay `True`.
+
+ILP validation, from the repository root, on the outputs of a training run:
 
 ```bash
-SMART_PLAN_DATA=/path/to/data jupyter nbconvert --to notebook --execute \
-  --ExecutePreprocessor.timeout=-1 --output run.ipynb data_driven_plan.ipynb
+python -m papermill notebooks/01_ilp_validation.ipynb runs/ilp_executed.ipynb --cwd . -k python3 \
+  -p PLNE_PARAMS_PATH data/inference/plne_parameters.json \
+  -p HOLDOUT_SCORES_PATH results/run_<id>/holdout_scores.parquet
 ```
 
-Section 3.2bis and sections 4a/4b each provide a resume point: once the
-preprocessed Parquet file and the model bundles exist, the expensive cells can
-be skipped on a later run.
-
-## Results of a validated run
-
-`reports/` holds one executed run on the full dataset (40,133,413 rows;
-train 28.1M / test 8.0M / inference holdout 4.0M). Precision, recall and
-F1-score are macro-averaged over both classes.
-
-No-show prediction, test set, each model at its optimal threshold:
-
-| Model | AUC | Accuracy | Precision | Recall | F1-score | train-test AUC gap |
-|---|---|---|---|---|---|---|
-| XGBoost | **0.77** | 0.94 | 0.58 | 0.59 | **0.59** | 0.00 |
-| RandomForest | 0.76 | 0.95 | 0.58 | 0.58 | 0.58 | 0.02 |
-| AdaBoost | 0.69 | 0.89 | 0.53 | 0.58 | 0.53 | 0.00 |
-| ANN | 0.63 | 0.94 | 0.54 | 0.54 | 0.54 | 0.03 |
-
-Brier score of the calibrated XGBoost: 0.0288. The A/B service-time classifier
-ranks the same way (XGBoost 0.73). Clustering: K=2, bootstrapped silhouette
-0.6917 ± 0.0035, cutoff 38.5 min. The ILP instance built from 30 held-out
-patients over 6 slots solves in 2.9 s (Z_complete 39.9288).
-
-The near-zero train-test gaps matter as much as the scores. An earlier run
-reported 0.99 cross-validated ROC-AUC against 0.75 on the test set, because
-SMOTE was applied to the tuning subset before the cross-validation: the search
-then selected whichever model best memorised interpolated data, and the forest
-it picked scored a perfect 1.00 on its own training set. Resampling now happens
-inside each fold only.
-
-- `run_20260926_2002.ipynb` — the executed notebook, figures included
-- `recap_data_driven_plan.csv`, `training_history.csv` — summary tables
-
-## Tuning the models
-
-Every training lever is exposed in the notebook's section 4.0 as a
-`TrainingConfig`: model families, search strategy (`grid`/`random`/`none`) and
-budget, cross-validation folds, optimised score, subsample sizes, SMOTE, class
-weighting and the decision-threshold criterion. Nothing is hard-coded in
-`data_driven_plan.py`.
-
-Section 4c compares runs: the threshold criterion alone (no retraining),
-a single retrained family (`train_single_model`), or a full campaign.
-`record_training_run(...)` archives each attempt and `training_history_table()`
-puts them side by side.
-
-## Editing the notebook
-
-`data_driven_plan.ipynb` is generated. Change `gen_main_nb.py`, then:
+Tests:
 
 ```bash
-python3 gen_main_nb.py
+python -m pytest tests
 ```
-
-Regenerating overwrites the notebook, including the outputs of cells that were
-already executed.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).

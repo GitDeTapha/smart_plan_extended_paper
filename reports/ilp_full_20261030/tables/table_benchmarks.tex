@@ -1,0 +1,20 @@
+\begin{table}[htbp]
+\caption{Benchmarks contre le PLNE, cellule centrale, R = 30 graines appariées.}
+\label{tab:benchmarks}
+\begin{tabular}{llrrrrlrr}
+\toprule
+Politique & Coût & ΔZ moyen & IC 95 \% bas & IC 95 \% haut & Écart moyen (\%) & Bat le PLNE & p (Wilcoxon) & Doubles moyens \\
+\midrule
+B1 Réservation simple & modèle exact & 10.735 & 10.053 & 11.417 & 8.104 & 0/30 & 0.000 & 0.000 \\
+B1 Réservation simple & simulé, NAC & 6.089 & 3.820 & 8.357 & 3.970 & 5/30 & 0.000 & 0.000 \\
+B2 Fluide (Jensen) & modèle exact & 5.942 & 4.084 & 7.799 & 4.866 & 0/30 & 0.000 & 4.667 \\
+B2 Fluide (Jensen) & simulé, NAC & 3.280 & 0.905 & 5.656 & 2.745 & 7/30 & 0.004 & 4.667 \\
+B3 Glouton & modèle exact & 3.578 & 2.437 & 4.719 & 2.793 & 0/30 & 0.000 & 4.000 \\
+B3 Glouton & simulé, NAC & 4.527 & 1.009 & 8.045 & 4.272 & 10/30 & 0.009 & 4.000 \\
+B4 Utilité Valenzuela & modèle exact & 32.172 & 26.387 & 37.956 & 25.505 & 0/30 & 0.000 & 0.033 \\
+B4 Utilité Valenzuela & simulé, NAC & 27.014 & 21.016 & 33.013 & 20.592 & 0/30 & 0.000 & 0.033 \\
+B5 Surréservation uniforme & modèle exact & 19.336 & 13.153 & 25.518 & 16.850 & 0/30 & 0.000 & 4.000 \\
+B5 Surréservation uniforme & simulé, NAC & 20.326 & 10.493 & 30.159 & 17.579 & 3/30 & 0.000 & 4.000 \\
+\bottomrule
+\end{tabular}
+\end{table}
