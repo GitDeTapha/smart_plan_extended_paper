@@ -1,0 +1,9 @@
+date_utc: 2026-10-29T23:35:46Z
+pod_id: 4syvvzurbcshpb
+commit: f4e60d938a3846b920dbdcd09a1d4fbebf359929
+python: Python 3.13.5
+cpu_model: AMD EPYC 9655 96-Core Processor
+nproc: 16
+cgroup_cpu_max: max 100000
+cgroup_mem_max: 128000000000
+kernel: 6.8.0-147-generic
