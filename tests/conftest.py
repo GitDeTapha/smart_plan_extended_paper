@@ -11,12 +11,17 @@ import pytest
 
 @pytest.fixture
 def illustrative_instance():
-    """Table 1 instance of the manuscript with the historical durations (s_A=43, s_B=8)."""
+    """Table 1 instance with the historical durations (s_A=43, s_B=8).
+
+    Seven patients for four slots: the former ten-patient instance left patients
+    7 to 9 unserved at its optimum, which every patient being served now forbids
+    (10 > 2 x 4). Without them the optimum and Z* (70.82, 65.62 with c_O = 0) are
+    unchanged."""
     from data_driven_plan import Instance
     s_A, s_B = 43.0, 8.0
-    return Instance(n=10, D=1, T=[4], L=[[30.0, 30.0, 60.0, 60.0]],
-                    s=np.array([s_A] * 3 + [s_B] * 7),
-                    q=np.array([0.90, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60, 0.55, 0.50, 0.45]),
+    return Instance(n=7, D=1, T=[4], L=[[30.0, 30.0, 60.0, 60.0]],
+                    s=np.array([s_A] * 3 + [s_B] * 4),
+                    q=np.array([0.90, 0.85, 0.80, 0.75, 0.70, 0.65, 0.60]),
                     c_I=1.0, c_W=0.5, c_O=0.5)
 
 

@@ -649,7 +649,9 @@ PLNE_PARAMS = export_plne_parameters(_paths, DURATION_GROUPS, HOLDOUT_SCORES, n_
                                      source_run=f"run_{RUN_ID}", smoke=not FULL_RUN, slot_lengths=SLOT_LENGTHS)
 export_holdout_scores(os.path.join(RUN_RESULTS_DIR, "holdout_scores.parquet"), HOLDOUT_SCORES)
 # ── 7.3 One real ILP day from holdout patients ──────────────────────────────
-_day = scored_inference.sample(n=min(30, len(scored_inference)), random_state=RANDOM_STATE)
+# Nine patients for six slots (load 1.5): the ILP serves every patient, so a day
+# holds at most two patients per slot.
+_day = scored_inference.sample(n=min(9, len(scored_inference)), random_state=RANDOM_STATE)
 T_demo, L_demo = [6], [[30.0, 30.0, 30.0, 60.0, 60.0, 60.0]]
 real_instance = build_instance_from_patients(
     _day, T=T_demo, L=L_demo, s_A=service_time_by_group["A"], s_B=service_time_by_group["B"],
