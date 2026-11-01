@@ -20,10 +20,10 @@ executed notebooks listed below.
 | Test metrics of the trained models | [test_metrics.csv](reports/run_full_20261030/test_metrics.csv), [tables/](reports/run_full_20261030/tables/) |
 | Figures of the training run | [reports/run_full_20261030/figures/](reports/run_full_20261030/figures/) |
 | Parameters passed from the models to the ILP | [data/inference/plne_parameters.json](data/inference/plne_parameters.json) |
-| How was the ILP validated, and with which outputs? | [reports/ilp_full_20261030/ilp_validation_full_20261030.ipynb](reports/ilp_full_20261030/ilp_validation_full_20261030.ipynb) |
-| Key ILP figures for the manuscript | [reports/ilp_full_20261030/RESULTS.md](reports/ilp_full_20261030/RESULTS.md) |
-| Raw ILP campaign tables, LaTeX tables and figures | [results/](reports/ilp_full_20261030/results/), [tables/](reports/ilp_full_20261030/tables/), [figures/](reports/ilp_full_20261030/figures/) |
-| Which code produced each run? | [PROVENANCE.md](reports/run_full_20261030/PROVENANCE.md), [CAMPAIGN.md](reports/ilp_full_20261030/CAMPAIGN.md) |
+| How was the ILP validated, and with which outputs? | [reports/ilp_full_20261101/ilp_validation_full_20261101.ipynb](reports/ilp_full_20261101/ilp_validation_full_20261101.ipynb) |
+| Key ILP figures for the manuscript | [reports/ilp_full_20261101/RESULTS.md](reports/ilp_full_20261101/RESULTS.md) |
+| Raw ILP campaign tables, LaTeX tables and figures | [results/](reports/ilp_full_20261101/results/), [tables/](reports/ilp_full_20261101/tables/), [figures/](reports/ilp_full_20261101/figures/) |
+| Which code produced each run? | [PROVENANCE.md](reports/run_full_20261030/PROVENANCE.md), [CAMPAIGN.md](reports/ilp_full_20261101/CAMPAIGN.md) |
 | Are the unversioned outputs the ones used? | [SHA256SUMS](reports/run_full_20261030/SHA256SUMS) |
 
 The `.ipynb` files open directly in the GitHub web interface (outputs and
@@ -42,7 +42,7 @@ data_driven_plan.ipynb  ── executed on a RunPod pod (16 vCPU, 128 GB) ──
         └──► holdout_scores.parquet                q_i and groups of holdout patients (patient level,
         │                                          not versioned; SHA-256 in SHA256SUMS)
         ▼
-notebooks/01_ilp_validation.ipynb  ── executed on a laptop (4 cores, 16 GB) ──►  reports/ilp_full_20261030/
+notebooks/01_ilp_validation.ipynb  ── executed on a laptop (4 cores, 16 GB) ──►  reports/ilp_full_20261101/
 ```
 
 The training needs a server; the ILP campaign runs on a laptop, which shows that
@@ -70,7 +70,8 @@ without any recomputation.
 └── reports/                       EXECUTED runs: the evidence
     ├── run_full_20261030.ipynb        training run on all patients (pod), with outputs
     ├── run_full_20261030/             its status, environment, metrics, tables, figures, checksums
-    ├── ilp_full_20261030/             ILP campaign on the outputs of that run (laptop)
+    ├── ilp_full_20261101/             ILP campaign on the outputs of that run (laptop), every patient served
+    ├── ilp_full_20261030/             earlier ILP campaign, C1 as an inequality (superseded, kept for the record)
     ├── commit_map_old_new.tsv         commit correspondence with the original repository
     ├── fixes_20261029.md              changes made after the audit of the pipeline
     └── run_20260926_2002.ipynb,       earlier run, before the audit (kept for the record,
@@ -130,6 +131,10 @@ python -m papermill notebooks/01_ilp_validation.ipynb runs/ilp_executed.ipynb --
   -p PLNE_PARAMS_PATH data/inference/plne_parameters.json \
   -p HOLDOUT_SCORES_PATH results/run_<id>/holdout_scores.parquet
 ```
+
+On a laptop, run long campaigns under `systemd-inhibit --what=sleep:idle`: HiGHS
+measures its time limit on the wall clock, so a suspension stops the running ILPs
+at the limit (see [CAMPAIGN.md](reports/ilp_full_20261101/CAMPAIGN.md)).
 
 Tests:
 
