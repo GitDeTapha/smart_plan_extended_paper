@@ -714,6 +714,8 @@ for ax, (kind, lab) in zip(axes.flat, _KIND_LABEL.items()):
     g = sub.groupby("level")["deg_pct"].apply(_mean_ci)
     ax.errorbar(g.index, [v[0] for v in g], yerr=[v[1] for v in g], fmt="o-", capsize=2)
     ax.axhline(0, color="grey", lw=0.8)
+    if len(g) == 1:  # un seul niveau : un seul repère, centré
+        ax.set_xticks(g.index); ax.set_xlim(g.index[0] - 0.05, g.index[0] + 0.05)
     ax.set_xlabel(lab); ax.set_ylabel("Exact regret (%)"); ax.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig("figures/sensitivity_regret.pdf", bbox_inches="tight")
@@ -752,9 +754,10 @@ _df_pareto.to_csv("results/pareto_idle_wait.csv", index=False)
 grp_p = _df_pareto.groupby("cW_ratio")[["E_idle", "wait_min"]].mean()
 fig, ax = plt.subplots(figsize=(4.4, 3.4))
 sc = ax.scatter(grp_p["E_idle"], grp_p["wait_min"], c=np.log(grp_p.index), cmap="viridis", s=25, zorder=5)
-for cwr, row in grp_p.iterrows():
-    ax.annotate(f"{cwr:g}", (row["E_idle"], row["wait_min"]), fontsize=6,
-                textcoords="offset points", xytext=(3, 3))
+# Plusieurs ratios peuvent donner les mêmes plannings : une seule étiquette par point
+for (_x, _y), _g in grp_p.round(6).reset_index().groupby(["E_idle", "wait_min"], sort=False):
+    ax.annotate(", ".join(f"{v:g}" for v in _g["cW_ratio"]), (_x, _y), fontsize=6,
+                textcoords="offset points", xytext=(4, 3))
 ax.plot(grp_p["E_idle"], grp_p["wait_min"], "k--", alpha=0.4)
 ax.set_xlabel("Expected idle time E[Idle] (min)"); ax.set_ylabel("Expected waiting time E[Wait] (min)")
 ax.grid(True, alpha=0.3)
