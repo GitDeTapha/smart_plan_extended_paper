@@ -1,2 +1,0 @@
-{"cell": "r175", "n": 14, "limit": 3600.0, "status": "optimal", "gap": 9.144829987855072e-07, "gap_complete": 4.7620940287359913e-07, "Z_complete": 177.54494766601226, "best_bound": -92.45513688256125, "solve_time": 692.8475757620035, "warm_start_cost": 183.47970723093204}
-{"cell": "r200", "n": 16, "limit": 3600.0, "status": "optimal", "gap": 4.84738738579281e-07, "gap_complete": 2.7557421083081253e-07, "Z_complete": 172.1389324198039, "best_bound": -97.86111501724656, "solve_time": 1153.1100079089956, "warm_start_cost": 180.52353369043226}

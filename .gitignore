@@ -8,11 +8,13 @@
 !/LICENSE
 !/requirements.txt
 
-# Main pipeline
-!/data_driven_plan.py
-!/gen_main_nb.py
-!/ilp_campaign.py
-!/data_driven_plan.ipynb
+# Helper modules of the three notebooks
+!/utils_prep.py
+!/utils_ml.py
+!/utils_ilp.py
+
+# Reference document read by notebook 01 (stop codes, Feyman et al. 2022, eTable 1)
+!/references/
 
 # Published results of a validated run (executed notebook + summary tables)
 !/reports/
@@ -25,11 +27,13 @@
 /reports/fixes_*.tex
 /reports/fixes_figures/
 
-# ILP validation: generator (single source to edit) and the notebook it writes
+# The three notebooks, committed executed (outputs and figures included)
 !/notebooks/
 /notebooks/*
-!/notebooks/gen_nb.py
-!/notebooks/01_ilp_validation.ipynb
+!/notebooks/01_data_preparation.ipynb
+!/notebooks/02_no_show_prediction.ipynb
+!/notebooks/03_service_time_groups.ipynb
+!/notebooks/04_scheduling_ilp.ipynb
 
 # Unit tests
 !/tests/
