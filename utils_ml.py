@@ -7,7 +7,9 @@
 # an argument from the "Paramètres" cell of the notebook.
 
 import time
+from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -19,7 +21,8 @@ from sklearn.inspection import permutation_importance
 from sklearn.metrics import (accuracy_score, auc, confusion_matrix, f1_score, precision_score,
                              recall_score, roc_auc_score, roc_curve)
 from sklearn.model_selection import GridSearchCV, StratifiedKFold
-from sklearn.preprocessing import MinMaxScaler, TargetEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler, TargetEncoder
 
 
 ############################################################
@@ -73,7 +76,8 @@ def make_pipeline(model, categorical, target_encoder, smote_ratio, random_state)
     and test (where SMOTE does nothing: imblearn only resamples during fit):
       1. target encoding of the categorical columns (output first, then the others);
       2. SMOTE up to `smote_ratio` minority / majority (skipped if None);
-      3. MinMaxScaler, as in the paper;
+      3. StandardScaler (the paper used MinMaxScaler: with it the MLP only
+         predicted the majority class, see notebook 02; trees are not affected);
       4. the model.
 
     Args:
@@ -90,15 +94,21 @@ def make_pipeline(model, categorical, target_encoder, smote_ratio, random_state)
     steps = [("encoder", encoder)]
     if smote_ratio is not None:
         steps.append(("smote", SMOTE(sampling_strategy=smote_ratio, random_state=random_state)))
-    steps += [("scaler", MinMaxScaler()), ("model", model)]
+    steps += [("scaler", StandardScaler()), ("model", model)]
     return Pipeline(steps)
 
 
-def train_model(pipeline, grid, X_train, y_train, scoring, cv_folds, random_state):
+def train_model(pipeline, grid, X_train, y_train, scoring, cv_folds, random_state, model_path, retrain):
     """
     Grid search with cross-validation on the training set (whole pipeline in
     each fold), then refit of the best pipeline on the whole training set. A
     pipeline without grid (None) is fitted once.
+
+    The fitted pipeline is saved to `model_path` (joblib) with its
+    cross-validation results and its settings. When the notebook is run again,
+    the saved pipeline is loaded instead of trained, unless `retrain` is True.
+    If the settings changed since it was saved (grid, model parameters, size of
+    the training set), an error is raised: a stale model is never reused.
 
     Args:
         pipeline: Output of make_pipeline.
@@ -107,21 +117,39 @@ def train_model(pipeline, grid, X_train, y_train, scoring, cv_folds, random_stat
         scoring (str): Score of the grid search, e.g. "f1_macro".
         cv_folds (int): Number of folds.
         random_state (int): Seed of the folds.
+        model_path (str): File of the saved pipeline.
+        retrain (bool): Train again even if a saved pipeline exists.
 
     Returns:
-        tuple: (fitted pipeline, DataFrame of the cross-validation results or None, minutes).
+        tuple: (fitted pipeline, DataFrame of the cross-validation results or None,
+        training time in minutes, True if loaded from model_path).
     """
+    settings = {"grid": grid, "model": str(pipeline.named_steps["model"].get_params()),
+                "n_train": len(y_train), "scoring": scoring, "cv_folds": cv_folds}
+    path = Path(model_path)
+    if path.exists() and not retrain:
+        saved = joblib.load(path)
+        if saved["settings"] != settings:
+            raise ValueError(f"{path} was trained with other settings: set RETRAIN = True to train it again")
+        return saved["pipeline"], saved["cv"], saved["minutes"], True
+
     start = time.time()
     if not grid:
-        return pipeline.fit(X_train, y_train), None, (time.time() - start) / 60
-    search = GridSearchCV(pipeline, {f"model__{k}": v for k, v in grid.items()}, scoring=scoring,
-                          cv=StratifiedKFold(cv_folds, shuffle=True, random_state=random_state),
-                          n_jobs=1, refit=True)
-    search.fit(X_train, y_train)
-    cv = pd.DataFrame(search.cv_results_)
-    cv["params"] = cv["params"].map(lambda p: {k.replace("model__", ""): v for k, v in p.items()})
-    cv = cv[["params", "mean_test_score", "std_test_score", "mean_fit_time"]].sort_values("mean_test_score", ascending=False)
-    return search.best_estimator_, cv, (time.time() - start) / 60
+        fitted, cv = pipeline.fit(X_train, y_train), None
+    else:
+        search = GridSearchCV(pipeline, {f"model__{k}": v for k, v in grid.items()}, scoring=scoring,
+                              cv=StratifiedKFold(cv_folds, shuffle=True, random_state=random_state),
+                              n_jobs=1, refit=True)
+        search.fit(X_train, y_train)
+        fitted = search.best_estimator_
+        cv = pd.DataFrame(search.cv_results_)
+        cv["params"] = cv["params"].map(lambda p: {k.replace("model__", ""): v for k, v in p.items()})
+        cv = cv[["params", "mean_test_score", "std_test_score", "mean_fit_time"]].sort_values(
+            "mean_test_score", ascending=False)
+    minutes = (time.time() - start) / 60
+    path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump({"pipeline": fitted, "cv": cv, "minutes": minutes, "settings": settings}, path)
+    return fitted, cv, minutes, False
 
 
 ############################################################
@@ -320,26 +348,26 @@ def plot_confidence_histogram(y_test, y_test_prob, title, threshold):
 #                                                          #
 ############################################################
 
-def prior_correction(p, train_rate, true_rate):
+def platt_scaling(p_val, y_val):
     """
-    Bring probabilities learnt at a no-show rate `train_rate` (after SMOTE and
-    class weights) back to the real rate `true_rate` (Bayes' rule; Elkan,
-    2001, "The foundations of cost-sensitive learning", Theorem 2):
-
-        p' = p * a / (p * a + (1 - p) * b),   a = true_rate / train_rate,
-                                               b = (1 - true_rate) / (1 - train_rate).
+    Platt scaling (Platt, 1999): a logistic regression with two parameters,
+        p' = 1 / (1 + exp(-(A * logit(p) + B))),
+    fitted on the validation set, that turns the scores of a model trained on
+    resampled and reweighted data into probabilities matching the real rates.
+    It is monotone: the ranking of the consultations (hence the AUC) is unchanged.
 
     Args:
-        p (array): Predicted no-show probabilities.
-        train_rate (float): No-show rate the model was trained at.
-        true_rate (float): Real no-show rate.
+        p_val (array): Predicted probabilities on the validation set.
+        y_val (array): Labels of the validation set.
 
     Returns:
-        array: Corrected probabilities.
+        function: maps predicted probabilities to calibrated probabilities.
     """
-    a = true_rate / train_rate
-    b = (1 - true_rate) / (1 - train_rate)
-    return p * a / (p * a + (1 - p) * b)
+    def logit(p):
+        p = np.clip(p, 1e-6, 1 - 1e-6)
+        return np.log(p / (1 - p))[:, None]
+    model = LogisticRegression().fit(logit(np.asarray(p_val)), y_val)
+    return lambda p: model.predict_proba(logit(np.asarray(p)))[:, 1]
 
 
 def plot_reliability(y_true, probas, n_bins, title):
