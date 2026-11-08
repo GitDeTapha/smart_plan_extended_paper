@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from utils_ilp import (build_milp, greedy, planning_cost, simulate_day, single_booking,  # noqa: E402
+from utils_ilp import (build_milp, greedy, pairs_last, planning_cost, simulate_day, single_booking,  # noqa: E402
                        solve_by_enumeration, solve_ilp, solve_pairs)
 
 
@@ -62,7 +62,7 @@ def test_simulation_matches_model_without_carry_over():
     L = [30.0, 30.0, 45.0, 30.0]
     planning = single_booking(4, 4)
     shows = rng.random((200_000, 4)) < q
-    sim = simulate_day(planning, s, L, shows, 1.0, 0.5)
+    sim = simulate_day(planning, s, L, shows, 1.0, 0.5, 1.0)
     assert sim["Z"].mean() == pytest.approx(planning_cost(planning, q, s, L, 1.0, 0.5)["Z"], rel=5e-3)
 
 
@@ -88,3 +88,22 @@ def test_pairs_equal_slot_model_and_enumeration(seed):
     assert pairs["Z"] == pytest.approx(slots["Z"], abs=1e-7)
     if n <= 6:
         assert pairs["Z"] == pytest.approx(solve_by_enumeration(q, s, [30.0] * T, 1.0, c_W)["Z"], abs=1e-7)
+
+
+def test_overtime_counted_after_the_end_of_the_day():
+    """Two patients of 30 min in the last slot of 30 min: the second one ends 30 min late."""
+    sim = simulate_day({0: [0], 1: [1, 2]}, np.array([30.0, 30.0, 30.0]), [30.0, 30.0],
+                       np.ones((1, 3), dtype=bool), 1.0, 0.5, 1.0)
+    assert sim["overtime"][0] == 30.0 and sim["wait"][0] == 30.0 and sim["idle"][0] == 0.0
+    assert sim["Z"][0] == 0.5 * 30.0 + 1.0 * 30.0
+
+
+def test_pairs_last_keeps_the_cost_of_the_model():
+    rng = np.random.default_rng(5)
+    q, s, _ = random_instance(rng, 7, 4)
+    L = [30.0] * 4
+    res = solve_pairs(q, s, 30.0, 4, 1.0, 0.5, 60.0, 1e-9)
+    ordered = pairs_last(res["planning"])
+    assert planning_cost(ordered, q, s, L, 1.0, 0.5)["Z"] == pytest.approx(res["Z"])
+    sizes = [len(ordered[t]) for t in sorted(ordered)]
+    assert sizes == sorted(sizes)

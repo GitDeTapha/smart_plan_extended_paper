@@ -311,18 +311,34 @@ def greedy(q, s, L):
     return planning
 
 
+def pairs_last(planning):
+    """
+    Order of the slots in the day. With slots of equal length the ILP gives the
+    same cost to every order, so the order is a rule set apart: the slots with
+    one patient first, then the double-booked slots, then the empty ones. The
+    delay of a double-booked slot then carries over to fewer patients.
+
+    Returns:
+        dict: {slot: patients}, slots numbered in that order.
+    """
+    groups = [p for p in planning.values() if len(p) == 1] + [p for p in planning.values() if len(p) == 2]
+    return dict(enumerate(groups))
+
+
 ############################################################
 #                                                          #
 #        ------   Simulation of the day   -------          #
 #                                                          #
 ############################################################
 
-def simulate_day(planning, s, L, shows, c_I, c_W):
+def simulate_day(planning, s, L, shows, c_I, c_W, c_O):
     """
     Cost of a planning over a real day, where delays carry over: a slot starts
     at its scheduled time or when the previous patient is done, whichever is
     later. Patients of a slot are served shortest first. Idle time counts every
-    minute the doctor waits for a patient, up to the end of the day.
+    minute the doctor waits for a patient, up to the end of the day; overtime
+    counts every minute worked after the end of the day (the ILP of the paper
+    has no overtime: it is counted here only, to judge the plannings).
 
     Args:
         planning (dict): {slot: patients}.
@@ -330,10 +346,10 @@ def simulate_day(planning, s, L, shows, c_I, c_W):
         L (list): Slot lengths (minutes).
         shows (array): Shape (M, n), True if patient i comes in scenario m.
             The same draws are used for every planning (common random numbers).
-        c_I, c_W (float): Costs of one minute of idle time and of waiting time.
+        c_I, c_W, c_O (float): Costs of one minute of idle time, of waiting time and of overtime.
 
     Returns:
-        dict: Z, idle and wait for each of the M scenarios (arrays).
+        dict: Z, idle, wait and overtime for each of the M scenarios (arrays).
     """
     M = shows.shape[0]
     starts = np.concatenate([[0.0], np.cumsum(L)[:-1]])
@@ -345,4 +361,5 @@ def simulate_day(planning, s, L, shows, c_I, c_W):
             wait += shows[:, i] * (clock - starts[t])
             clock = clock + shows[:, i] * s[i]
     idle += np.maximum(0.0, sum(L) - clock)
-    return {"Z": c_I * idle + c_W * wait, "idle": idle, "wait": wait}
+    overtime = np.maximum(0.0, clock - sum(L))
+    return {"Z": c_I * idle + c_W * wait + c_O * overtime, "idle": idle, "wait": wait, "overtime": overtime}
