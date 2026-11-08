@@ -17,7 +17,6 @@ import seaborn as sns
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
-from sklearn.inspection import permutation_importance
 from sklearn.metrics import (accuracy_score, auc, confusion_matrix, f1_score, precision_score,
                              recall_score, roc_auc_score, roc_curve)
 from sklearn.model_selection import GridSearchCV, StratifiedKFold
@@ -207,7 +206,7 @@ def evaluate_model(y_train, y_train_proba, y_test, y_test_proba, threshold, titl
 
 
 def evaluate_classifier(name, fitted, probas, y_train, y_val, y_test, X_test, thresholds,
-                        feature_names, permutation_rows, random_state):
+                        feature_names, permutation_rows, n_bootstrap, random_state):
     """
     Everything shown for one model:
       1. the decision threshold maximising the F1 score on the validation set (plot);
@@ -219,10 +218,11 @@ def evaluate_classifier(name, fitted, probas, y_train, y_val, y_test, X_test, th
         fitted: Fitted pipeline (output of train_model).
         probas (dict): Predicted probabilities of class 1 on "train", "val" and "test".
         y_train, y_val, y_test: Labels.
-        X_test: Test set (for the permutation importance of the MLP).
+        X_test: Test set (for the permutation importance).
         thresholds (array): Candidate thresholds.
         feature_names (list): Names of the columns after the encoder (categorical first).
-        permutation_rows (int): Rows for the permutation importance of the MLP.
+        permutation_rows (int): Rows of each bootstrap sample of the permutation importance.
+        n_bootstrap (int): Number of bootstrap samples of the permutation importance.
         random_state (int): Seed of the permutation importance.
 
     Returns:
@@ -238,7 +238,8 @@ def evaluate_classifier(name, fitted, probas, y_train, y_val, y_test, X_test, th
     plot_roc_curve(y_test, probas["test"], name)
     plot_confidence_histogram(y_test, probas["test"], f"{name}: errors on the test set", threshold)
     plot_feature_importances(fitted.named_steps["model"], fitted[:-1].transform(X_test), y_test,
-                             feature_names, f"{name}: feature importances", permutation_rows, random_state)
+                             feature_names, f"{name}: feature importances", threshold,
+                             permutation_rows, n_bootstrap, random_state)
     return threshold, results
 
 
@@ -280,38 +281,50 @@ def plot_roc_curve(y_true, y_pred_proba, model_name="Model"):
     plt.show()
 
 
-def plot_feature_importances(model, X, y, feature_names, title, n_rows, random_state):
+def plot_feature_importances(model, X, y, feature_names, title, threshold, n_rows, n_bootstrap, random_state):
     """
-    Plot the feature importances of a model.
-    Tree ensembles (Random Forest, XGBoost, AdaBoost) have feature_importances_.
-    The MLP has none: its importance is the drop of the ROC-AUC when one
-    feature is shuffled (permutation importance), on `n_rows` rows of (X, y).
+    Permutation importance with a bootstrap, the same method for the four models.
+    The trained model is kept as it is (no retraining). For each of `n_bootstrap`
+    samples of `n_rows` rows drawn with replacement from (X, y):
+      - F1 score (macro) of the model at its decision threshold;
+      - for each feature, F1 score once that column is shuffled;
+      - importance of the feature = drop of the F1 score.
+    The bar is the mean over the samples, the error bar their standard deviation
+    (as plot_feature_importances_bootstrap in the code of the paper).
 
     Args:
-        model: Trained model.
-        X, y: Data used for the permutation importance (MLP only).
-        feature_names (list): Names of the features.
+        model: Trained model (last step of the pipeline).
+        X, y: Test set, already encoded and scaled by the pipeline.
+        feature_names (list): Names of the features (columns of X).
         title (str): Title of the plot.
-        n_rows (int): Rows used for the permutation importance.
-        random_state (int): Seed of the row sample and of the shuffles.
+        threshold (float): Decision threshold of the model.
+        n_rows (int): Rows of each bootstrap sample.
+        n_bootstrap (int): Number of bootstrap samples.
+        random_state (int): Seed of the samples and of the shuffles.
 
     Returns:
-        Series: Importance of each feature, sorted.
+        DataFrame: mean and standard deviation of the importance of each feature, sorted.
     """
-    if hasattr(model, 'feature_importances_'):
-        importances = pd.Series(model.feature_importances_, index=feature_names)
-        xlabel = 'Importance'
-    else:
-        rows = np.random.default_rng(random_state).choice(len(y), size=min(n_rows, len(y)), replace=False)
-        result = permutation_importance(model, X[rows], np.asarray(y)[rows], scoring='roc_auc',
-                                        n_repeats=3, random_state=random_state)
-        importances = pd.Series(result.importances_mean, index=feature_names)
-        xlabel = 'Drop of the ROC-AUC when the feature is shuffled'
-    importances = importances.sort_values(ascending=False)
+    rng = np.random.default_rng(random_state)
+    X, y = np.asarray(X), np.asarray(y)
+    drops = np.zeros((n_bootstrap, X.shape[1]))
+    for b in range(n_bootstrap):
+        rows = rng.choice(len(y), size=min(n_rows, len(y)), replace=True)
+        X_b, y_b = X[rows], y[rows]
+        base = f1_score(y_b, (model.predict_proba(X_b)[:, 1] >= threshold).astype(int), average='macro')
+        for j in range(X.shape[1]):
+            X_perm = X_b.copy()
+            X_perm[:, j] = rng.permutation(X_perm[:, j])
+            score = f1_score(y_b, (model.predict_proba(X_perm)[:, 1] >= threshold).astype(int), average='macro')
+            drops[b, j] = base - score
+    importances = pd.DataFrame({'mean': drops.mean(axis=0), 'std': drops.std(axis=0)},
+                               index=feature_names).sort_values('mean', ascending=False)
     plt.figure(figsize=(7, 4))
-    sns.barplot(x=importances.values, y=importances.index, color='steelblue')
+    plt.barh(importances.index[::-1], importances['mean'][::-1], xerr=importances['std'][::-1],
+             color='steelblue', ecolor='black', capsize=3)
     plt.title(title)
-    plt.xlabel(xlabel)
+    plt.xlabel(f'Drop of the F1 score (macro) when the feature is shuffled\n'
+               f'mean and standard deviation over {n_bootstrap} bootstrap samples of {min(n_rows, len(y)):,} test rows')
     plt.ylabel('Features')
     plt.show()
     return importances
