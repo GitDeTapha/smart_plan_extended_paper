@@ -1,146 +1,61 @@
 # Smart Plan: Cluster-Predict-Schedule
 
-Data-driven outpatient appointment scheduling. Two predictive models (the
-no-show probability of each patient and its service-time group) feed a
-stochastic overbooking integer program (ILP) that allows at most two patients
-per slot, trading slot idle time against patient waiting time.
+Data-driven outpatient appointment scheduling with overbooking. Two predictions
+made when an appointment is booked (the probability that the patient does not
+show up, and the service-time group of the consultation) feed an integer linear
+program that puts at most two patients in a slot and minimises the expected cost
+of idle time and waiting time.
 
-This repository is the evidence behind the paper: the code, the executed
-notebooks of the runs reported in it, their inputs and outputs, and the
-provenance of each number. Results are not restated here; they are read in the
-executed notebooks listed below.
+This project extends the conference paper whose code is at
+https://github.com/GitDeTapha/Data_driven_model_in_AOS. Each notebook is
+committed executed: its tables and figures are visible on GitHub, nothing needs
+to be run to read the results. Every choice is set in the "Parameters" cell at
+the top of each notebook, with its reason.
 
-## Where to find what
+## Notebooks
 
-| Question | File |
+| Notebook | Question |
 |---|---|
-| How were the models trained, and with which outputs? | [reports/run_full_20261030.ipynb](reports/run_full_20261030.ipynb) (executed notebook, all outputs) |
-| How long did each training stage take, with how much memory? | [reports/run_full_20261030/STATUS.md](reports/run_full_20261030/STATUS.md) |
-| On which machine and package versions? | [pod_env.txt](reports/run_full_20261030/pod_env.txt), [pod_freeze.txt](reports/run_full_20261030/pod_freeze.txt) |
-| Test metrics of the trained models | [test_metrics.csv](reports/run_full_20261030/test_metrics.csv), [tables/](reports/run_full_20261030/tables/) |
-| Figures of the training run | [reports/run_full_20261030/figures/](reports/run_full_20261030/figures/) |
-| Parameters passed from the models to the ILP | [data/inference/plne_parameters.json](data/inference/plne_parameters.json) |
-| How was the ILP validated, and with which outputs? | [reports/ilp_full_20261101/ilp_validation_full_20261101.ipynb](reports/ilp_full_20261101/ilp_validation_full_20261101.ipynb) |
-| Key ILP figures for the manuscript | [reports/ilp_full_20261101/RESULTS.md](reports/ilp_full_20261101/RESULTS.md) |
-| Raw ILP campaign tables, LaTeX tables and figures | [results/](reports/ilp_full_20261101/results/), [tables/](reports/ilp_full_20261101/tables/), [figures/](reports/ilp_full_20261101/figures/) |
-| Which code produced each run? | [PROVENANCE.md](reports/run_full_20261030/PROVENANCE.md), [CAMPAIGN.md](reports/ilp_full_20261101/CAMPAIGN.md) |
-| Are the unversioned outputs the ones used? | [SHA256SUMS](reports/run_full_20261030/SHA256SUMS) |
+| [01_data_preparation](notebooks/01_data_preparation.ipynb) | Which consultations and predictors? (same steps and row counts as the paper) |
+| [02_no_show_prediction](notebooks/02_no_show_prediction.ipynb) | How well is a no-show predicted? (Random Forest, XGBoost, AdaBoost, MLP) |
+| [03_service_time_groups](notebooks/03_service_time_groups.ipynb) | Short or long consultation? (K-medians clustering, then the same four classifiers) |
+| [04_scheduling_ilp](notebooks/04_scheduling_ilp.ipynb) | Which patients share a slot, and what does it save? (ILP, simple policies, real test days) |
 
-The `.ipynb` files open directly in the GitHub web interface (outputs and
-figures included). For a large notebook that GitHub does not render, download
-it and open it with Jupyter or VS Code.
-
-## How the pieces fit
+## Files
 
 ```
-raw consultations (not versioned)
-        │  scripts/csv_to_parquet.py
-        ▼
-data_driven_plan.ipynb  ── executed on a RunPod pod (16 vCPU, 128 GB) ──►  reports/run_full_20261030.ipynb
-        │  export stage
-        ├──► data/inference/plne_parameters.json   s_A, s_B, pi_A, no-show rate, provenance (versioned)
-        └──► holdout_scores.parquet                q_i and groups of holdout patients (patient level,
-        │                                          not versioned; SHA-256 in SHA256SUMS)
-        ▼
-notebooks/01_ilp_validation.ipynb  ── executed on a laptop (4 cores, 16 GB) ──►  reports/ilp_full_20261101/
+utils_prep.py      functions of notebook 01 (taken from the paper's code)
+utils_ml.py        functions of notebooks 02 and 03 (pipeline, metrics as in the paper)
+utils_ilp.py       functions of notebook 04 (cost of a slot, the ILP, simple policies, simulation)
+tests/test_ilp.py  the ILP against the enumeration of every planning
+references/        stop codes kept (Feyman et al., 2022, JAMA Netw Open, eTable 1)
+scripts/           one-off conversion of the raw CSV into Parquet chunks
 ```
-
-The training needs a server; the ILP campaign runs on a laptop, which shows that
-the scheduling step can be deployed on modest hardware. The ILP campaign reads
-nothing but the two exported files, so its results follow from the training run
-without any recomputation.
-
-## Repository tree
-
-```
-.
-├── README.md
-├── requirements.txt               pinned dependencies (Python 3.13)
-├── data_driven_plan.py            all reusable functions: data, features, models, ILP core, evaluators
-├── ilp_campaign.py                ILP campaign: instance generator, benchmarks B1-B5, cache, parallel runner
-├── gen_main_nb.py                 GENERATOR of data_driven_plan.ipynb (edit this file, not the notebook)
-├── data_driven_plan.ipynb         GENERATED template of the training pipeline, without outputs
-├── notebooks/
-│   ├── gen_nb.py                  GENERATOR of 01_ilp_validation.ipynb
-│   └── 01_ilp_validation.ipynb    GENERATED template of the ILP validation, without outputs
-├── scripts/csv_to_parquet.py      converts the raw CSV into chunked Parquet input
-├── data/inference/
-│   └── plne_parameters.json       the only versioned data file (aggregates, no patient record)
-├── tests/                         pytest suite (exactness of the ILP, evaluators, training, campaign)
-└── reports/                       EXECUTED runs: the evidence
-    ├── run_full_20261030.ipynb        training run on all patients (pod), with outputs
-    ├── run_full_20261030/             its status, environment, metrics, tables, figures, checksums
-    ├── ilp_full_20261101/             ILP campaign on the outputs of that run (laptop), every patient served
-    ├── ilp_full_20261030/             earlier ILP campaign, C1 as an inequality (superseded, kept for the record)
-    ├── commit_map_old_new.tsv         commit correspondence with the original repository
-    ├── fixes_20261029.md              changes made after the audit of the pipeline
-    └── run_20260926_2002.ipynb,       earlier run, before the audit (kept for the record,
-        recap_data_driven_plan.csv,    superseded by run_full_20261030)
-        training_history.csv
-```
-
-### Generated templates and executed runs
-
-`data_driven_plan.ipynb` and `notebooks/01_ilp_validation.ipynb` are written by
-`gen_main_nb.py` and `notebooks/gen_nb.py`. They are kept without outputs: they
-are the programs. Each run executes a copy with papermill, which records the
-parameters of the run in a cell tagged `injected-parameters`; that executed copy
-is the one stored in `reports/`. To change a notebook, edit its generator and
-regenerate (`python3 gen_main_nb.py`, or `cd notebooks && python3 gen_nb.py`).
 
 ## Data
 
-The dataset is not part of this repository: it contains patient-level
-consultation records. `.gitignore` is an allow-list, so `data/`, `models/`,
-`results/`, `figures/`, `tables/` and `runs/` stay local unless a file is
-explicitly allowed. All data paths derive from `SMART_PLAN_DATA` (default
-`./data`).
-
-## Reproducing the runs
-
-Setup:
+The consultations of the Veterans Health Administration are patient records and
+are not in this repository. Notebook 01 reads them from `data/raw_data_parquet/`,
+written once from the raw CSV:
 
 ```bash
-python3 -m venv ml_env
-./ml_env/bin/pip install -r requirements.txt
-```
-
-Convert the raw CSV once:
-
-```bash
-./ml_env/bin/python scripts/csv_to_parquet.py \
-  --csv data/consult_waits_2024_03_25.csv \
+python scripts/csv_to_parquet.py --csv data/consult_waits_2024_03_25.csv \
   --out-dir data/raw_data_parquet --chunksize 500000 --compression snappy
 ```
 
-Training (the full run took 25.5 h on 16 vCPU and 128 GB; stages resume from
-their saved artifacts after an interruption):
+## Running
 
 ```bash
-python -m papermill data_driven_plan.ipynb runs/full_executed.ipynb -k python3 \
-  -p RUN_ID full_<date> -p MMAP_MATRICES False
+python3 -m venv ml_env && ./ml_env/bin/pip install -r requirements.txt
+cd notebooks
+for nb in 01_data_preparation 02_no_show_prediction 03_service_time_groups 04_scheduling_ilp; do
+  ../ml_env/bin/jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.timeout=-1 $nb.ipynb
+done
+cd .. && ./ml_env/bin/python -m pytest tests
 ```
 
-`-p PATIENT_FRACTION 0.1` runs a pilot on 10 % of the patients; `-p SMOKE True`
-a quick check. On a local disk `MMAP_MATRICES` can stay `True`.
-
-ILP validation, from the repository root, on the outputs of a training run:
-
-```bash
-python -m papermill notebooks/01_ilp_validation.ipynb runs/ilp_executed.ipynb --cwd . -k python3 \
-  -p PLNE_PARAMS_PATH data/inference/plne_parameters.json \
-  -p HOLDOUT_SCORES_PATH results/run_<id>/holdout_scores.parquet
-```
-
-On a laptop, run long campaigns under `systemd-inhibit --what=sleep:idle`: HiGHS
-measures its time limit on the wall clock, so a suspension stops the running ILPs
-at the limit (see [CAMPAIGN.md](reports/ilp_full_20261101/CAMPAIGN.md)).
-
-Tests:
-
-```bash
-python -m pytest tests
-```
+The notebooks run in this order: each one reads the files written by the
+previous ones in `data/`.
 
 ## License
 
