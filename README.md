@@ -7,10 +7,81 @@ program that puts at most two patients in a slot and minimises the expected cost
 of idle time and waiting time.
 
 This project extends the conference paper whose code is at
-https://github.com/GitDeTapha/Data_driven_model_in_AOS. Each notebook is
-committed executed: its tables and figures are visible on GitHub, nothing needs
-to be run to read the results. Every choice is set in the "Parameters" cell at
-the top of each notebook, with its reason.
+https://github.com/GitDeTapha/Data_driven_model_in_AOS. Every choice is set in
+the "Parameters" cell at the top of each notebook, with its reason. The notebooks
+are committed executed: their tables and figures can be read on GitHub without
+running anything.
+
+## Status
+
+- Notebook 01 is executed on all the data.
+- Notebooks 02 to 04 have been executed on a **pilot of 10 % of the
+  consultations** ([pilot_10pct/](pilot_10pct/)). The run on all the data is
+  under way; its executed notebooks will replace the ones in `notebooks/`.
+
+### Why a 10 % pilot
+
+The four classifiers of notebooks 02 and 03 are tuned by a grid search with
+3-fold cross-validation. On 10 % of the consultations (1.1 million), this took
+2 h 40 for notebook 02 and 2 h 20 for notebook 03 on a laptop. All the data
+(11.3 million consultations) is ten times larger: the full run is estimated at
+40 to 60 hours on the laptop, so it runs on a rented server.
+
+The pilot checks, before that expensive run, that the whole chain works end to
+end, and gives a first view of the results. The pilot notebooks are the
+notebooks of `notebooks/` with two changes: `SAMPLE_FRACTION = 0.1` in
+notebook 02, and the paths of their files.
+
+### Pilot results (10 % of the consultations)
+
+Test set (30 % of the sample), metrics averaged over the two classes
+(`average='macro'`, as in the conference paper). The threshold of each model
+maximises the F1 score on a validation set taken from the training set. The
+training metrics are in the notebooks.
+
+**No-show** ([02_no_show_prediction_10pct](pilot_10pct/02_no_show_prediction_10pct.ipynb)), no-show rate 3.1 %:
+
+| Model | F1 | Precision | Recall | AUC | Accuracy |
+|---|---|---|---|---|---|
+| XGBoost | 0.662 | 0.679 | 0.649 | 0.845 | 0.963 |
+| Random Forest | 0.630 | 0.634 | 0.627 | 0.832 | 0.957 |
+| MLP | 0.628 | 0.627 | 0.629 | 0.814 | 0.955 |
+| AdaBoost | 0.598 | 0.589 | 0.610 | 0.795 | 0.946 |
+
+XGBoost is kept (best F1 on the validation set). Its probabilities, calibrated
+by Platt scaling on the validation set, give a mean of 3.09 % on the test set,
+for 3.11 % observed.
+
+**Service-time group** ([03_service_time_groups_10pct](pilot_10pct/03_service_time_groups_10pct.ipynb)):
+two groups by exact 1D K-medians on the training set. The cutoff is 22 days
+(medians: 7 days for the short group, 38 days for the long group); 35 % of the
+consultations are long.
+
+| Model | F1 | Precision | Recall | AUC | Accuracy |
+|---|---|---|---|---|---|
+| XGBoost | 0.636 | 0.635 | 0.638 | 0.707 | 0.666 |
+| Random Forest | 0.632 | 0.630 | 0.636 | 0.700 | 0.657 |
+| MLP | 0.612 | 0.610 | 0.615 | 0.674 | 0.640 |
+| AdaBoost | 0.561 | 0.601 | 0.567 | 0.630 | 0.658 |
+
+AdaBoost predicts the short group for almost every consultation (cross-validated
+F1 0.395); it is shown as it is.
+
+**Scheduling** ([04_scheduling_ilp_10pct](pilot_10pct/04_scheduling_ilp_10pct.ipynb)):
+one day of 8 slots of 30 minutes, 12 patients, short and long consultations of
+15 and 30 minutes, c_I = 1, c_W = 0.5.
+
+- Table 1 of the conference paper is reproduced (Z* = 65.62). The ILP is
+  checked against the enumeration of every planning.
+- Every ILP is proven optimal by HiGHS, in about 0.03 s.
+- In this setting, the ILP and the greedy policy have the **same expected cost**
+  on all 30 days. With identical slots, two lengths and show probabilities close
+  to 0.97, there is almost nothing to optimise.
+- On 100 real days of the test set, the difference between the ILP and the
+  greedy policy is not significant (95 % CI -9.3 to 2.7). Single booking costs
+  less, but serves 8 patients out of 12.
+- The setting of the full run (slots of different lengths, or a lighter day) is
+  being discussed.
 
 ## Notebooks
 
@@ -28,7 +99,8 @@ utils_prep.py      functions of notebook 01 (taken from the paper's code)
 utils_ml.py        functions of notebooks 02 and 03 (pipeline, metrics as in the paper)
 utils_ilp.py       functions of notebook 04 (cost of a slot, the ILP, simple policies, simulation)
 tests/test_ilp.py  the ILP against the enumeration of every planning
-references/        stop codes kept (Feyman et al., 2022, JAMA Netw Open, eTable 1)
+pilot_10pct/       notebooks 02 to 04 executed on 10 % of the consultations
+references/        stop codes kept (Feyman et al., 2022, eTable 1)
 scripts/           one-off conversion of the raw CSV into Parquet chunks
 ```
 
@@ -55,7 +127,49 @@ cd .. && ./ml_env/bin/python -m pytest tests
 ```
 
 The notebooks run in this order: each one reads the files written by the
-previous ones in `data/`.
+previous ones in `data/`. Trained models are saved in `models/` and reloaded
+when a notebook is run again (`RETRAIN = True` trains them again).
+
+## References
+
+**Data and earlier work**
+- Code of the conference paper: https://github.com/GitDeTapha/Data_driven_model_in_AOS
+- Feyman Y, Asfaw DA, Griffith KN. Geographic variation in appointment wait
+  times for US military veterans. *JAMA Network Open*. 2022;5(8):e2228783.
+  doi:10.1001/jamanetworkopen.2022.28783 (stop codes kept: eTable 1).
+
+**Methods**
+- Chawla NV, Bowyer KW, Hall LO, Kegelmeyer WP. SMOTE: synthetic minority
+  over-sampling technique. *Journal of Artificial Intelligence Research*.
+  2002;16:321-357.
+- Micci-Barreca D. A preprocessing scheme for high-cardinality categorical
+  attributes in classification and prediction problems. *ACM SIGKDD
+  Explorations*. 2001;3(1):27-32 (target encoding).
+- Breiman L. Random forests. *Machine Learning*. 2001;45(1):5-32.
+- Chen T, Guestrin C. XGBoost: a scalable tree boosting system. *Proceedings of
+  KDD 2016*:785-794.
+- Freund Y, Schapire RE. A decision-theoretic generalization of on-line learning
+  and an application to boosting. *Journal of Computer and System Sciences*.
+  1997;55(1):119-139 (AdaBoost).
+- Platt J. Probabilistic outputs for support vector machines and comparisons to
+  regularized likelihood methods. In: *Advances in Large Margin Classifiers*.
+  MIT Press; 1999:61-74 (Platt scaling).
+- Huangfu Q, Hall JAJ. Parallelizing the dual revised simplex method.
+  *Mathematical Programming Computation*. 2018;10(1):119-142 (HiGHS).
+- Lindley DV. The theory of queues with a single server. *Mathematical
+  Proceedings of the Cambridge Philosophical Society*. 1952;48(2):277-289
+  (delays carried over in the simulation).
+- Wilcoxon F. Individual comparisons by ranking methods. *Biometrics Bulletin*.
+  1945;1(6):80-83.
+
+**Software**
+- Pedregosa F, et al. Scikit-learn: machine learning in Python. *Journal of
+  Machine Learning Research*. 2011;12:2825-2830.
+- Lemaître G, Nogueira F, Aridas CK. Imbalanced-learn: a Python toolbox to
+  tackle the curse of imbalanced datasets in machine learning. *Journal of
+  Machine Learning Research*. 2017;18(17):1-5.
+- Virtanen P, et al. SciPy 1.0: fundamental algorithms for scientific computing
+  in Python. *Nature Methods*. 2020;17:261-272 (`scipy.optimize.milp`).
 
 ## License
 
