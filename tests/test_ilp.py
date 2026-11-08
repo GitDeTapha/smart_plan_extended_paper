@@ -82,7 +82,7 @@ def test_pairs_equal_slot_model_and_enumeration(seed):
     q = rng.uniform(0.5, 0.99, n)
     s = rng.choice([15.0, 30.0], n)
     c_W = float(rng.choice([0.25, 0.5, 1.0, 2.0]))
-    pairs = solve_pairs(q, s, 30.0, T, 1.0, c_W, time_limit=60, mip_rel_gap=1e-9)
+    pairs = solve_pairs(q, s, [30.0] * T, 1.0, c_W, time_limit=60, mip_rel_gap=1e-9)
     slots = solve_ilp(q, s, [30.0] * T, 1.0, c_W, time_limit=60, mip_rel_gap=1e-9)
     assert pairs["optimal"] and slots["optimal"]
     assert pairs["Z"] == pytest.approx(slots["Z"], abs=1e-7)
@@ -98,12 +98,30 @@ def test_overtime_counted_after_the_end_of_the_day():
     assert sim["Z"][0] == 0.5 * 30.0 + 1.0 * 30.0
 
 
+@pytest.mark.parametrize("seed", range(30))
+def test_pairs_with_slots_of_two_lengths(seed):
+    """Slots of 15 and 30 minutes: the pair formulation finds the optimum of the slot model."""
+    rng = np.random.default_rng(200 + seed)
+    n = int(rng.integers(3, 8))
+    L = [15.0, 30.0, 15.0, 30.0]
+    q = rng.uniform(0.5, 0.99, n)
+    s = rng.choice([15.0, 30.0], n)
+    c_W = float(rng.choice([0.25, 0.5, 1.0, 2.0]))
+    pairs = solve_pairs(q, s, L, 1.0, c_W, time_limit=60, mip_rel_gap=1e-9)
+    slots = solve_ilp(q, s, L, 1.0, c_W, time_limit=60, mip_rel_gap=1e-9)
+    assert pairs["optimal"] and slots["optimal"]
+    assert pairs["Z"] == pytest.approx(slots["Z"], abs=1e-7)
+    if n <= 6:
+        assert pairs["Z"] == pytest.approx(solve_by_enumeration(q, s, L, 1.0, c_W)["Z"], abs=1e-7)
+
+
 def test_pairs_last_keeps_the_cost_of_the_model():
     rng = np.random.default_rng(5)
     q, s, _ = random_instance(rng, 7, 4)
-    L = [30.0] * 4
-    res = solve_pairs(q, s, 30.0, 4, 1.0, 0.5, 60.0, 1e-9)
-    ordered = pairs_last(res["planning"])
-    assert planning_cost(ordered, q, s, L, 1.0, 0.5)["Z"] == pytest.approx(res["Z"])
-    sizes = [len(ordered[t]) for t in sorted(ordered)]
+    L = [15.0, 30.0, 15.0, 30.0, 30.0]
+    res = solve_pairs(q, s, L, 1.0, 0.5, 60.0, 1e-9)
+    ordered, L_ordered = pairs_last(res["planning"], L)
+    assert sorted(L_ordered) == sorted(L)
+    assert planning_cost(ordered, q, s, L_ordered, 1.0, 0.5)["Z"] == pytest.approx(res["Z"])
+    sizes = [len(ordered.get(t, [])) or 3 for t in range(len(L))]
     assert sizes == sorted(sizes)

@@ -186,53 +186,57 @@ def solve_ilp(q, s, L, c_I, c_W, time_limit, mip_rel_gap):
             "nodes": res.mip_node_count, "seconds": seconds}
 
 
-def solve_pairs(q, s, slot_length, n_slots, c_I, c_W, time_limit, mip_rel_gap):
+def solve_pairs(q, s, L, c_I, c_W, time_limit, mip_rel_gap):
     """
-    Same ILP when all the slots have the same length: which slot a patient gets
-    no longer matters, only who shares a slot. Every planning of the slot model
-    corresponds to n_slots! plannings of equal cost (permutations of the slots),
-    which the branch-and-bound of solve_ilp has to rule out one by one; this
-    formulation has no such symmetry.
+    Same ILP, written without the slot index. Slots of the same length are
+    interchangeable: only who shares a slot, and the length of that slot,
+    matter. Every planning of the slot model has n_k! copies of equal cost for
+    each length k (permutations of the slots of that length), which the
+    branch-and-bound of solve_ilp has to rule out one by one; this formulation
+    has no such symmetry.
 
-    Variables:
-        u[i] in {0, 1}    patient i is alone in a slot
-        y[i, j] in {0, 1} patients i < j share a slot
+    Variables, for each slot length k:
+        u[i, k] in {0, 1}    patient i is alone in a slot of length k
+        y[i, j, k] in {0, 1} patients i < j share a slot of length k
     Constraints:
-        u[i] + sum_j y[i, j] = 1                  every patient is alone or in exactly one pair (C1, C2)
-        sum_i u[i] + sum_{i<j} y[i, j] <= n_slots at most one slot per single or pair
-    Objective, with the coefficients of build_milp (L = slot_length):
-        c_I * n_slots * L - c_I * sum_i a[i] u[i]
-                          + sum_{i<j} (c_W w[i,j] - c_I (a[i] + a[j] + delta[i,j])) y[i, j]
+        sum_k (u[i, k] + sum_j y[i, j, k]) = 1    every patient alone or in one pair, in one slot (C1, C2)
+        sum_i u[i, k] + sum_{i<j} y[i, j, k] <= n_k   at most n_k slots of length k
+    Objective, with the coefficients of build_milp:
+        c_I * sum_t L_t - c_I * sum_{i,k} a[i,k] u[i,k]
+                        + sum_{i<j,k} (c_W w[i,j] - c_I (a[i,k] + a[j,k] + delta[i,j,k])) y[i,j,k]
 
     Args:
         q, s (arrays): Show probabilities and durations (minutes).
-        slot_length (float): Length of every slot (minutes).
-        n_slots (int): Number of slots.
+        L (list): Slot lengths (minutes).
         c_I, c_W (float): Costs of one minute of idle time and of waiting time.
         time_limit (float): Seconds after which HiGHS stops.
         mip_rel_gap (float): Relative gap at which HiGHS stops.
 
     Returns:
-        dict: same keys as solve_ilp (slots numbered in the order of the pairs, then the singles).
+        dict: same keys as solve_ilp. In the planning, the slots of each length
+        get the pairs first, then the single patients (the order of the day is
+        set apart, see pairs_last).
     """
-    n, L = len(q), float(slot_length)
-    if n > 2 * n_slots:
-        raise ValueError(f"{n} patients cannot fit in {n_slots} slots of two patients")
+    L = [float(length) for length in L]
+    n, lengths = len(q), sorted(set(L))
+    if n > 2 * len(L):
+        raise ValueError(f"{n} patients cannot fit in {len(L)} slots of two patients")
     pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
-    a = q * np.minimum(s, L)
-    c = np.zeros(n + len(pairs))
-    c[:n] = -c_I * a
-    for k, (i, j) in enumerate(pairs):
-        w = q[i] * q[j] * min(s[i], s[j])
-        delta = q[i] * q[j] * (min(s[i] + s[j], L) - min(s[i], L) - min(s[j], L))
-        c[n + k] = c_W * w - c_I * (a[i] + a[j] + delta)
-    A = np.zeros((n + 1, n + len(pairs)))
-    A[np.arange(n), np.arange(n)] = 1                      # u[i]
-    for k, (i, j) in enumerate(pairs):                      # y[i, j] counts for i and for j
-        A[i, n + k] = A[j, n + k] = 1
-    A[n, :] = 1                                             # number of slots used
-    lower = np.r_[np.ones(n), -np.inf]
-    upper = np.r_[np.ones(n), n_slots]
+    block = n + len(pairs)                                  # variables of one slot length
+    c = np.zeros(block * len(lengths))
+    A = np.zeros((n + len(lengths), len(c)))
+    for k, length in enumerate(lengths):
+        a = q * np.minimum(s, length)
+        c[k * block:k * block + n] = -c_I * a
+        A[np.arange(n), k * block + np.arange(n)] = 1       # u[i, k]
+        for p, (i, j) in enumerate(pairs):
+            w = q[i] * q[j] * min(s[i], s[j])
+            delta = q[i] * q[j] * (min(s[i] + s[j], length) - min(s[i], length) - min(s[j], length))
+            c[k * block + n + p] = c_W * w - c_I * (a[i] + a[j] + delta)
+            A[i, k * block + n + p] = A[j, k * block + n + p] = 1   # y[i, j, k] counts for i and for j
+        A[n + k, k * block:(k + 1) * block] = 1             # slots of length k used
+    lower = np.r_[np.ones(n), np.full(len(lengths), -np.inf)]
+    upper = np.r_[np.ones(n), [L.count(length) for length in lengths]]
 
     start = time.perf_counter()
     res = milp(c, constraints=LinearConstraint(A, lower, upper), bounds=Bounds(0, 1),
@@ -241,11 +245,15 @@ def solve_pairs(q, s, slot_length, n_slots, c_I, c_W, time_limit, mip_rel_gap):
     seconds = time.perf_counter() - start
     if res.x is None:
         raise RuntimeError(f"HiGHS found no planning: {res.message}")
-    groups = [list(pairs[k]) for k in range(len(pairs)) if res.x[n + k] > 0.5] + \
-             [[i] for i in range(n) if res.x[i] > 0.5]
-    planning = dict(enumerate(groups))
-    cost = planning_cost(planning, q, s, [L] * n_slots, c_I, c_W)
-    assert abs(cost["Z"] - (res.fun + c_I * n_slots * L)) < 1e-6 * max(1, abs(cost["Z"])), \
+    planning = {}
+    for k, length in enumerate(lengths):
+        x = res.x[k * block:(k + 1) * block]
+        groups = [list(pairs[p]) for p in range(len(pairs)) if x[n + p] > 0.5] + \
+                 [[i] for i in range(n) if x[i] > 0.5]
+        slots = [t for t in range(len(L)) if L[t] == length]
+        planning.update(zip(slots, groups))
+    cost = planning_cost(planning, q, s, L, c_I, c_W)
+    assert abs(cost["Z"] - (res.fun + c_I * sum(L))) < 1e-6 * max(1, abs(cost["Z"])), \
         "the ILP objective and the enumeration disagree"
     return {"planning": planning, **cost, "optimal": res.status == 0, "gap": res.mip_gap,
             "nodes": res.mip_node_count, "seconds": seconds}
@@ -311,18 +319,23 @@ def greedy(q, s, L):
     return planning
 
 
-def pairs_last(planning):
+def pairs_last(planning, L):
     """
-    Order of the slots in the day. With slots of equal length the ILP gives the
-    same cost to every order, so the order is a rule set apart: the slots with
-    one patient first, then the double-booked slots, then the empty ones. The
-    delay of a double-booked slot then carries over to fewer patients.
+    Order of the slots in the day. The ILP gives the same cost to every order of
+    the slots, so the order is a rule set apart: the slots with one patient
+    first, then the double-booked slots, then the empty ones; each slot keeps
+    its length. The delay of a double-booked slot then carries over to fewer
+    patients.
+
+    Args:
+        planning (dict): {slot: patients}.
+        L (list): Slot lengths (minutes).
 
     Returns:
-        dict: {slot: patients}, slots numbered in that order.
+        tuple: (planning, L) with the slots numbered in that order.
     """
-    groups = [p for p in planning.values() if len(p) == 1] + [p for p in planning.values() if len(p) == 2]
-    return dict(enumerate(groups))
+    slots = sorted(range(len(L)), key=lambda t: {1: 0, 2: 1}.get(len(planning.get(t, [])), 2))
+    return {new: planning[t] for new, t in enumerate(slots) if planning.get(t)}, [L[t] for t in slots]
 
 
 ############################################################
