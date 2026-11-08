@@ -25,7 +25,7 @@ The four classifiers of notebooks 02 and 03 are tuned by a grid search with
 3-fold cross-validation. On 10 % of the consultations (1.1 million), this took
 2 h 40 for notebook 02 and 2 h 20 for notebook 03 on a laptop. All the data
 (11.3 million consultations) is ten times larger: the full run is estimated at
-40 to 60 hours on the laptop, so it runs on a rented server.
+40 to 60 hours on the laptop, so it runs on a secure rented server.
 
 The pilot checks, before that expensive run, that the whole chain works end to
 end, and gives a first view of the results. The pilot notebooks are the
@@ -136,40 +136,7 @@ when a notebook is run again (`RETRAIN = True` trains them again).
 - Code of the conference paper: https://github.com/GitDeTapha/Data_driven_model_in_AOS
 - Feyman Y, Asfaw DA, Griffith KN. Geographic variation in appointment wait
   times for US military veterans. *JAMA Network Open*. 2022;5(8):e2228783.
-  doi:10.1001/jamanetworkopen.2022.28783 (stop codes kept: eTable 1).
-
-**Methods**
-- Chawla NV, Bowyer KW, Hall LO, Kegelmeyer WP. SMOTE: synthetic minority
-  over-sampling technique. *Journal of Artificial Intelligence Research*.
-  2002;16:321-357.
-- Micci-Barreca D. A preprocessing scheme for high-cardinality categorical
-  attributes in classification and prediction problems. *ACM SIGKDD
-  Explorations*. 2001;3(1):27-32 (target encoding).
-- Breiman L. Random forests. *Machine Learning*. 2001;45(1):5-32.
-- Chen T, Guestrin C. XGBoost: a scalable tree boosting system. *Proceedings of
-  KDD 2016*:785-794.
-- Freund Y, Schapire RE. A decision-theoretic generalization of on-line learning
-  and an application to boosting. *Journal of Computer and System Sciences*.
-  1997;55(1):119-139 (AdaBoost).
-- Platt J. Probabilistic outputs for support vector machines and comparisons to
-  regularized likelihood methods. In: *Advances in Large Margin Classifiers*.
-  MIT Press; 1999:61-74 (Platt scaling).
-- Huangfu Q, Hall JAJ. Parallelizing the dual revised simplex method.
-  *Mathematical Programming Computation*. 2018;10(1):119-142 (HiGHS).
-- Lindley DV. The theory of queues with a single server. *Mathematical
-  Proceedings of the Cambridge Philosophical Society*. 1952;48(2):277-289
-  (delays carried over in the simulation).
-- Wilcoxon F. Individual comparisons by ranking methods. *Biometrics Bulletin*.
-  1945;1(6):80-83.
-
-**Software**
-- Pedregosa F, et al. Scikit-learn: machine learning in Python. *Journal of
-  Machine Learning Research*. 2011;12:2825-2830.
-- Lemaître G, Nogueira F, Aridas CK. Imbalanced-learn: a Python toolbox to
-  tackle the curse of imbalanced datasets in machine learning. *Journal of
-  Machine Learning Research*. 2017;18(17):1-5.
-- Virtanen P, et al. SciPy 1.0: fundamental algorithms for scientific computing
-  in Python. *Nature Methods*. 2020;17:261-272 (`scipy.optimize.milp`).
+  doi:10.1001/jamanetworkopen.2022.28783 (stop codes kept: eTable 1). [To find raw data used]
 
 ## License
 
