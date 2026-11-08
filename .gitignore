@@ -1,6 +1,6 @@
-# Deny-all allow-list: nothing is tracked unless explicitly un-ignored below.
-# This keeps the patient dataset (data/, data_parquet_chunks/), the virtual
-# environment and every generated artifact out of the repository by default.
+# Allow-list: nothing is tracked unless un-ignored below. This keeps the patient
+# records (data/), the trained models (models/, runs/) and the environment out of
+# the repository.
 /*
 
 !/.gitignore
@@ -8,26 +8,15 @@
 !/LICENSE
 !/requirements.txt
 
-# Helper modules of the three notebooks
+# Functions of the notebooks
 !/utils_prep.py
 !/utils_ml.py
 !/utils_ilp.py
 
-# Reference document read by notebook 01 (stop codes, Feyman et al. 2022, eTable 1)
+# Stop codes read by notebook 01 (Feyman et al. 2022, eTable 1)
 !/references/
 
-# Published results of a validated run (executed notebook + summary tables)
-!/reports/
-# Internal audit: kept out of the published repository
-/reports/audit_cps*
-/reports/audit_figures/
-/reports/Makefile
-/reports/audit_checks/
-/reports/fixes_*.pdf
-/reports/fixes_*.tex
-/reports/fixes_figures/
-
-# The three notebooks, committed executed (outputs and figures included)
+# The four notebooks, committed executed (outputs and figures included)
 !/notebooks/
 /notebooks/*
 !/notebooks/01_data_preparation.ipynb
@@ -35,25 +24,15 @@
 !/notebooks/03_service_time_groups.ipynb
 !/notebooks/04_scheduling_ilp.ipynb
 
+# Pilot run on 10 % of the consultations (executed notebooks 02 to 04)
+!/pilot_10pct/
+
 # Unit tests
 !/tests/
 __pycache__/
 .pytest_cache/
 
-# The only versioned data file: aggregate ILP parameters exported by the pipeline
-# (durations, shares, rates, provenance). No patient-level record.
-!/data/
-/data/*
-!/data/inference/
-/data/inference/*
-!/data/inference/plne_parameters.json
-
-# Data ingestion (produces the notebook's input)
+# Conversion of the raw CSV into Parquet chunks
 !/scripts/
 /scripts/*
 !/scripts/csv_to_parquet.py
-
-# Generated at run time, never committed:
-#   data/ data_parquet_chunks/  input and preprocessed data (patient records)
-#   figures/ models/ results/ tables/  pipeline outputs
-#   ml_env/ __pycache__/ .ipynb_checkpoints/  environment and caches
